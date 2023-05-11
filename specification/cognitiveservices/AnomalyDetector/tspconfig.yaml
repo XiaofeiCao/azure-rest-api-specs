@@ -27,7 +27,7 @@ options:
   # Uncomment this line and add "@azure-tools/typespec-java" to your package.json to generate Java code
   "@azure-tools/typespec-java":
     namespace: com.azure.ai.anomalydetector
-    partial-update: true
+    partial-update: false
     emitter-output-dir: "{java-sdk-folder}/sdk/{service-directory-name}/azure-ai-anomalydetector"
     examples-directory: ./examples
     generate-samples: true
