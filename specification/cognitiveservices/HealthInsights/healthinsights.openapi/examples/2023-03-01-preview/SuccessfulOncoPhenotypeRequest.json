@@ -4,7 +4,7 @@
   "parameters": {
     "endpoint": "{endpoint}",
     "api-version": "2023-03-01-preview",
-    "body": {
+    "oncoPhenotypeData": {
       "patients": [
         {
           "id": "Patient ID Example 1",
