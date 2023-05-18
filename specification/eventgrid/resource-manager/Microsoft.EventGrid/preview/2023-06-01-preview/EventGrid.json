@@ -1998,6 +1998,65 @@
         }
       }
     },
+    "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.EventGrid/topics/{topicName}/eventSubscriptions/{eventSubscriptionName}/getDeliveryAttributes": {
+      "post": {
+        "tags": [
+          "EventSubscriptions"
+        ],
+        "summary": "Get delivery attributes for an event subscription for topic.",
+        "description": "Get all delivery attributes for an event subscription for topic.",
+        "operationId": "TopicEventSubscriptions_GetDeliveryAttributes",
+        "consumes": [],
+        "produces": [
+          "application/json"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/parameters/SubscriptionIdParameter"
+          },
+          {
+            "name": "resourceGroupName",
+            "in": "path",
+            "description": "The name of the resource group within the user's subscription.",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "topicName",
+            "in": "path",
+            "description": "Name of the topic.",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "eventSubscriptionName",
+            "in": "path",
+            "description": "Name of the event subscription.",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "$ref": "#/parameters/ApiVersionParameter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/DeliveryAttributeListResult"
+            }
+          },
+          "default": {
+            "description": "*** Error Responses: ***\n\n * 400 Bad Request.\n\n * 500 Internal Server Error."
+          }
+        },
+        "x-ms-examples": {
+          "TopicEventSubscriptions_GetDeliveryAttributes": {
+            "$ref": "./examples/TopicEventSubscriptions_GetDeliveryAttributes.json"
+          }
+        }
+      }
+    },
     "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.EventGrid/domains/{domainName}/topics/{topicName}/eventSubscriptions/{eventSubscriptionName}/getDeliveryAttributes": {
       "post": {
         "tags": [
@@ -2060,65 +2119,6 @@
         "x-ms-examples": {
           "DomainTopicEventSubscriptions_GetDeliveryAttributes": {
             "$ref": "./examples/DomainTopicEventSubscriptions_GetDeliveryAttributes.json"
-          }
-        }
-      }
-    },
-    "/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.EventGrid/topics/{topicName}/eventSubscriptions/{eventSubscriptionName}/getDeliveryAttributes": {
-      "post": {
-        "tags": [
-          "EventSubscriptions"
-        ],
-        "summary": "Get delivery attributes for an event subscription for topic.",
-        "description": "Get all delivery attributes for an event subscription for topic.",
-        "operationId": "TopicEventSubscriptions_GetDeliveryAttributes",
-        "consumes": [],
-        "produces": [
-          "application/json"
-        ],
-        "parameters": [
-          {
-            "$ref": "#/parameters/SubscriptionIdParameter"
-          },
-          {
-            "name": "resourceGroupName",
-            "in": "path",
-            "description": "The name of the resource group within the user's subscription.",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "topicName",
-            "in": "path",
-            "description": "Name of the topic.",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "name": "eventSubscriptionName",
-            "in": "path",
-            "description": "Name of the event subscription.",
-            "required": true,
-            "type": "string"
-          },
-          {
-            "$ref": "#/parameters/ApiVersionParameter"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "schema": {
-              "$ref": "#/definitions/DeliveryAttributeListResult"
-            }
-          },
-          "default": {
-            "description": "*** Error Responses: ***\n\n * 400 Bad Request.\n\n * 500 Internal Server Error."
-          }
-        },
-        "x-ms-examples": {
-          "TopicEventSubscriptions_GetDeliveryAttributes": {
-            "$ref": "./examples/TopicEventSubscriptions_GetDeliveryAttributes.json"
           }
         }
       }
