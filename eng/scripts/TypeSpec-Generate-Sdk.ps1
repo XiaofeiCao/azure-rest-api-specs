@@ -37,7 +37,7 @@ if ($SdkLanguage) {
   }
   $specFolderPath = $TypeSpecProjectDirectory.Substring(0, $index - 1)
   $rootPath = Split-Path $specFolderPath -Parent
-  $sdkRepoRoot = Join-Path $rootPath "sdk-repos"
+  $sdkRepoRoot = $rootPath
   if (!(Test-Path $sdkRepoRoot)) {
     Write-Error "sdk repos root folder doesn't eixst: $sdkRepoRoot"
     exit 1

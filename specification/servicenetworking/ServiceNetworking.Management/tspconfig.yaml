@@ -12,5 +12,6 @@ options:
     namespace: com.azure.resourcemanager.servicenetworking
     examples-directory: examples
     fluent: lite
-    # dev-options:
-    #   debug: true
+    dev-options:
+      # debug: true
+      generate-code-model: true
