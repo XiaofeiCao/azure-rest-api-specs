@@ -11,3 +11,6 @@ options:
     package-dir: "azure-resourcemanager-servicenetworking"
     namespace: com.azure.resourcemanager.servicenetworking
     examples-directory: examples
+    fluent: lite
+    # dev-options:
+    #   debug: true
