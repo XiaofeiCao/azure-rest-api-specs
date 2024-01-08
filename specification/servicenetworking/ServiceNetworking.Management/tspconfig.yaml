@@ -15,5 +15,6 @@ options:
     examples-directory: examples
     fluent: lite
     dev-options:
-      # debug: true
+      debug: true
       generate-code-model: true
+      java-temp-dir: C:\\Users\\xiaofeicao\\Desktop
