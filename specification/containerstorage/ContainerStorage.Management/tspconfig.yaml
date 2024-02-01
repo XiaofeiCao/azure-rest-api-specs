@@ -1,5 +1,9 @@
+parameters:
+  service-dir:
+    default: "sdk/containerstorage"
 emit:
-  - "@azure-tools/typespec-autorest"
+  - '@azure-tools/typespec-autorest'
+  - '@azure-tools/typespec-java'
 linter:
   extends:
     - "@azure-tools/typespec-azure-resource-manager/all"
@@ -11,3 +15,13 @@ options:
     emitter-output-dir: "{project-root}/.."
     examples-directory: "{project-root}/examples"
     output-file: "{azure-resource-provider-folder}/{service-name}/{version-status}/{version}/containerstorage.json"
+  "@azure-tools/typespec-java":
+    package-dir: "azure-resourcemanager-containerstorage"
+    namespace: com.azure.resourcemanager.containerstorage
+    examples-directory: examples
+    generate-samples: false
+    generate-tests: false
+    dev-options:
+      # debug: true
+      generate-code-model: true
+      java-temp-dir: C:\\Users\\xiaofeicao\\Desktop\\code-model
