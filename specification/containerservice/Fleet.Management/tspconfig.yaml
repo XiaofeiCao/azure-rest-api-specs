@@ -1,6 +1,6 @@
 parameters:
   service-dir:
-    default: "sdk/containerservicefleet2"
+    default: "sdk/containerservicefleet"
 emit:
   - "@azure-tools/typespec-autorest"
   - "@azure-tools/typespec-java"
@@ -19,8 +19,9 @@ options:
     omit-unreachable-types: true
     use-read-only-status-schema: true
   "@azure-tools/typespec-java":
-    service-dir: "sdk/containerservicefleet"
     package-dir: "azure-resourcemanager-containerservicefleet"
     namespace: com.azure.resourcemanager.containerservicefleet
     examples-directory: examples
     title: ContainerServiceFleetManagementClient
+    dev-options:
+      debug: true
