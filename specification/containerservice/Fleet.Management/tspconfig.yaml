@@ -1,5 +1,6 @@
 emit:
   - "@azure-tools/typespec-autorest"
+  - "@azure-tools/typespec-java"
 linter:
   extends:
     - "@azure-tools/typespec-azure-resource-manager/all"
@@ -14,3 +15,8 @@ options:
     output-file: "{azure-resource-provider-folder}/{service-name}/fleet/{version-status}/{version}/fleets.json"
     omit-unreachable-types: true
     use-read-only-status-schema: true
+  "@azure-tools/typespec-java":
+    package-dir: "azure-resourcemanager-containerservicefleet"
+    namespace: com.azure.resourcemanager.containerservicefleet
+    examples-directory: examples
+    title: ContainerServiceFleetManagementClient
