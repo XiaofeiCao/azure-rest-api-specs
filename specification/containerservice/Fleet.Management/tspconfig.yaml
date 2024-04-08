@@ -23,3 +23,4 @@ options:
     namespace: com.azure.resourcemanager.containerservicefleet
     examples-directory: examples
     title: ContainerServiceFleetManagementClient
+    service-name: ContainerServiceFleet
