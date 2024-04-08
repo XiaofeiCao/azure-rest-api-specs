@@ -23,5 +23,3 @@ options:
     namespace: com.azure.resourcemanager.containerservicefleet
     examples-directory: examples
     title: ContainerServiceFleetManagementClient
-    dev-options:
-      debug: true
