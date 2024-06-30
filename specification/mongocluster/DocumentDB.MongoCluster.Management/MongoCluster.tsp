@@ -26,11 +26,13 @@ interface MongoClusters {
   /** Gets information about a mongo cluster. */
   get is ArmResourceRead<MongoCluster>;
   /** Create or update a mongo cluster. Update overwrites all properties for the resource. To only modify some of the properties, use PATCH. */
-  #suppress "@azure-tools/typespec-azure-core/invalid-final-state" "MUST CHANGE ON NEXT UPDATE"
-  @Azure.Core.useFinalStateVia("azure-async-operation")
-  createOrUpdate is ArmResourceCreateOrUpdateAsync<
-    MongoCluster,
-    LroHeaders = Azure.Core.Foundations.RetryAfterHeader
+  #suppress "@azure-tools/typespec-azure-resource-manager/lro-location-header" "This LRO uses Azure-AsyncOperation header instead of Location header"
+  #suppress "@azure-tools/typespec-azure-resource-manager/arm-put-operation-response-codes" "Legacy Template"
+  createOrUpdate is ArmResourceCreateOrUpdateAsync<MongoCluster, 
+  Response = 
+  | ArmResponse<MongoCluster>
+  | ArmResourceCreatedResponse<MongoCluster>
+  | ArmAcceptedLroResponse<LroHeaders = ArmAsyncOperationHeader<FinalResult = MongoCluster> & Azure.Core.Foundations.RetryAfterHeader>
   >;
   /** Updates an existing mongo cluster. The request body can contain one to many of the properties present in the normal mongo cluster definition. */
   update is ArmResourcePatchAsync<MongoCluster, MongoClusterProperties>;
