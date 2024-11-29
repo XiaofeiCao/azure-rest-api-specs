@@ -286,20 +286,7 @@ These settings apply only when `--tag=package-2024-07-01` is specified on the co
 ``` yaml $(tag) == 'package-2024-07-01'
 input-file:
   - Microsoft.Compute/common-types/v1/common.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/computeRPCommon.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/virtualMachineScaleSet.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/virtualMachine.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/virtualMachineImage.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/virtualMachineExtensionImage.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/availabilitySet.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/proximityPlacementGroup.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/dedicatedHost.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/sshPublicKey.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/image.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/restorePoint.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/capacityReservation.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/logAnalytic.json
-  - Microsoft.Compute/ComputeRP/stable/2024-07-01/runCommand.json 
+  - Microsoft.Compute/ComputeRP/stable/2024-07-01/ComputeRP.json
   - Microsoft.Compute/DiskRP/stable/2024-03-02/diskRPCommon.json
   - Microsoft.Compute/DiskRP/stable/2024-03-02/disk.json
   - Microsoft.Compute/DiskRP/stable/2024-03-02/diskAccess.json
