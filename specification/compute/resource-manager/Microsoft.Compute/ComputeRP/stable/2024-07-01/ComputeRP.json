@@ -1606,6 +1606,9 @@
             }
           }
         },
+        "x-ms-pageable": {
+          "nextLinkName": null
+        },
         "x-ms-examples": {
           "virtualMachineSizes_List_MaximumSet_Gen": {
             "$ref": "./examples/computeRPCommonExamples/VirtualMachineSizes_List_MaximumSet_Gen.json"
@@ -2145,6 +2148,9 @@
               "$ref": "#/definitions/CloudError"
             }
           }
+        },
+        "x-ms-pageable": {
+          "nextLinkName": null
         },
         "x-ms-examples": {
           "availabilitySet_ListAvailableSizes_MaximumSet_Gen": {
@@ -3480,6 +3486,9 @@
               "$ref": "#/definitions/CloudError"
             }
           }
+        },
+        "x-ms-pageable": {
+          "nextLinkName": null
         },
         "x-ms-examples": {
           "get Available Dedicated Host Sizes.": {
@@ -11821,6 +11830,9 @@
             }
           }
         },
+        "x-ms-pageable": {
+          "nextLinkName": null
+        },
         "x-ms-examples": {
           "lists all available virtual machine sizes to which the specified virtual machine can be resized": {
             "$ref": "./examples/virtualMachineExamples/VirtualMachine_ListAvailableVmSizes.json"
@@ -19010,6 +19022,10 @@
       "type": "object",
       "description": "Describes a Virtual Machine Scale Set Extension.",
       "properties": {
+        "name": {
+          "type": "string",
+          "description": "The name of the extension."
+        },
         "properties": {
           "$ref": "#/definitions/VirtualMachineScaleSetExtensionProperties",
           "description": "Describes the properties of a Virtual Machine Scale Set Extension.",
