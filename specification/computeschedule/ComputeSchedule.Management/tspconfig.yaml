@@ -35,6 +35,8 @@ options:
     package-dir: "azure-resourcemanager-computeschedule"
     flavor: "azure"
     service-name: "Compute Schedule"
+    dev-options:
+      debug: true
 linter:
   extends:
     - "@azure-tools/typespec-azure-rulesets/resource-manager"
