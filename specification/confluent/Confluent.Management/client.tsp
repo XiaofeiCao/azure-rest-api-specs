@@ -3,3 +3,30 @@ import "./main.tsp";
 using Azure.ClientGenerator.Core;
 
 @@clientName(Microsoft.Confluent, "ConfluentManagementClient", "javascript");
+@@clientName(Microsoft.Confluent.APIKeyResourceEntity,
+  "ApiKeyResourceEntity",
+  "java"
+);
+@@clientName(Microsoft.Confluent.APIKeyOwnerEntity,
+  "ApiKeyOwnerEntity",
+  "java"
+);
+@@clientName(Microsoft.Confluent.CreateAPIKeyModel,
+  "CreateApiKeyModel",
+  "java"
+);
+@@clientName(Microsoft.Confluent.APIKeySpecEntity, "ApiKeySpecEntity", "java");
+@@clientName(Microsoft.Confluent.APIKeyProperties, "ApiKeyProperties", "java");
+@@clientName(Microsoft.Confluent.APIKeyRecord, "ApiKeyRecord", "java");
+@@clientName(Microsoft.Confluent.OrganizationResourceAPIKeyActions.getClusterAPIKey,
+  "getClusterApiKey",
+  "java"
+);
+@@clientName(Microsoft.Confluent.OrganizationResourceAPIKeyActions.deleteClusterAPIKey,
+  "deleteClusterApiKey",
+  "java"
+);
+@@clientName(Microsoft.Confluent.SCClusterRecords.createAPIKey,
+  "createApiKey",
+  "java"
+);
