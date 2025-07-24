@@ -28,10 +28,8 @@ options:
     namespace: "com.azure.resourcemanager.keyvault"
     service-name: "KeyVault" # human-readable service name, whitespace allowed
     flavor: azure
-    premium: true,
+    premium: true
     service-dir: "sdk/resourcemanager"
-    dev-options:
-      debug: true
   "@azure-tools/typespec-ts":
     package-dir: "arm-keyvault"
     flavor: azure
