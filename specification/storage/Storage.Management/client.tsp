@@ -1,8 +1,12 @@
 import "@azure-tools/typespec-client-generator-core";
+import "@typespec/openapi";
+import "@typespec/rest";
 import "./main.tsp";
 
 using Azure.ClientGenerator.Core;
 using Microsoft.Storage;
+using TypeSpec.Http;
+using TypeSpec.Rest;
 
 @@clientName(ProvisioningState, "StorageProvisioningState", "csharp");
 @@clientName(Microsoft.Storage, "StorageManagementClient", "javascript");
@@ -49,3 +53,23 @@ enum IntervalUnit {
 );
 
 @@clientName(ETagHeader.eTag, "etag", "java");
+
+#suppress "@azure-tools/typespec-azure-resource-manager/arm-resource-operation" "customization"
+#suppress "@azure-tools/typespec-azure-core/documentation-required" "override"
+op getDeletedAccountCustomized(
+  @path
+  subscriptionId: string,
+
+  @path
+  provider: "Microsoft.ThisWillBeReplaced",
+
+  @path
+  deletedAccountName: string,
+
+  @path
+  location: string
+  @query("api-version")
+  apiVersion: string,
+): DeletedAccount;
+
+@@override(DeletedAccounts.get, getDeletedAccountCustomized);
