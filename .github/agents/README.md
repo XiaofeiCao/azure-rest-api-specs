@@ -12,6 +12,7 @@ Visual Studio Code and local project sessions in the GitHub Copilot app.
 | [`arm-api-review-critic.agent.md`](./arm-api-review-critic.agent.md)     | Internal subagent invoked by the Reviewer at Step 7 to re-verify findings.                                    | No              |
 | [`data-plane-api-reviewer.agent.md`](./data-plane-api-reviewer.agent.md) | Reviews data-plane TypeSpec for high-value semantic defects outside deterministic compiler and linter checks. | Yes             |
 | [`hero-scenarios.agent.md`](./hero-scenarios.agent.md)                   | Suggests hero scenarios from TypeSpec to seed SDK samples, documentation, and tests.                          | Yes             |
+| [`arm-blackbox-tester.agent.md`](./arm-blackbox-tester.agent.md)         | Blackbox tests ARM specs against live Azure service behavior and generates sanitized real-life examples.      | Yes             |
 
 ## Shared protocols
 
