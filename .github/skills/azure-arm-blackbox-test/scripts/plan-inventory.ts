@@ -1,0 +1,954 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import {
+  getArmResourceIdentifierConfig,
+  getLroMetadata,
+  getUnionAsEnum,
+} from "@azure-tools/typespec-azure-core";
+import {
+  getDoc,
+  getFormat,
+  getPagingOperation,
+  isArrayModelType,
+  isErrorModel,
+  isRecordModelType,
+  isSecret,
+  isVoidType,
+  resolveEncodedName,
+  walkPropertiesInherited,
+  type Program,
+  type Type,
+} from "@typespec/compiler";
+import {
+  createMetadataInfo,
+  resolveRequestVisibility,
+  Visibility,
+  type HttpOperation,
+  type MetadataInfo,
+} from "@typespec/http";
+import { getExtensions, isReadonlyProperty } from "@typespec/openapi";
+import { getArmBearerToken } from "./auth-and-http.ts";
+import { saveLedger } from "./ledger-store.ts";
+import {
+  extractOperationSourceLocation,
+  loadProjectedTypeSpecService,
+  resolveBodyParameterName,
+  resolveCanonicalOperationId,
+} from "./typespec-loader.ts";
+import type {
+  ArmOperationScope,
+  CoverageLedger,
+  ExternalDependencyHint,
+  HttpMethod,
+  LifecyclePhase,
+  OperationContract,
+  OperationCoverageEntry,
+  OperationParameterSpec,
+  PageableContract,
+  ProviderLiveMetadata,
+} from "./types.ts";
+
+const SECRET_PROPERTY_NAME_RE =
+  /(password|secret|connectionstring|primarykey|secondarykey|accesskey|apikey|sastoken|sharedkey|clientsecret|privatekey|token)/i;
+
+export interface DiscoverInventoryOptions {
+  specPath: string;
+  apiVersion?: string;
+  workDir: string;
+  armBaseUrl?: string;
+  subscriptionId?: string;
+  location?: string;
+  checkLiveProvider?: boolean;
+  bearerToken?: string;
+}
+
+function inferScope(pathTemplate: string): ArmOperationScope {
+  const cleanPath = pathTemplate.split("?")[0];
+  const providerMatches = [...cleanPath.matchAll(/\/providers\/([^/]+)/gi)];
+  if (providerMatches.length >= 2) {
+    return "extension";
+  }
+  if (/\/resourcegroups\/\{[^}]+\}/i.test(cleanPath)) {
+    return "resourceGroup";
+  }
+  if (/^\/subscriptions\/\{[^}]+\}/i.test(cleanPath)) {
+    return "subscription";
+  }
+  return "tenant";
+}
+
+function extractProviderAndResource(pathTemplate: string): {
+  providerNamespace: string;
+  resourceType: string;
+  depth: number;
+  isActionSegment: boolean;
+  lastStaticSegment: string;
+} {
+  const cleanPath = pathTemplate.split("?")[0].replace(/\/+$/, "");
+  const providerIdx = cleanPath.toLowerCase().lastIndexOf("/providers/");
+  if (providerIdx === -1) {
+    return {
+      providerNamespace: "Microsoft.Resources",
+      resourceType: "Microsoft.Resources/subscriptions",
+      depth: 0,
+      isActionSegment: false,
+      lastStaticSegment: "",
+    };
+  }
+
+  const afterProviders = cleanPath.slice(providerIdx + "/providers/".length);
+  const segments = afterProviders.split("/").filter(Boolean);
+  const providerNamespace = segments[0] ?? "Unknown.Provider";
+  const rest = segments.slice(1);
+
+  // Filter out "/locations/{location}" prefix segments for location-based resources/deleted stores.
+  const normalizedRest: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (
+      rest[i].toLowerCase() === "locations" &&
+      i + 1 < rest.length &&
+      rest[i + 1].startsWith("{")
+    ) {
+      i++;
+      continue;
+    }
+    normalizedRest.push(rest[i]);
+  }
+
+  const typeSegments: string[] = [];
+  let idx = 0;
+  while (idx < normalizedRest.length) {
+    const seg = normalizedRest[idx];
+    if (!seg.startsWith("{")) {
+      typeSegments.push(seg);
+      if (idx + 1 < normalizedRest.length && normalizedRest[idx + 1].startsWith("{")) {
+        idx += 2;
+        continue;
+      }
+    }
+    idx++;
+  }
+
+  const endsWithParam =
+    normalizedRest.length > 0 && normalizedRest[normalizedRest.length - 1].startsWith("{");
+  const lastSegment = normalizedRest[normalizedRest.length - 1] ?? "";
+  const isActionSegment = !endsWithParam && normalizedRest.length >= 2;
+
+  const resourceTypeSegments =
+    isActionSegment && typeSegments.length > 1 ? typeSegments.slice(0, -1) : typeSegments;
+  const resourceType =
+    resourceTypeSegments.length > 0
+      ? `${providerNamespace}/${resourceTypeSegments.join("/")}`
+      : providerNamespace;
+
+  return {
+    providerNamespace,
+    resourceType,
+    depth: resourceTypeSegments.length,
+    isActionSegment,
+    lastStaticSegment: endsWithParam ? "" : lastSegment,
+  };
+}
+
+function classifyPhase(
+  method: HttpMethod,
+  pathTemplate: string,
+  operationId: string,
+  pageable: PageableContract | undefined,
+): LifecyclePhase {
+  const lowerPath = pathTemplate.toLowerCase();
+  const lowerOp = operationId.toLowerCase();
+
+  if (
+    lowerPath.endsWith("/operations") ||
+    lowerPath.endsWith("/checknameavailability") ||
+    lowerOp.includes("checknameavailability") ||
+    lowerOp.startsWith("operations_") ||
+    lowerOp.includes("listskus") ||
+    lowerOp.includes("usages")
+  ) {
+    return "preflight-discovery";
+  }
+
+  if (lowerPath.includes("/deleted") || lowerOp.includes("deleted")) {
+    return "deleted-resource";
+  }
+
+  const cleanPath = pathTemplate.split("?")[0].replace(/\/+$/, "");
+  const endsWithParam = cleanPath.endsWith("}");
+
+  if (method === "PUT") {
+    return "create";
+  }
+  if (method === "PATCH") {
+    return "update";
+  }
+  if (method === "DELETE") {
+    return "delete";
+  }
+  if (method === "POST") {
+    return "action";
+  }
+  if (method === "GET") {
+    if (pageable || !endsWithParam || lowerOp.includes("_list")) {
+      return "list";
+    }
+    return "read";
+  }
+  return "read";
+}
+
+function describeTypeSpecType(type: Type): {
+  typeName?: string;
+  format?: string;
+  enumValues?: string[];
+  armAllowedType?: string;
+} {
+  if (type.kind === "Scalar") {
+    return { typeName: type.name };
+  }
+  if (type.kind === "Enum") {
+    return {
+      typeName: "string",
+      enumValues: [...type.members.values()].map((m) => String(m.value ?? m.name)),
+    };
+  }
+  if (type.kind === "Union") {
+    const [unionEnum] = getUnionAsEnum(type);
+    if (unionEnum) {
+      return {
+        typeName: "string",
+        enumValues: [...unionEnum.flattenedMembers.values()].map((m) => String(m.value)),
+      };
+    }
+    return { typeName: "union" };
+  }
+  if (type.kind === "Model") {
+    return { typeName: type.name || "object" };
+  }
+  return { typeName: type.kind.toLowerCase() };
+}
+
+function detectExternalDependencyFromTypeSpec(
+  program: Program,
+  propertyPath: string,
+  propType: Type,
+  description: string,
+): ExternalDependencyHint | undefined {
+  const lowerPath = propertyPath.toLowerCase();
+  const armIdConfig =
+    propType.kind === "Scalar" ? getArmResourceIdentifierConfig(program, propType) : undefined;
+  const armAllowed = armIdConfig?.allowedResources?.[0]?.type;
+
+  if (lowerPath === "identity" || lowerPath.endsWith(".userassignedidentities")) {
+    return {
+      propertyPath,
+      providerNamespace: "Microsoft.ManagedIdentity",
+      kind: "managed-identity",
+      required: false,
+      description: "User-assigned or system-assigned Managed Identity fixture",
+    };
+  }
+  if (
+    lowerPath.includes("subnetid") ||
+    lowerPath.includes("virtualnetwork") ||
+    armAllowed?.toLowerCase().startsWith("microsoft.network/virtualnetworks")
+  ) {
+    return {
+      propertyPath,
+      providerNamespace: "Microsoft.Network",
+      kind: "vnet-subnet",
+      required: false,
+      description,
+    };
+  }
+  if (
+    lowerPath.includes("privateendpoint") ||
+    armAllowed?.toLowerCase().startsWith("microsoft.network/privateendpoints")
+  ) {
+    return {
+      propertyPath,
+      providerNamespace: "Microsoft.Network",
+      kind: "private-endpoint",
+      required: false,
+      description,
+    };
+  }
+  if (
+    lowerPath.includes("keyvault") ||
+    lowerPath.includes("vaulturi") ||
+    lowerPath.includes("keyidentifier") ||
+    armAllowed?.toLowerCase().startsWith("microsoft.keyvault/")
+  ) {
+    return {
+      propertyPath,
+      providerNamespace: "Microsoft.KeyVault",
+      kind: "key-vault",
+      required: false,
+      description,
+    };
+  }
+  if (
+    lowerPath.includes("storageaccount") ||
+    armAllowed?.toLowerCase().startsWith("microsoft.storage/")
+  ) {
+    return {
+      propertyPath,
+      providerNamespace: "Microsoft.Storage",
+      kind: "storage-account",
+      required: false,
+      description,
+    };
+  }
+  if (
+    lowerPath.includes("workspaceid") ||
+    lowerPath.includes("workspaceresourceid") ||
+    armAllowed?.toLowerCase().startsWith("microsoft.operationalinsights/")
+  ) {
+    return {
+      propertyPath,
+      providerNamespace: "Microsoft.OperationalInsights",
+      kind: "log-analytics",
+      required: false,
+      description,
+    };
+  }
+  if ((lowerPath.endsWith("resourceid") || Boolean(armIdConfig)) && !lowerPath.includes("parent")) {
+    return {
+      propertyPath,
+      providerNamespace: armAllowed?.split("/")[0],
+      kind: "generic-arm-resource",
+      required: false,
+      description,
+    };
+  }
+  return undefined;
+}
+
+function collectTypeSpecBodyMetadata(
+  program: Program,
+  metadataInfo: MetadataInfo,
+  reqVisibility: Visibility,
+  type: Type | undefined,
+  prefix = "",
+  depth = 0,
+  visited = new Set<Type>(),
+  result = {
+    writable: new Set<string>(),
+    readOnly: new Set<string>(),
+    secrets: new Set<string>(),
+    externalDeps: new Map<string, ExternalDependencyHint>(),
+  },
+  requiredInParent = false,
+): {
+  writable: Set<string>;
+  readOnly: Set<string>;
+  secrets: Set<string>;
+  externalDeps: Map<string, ExternalDependencyHint>;
+} {
+  if (!type || depth > 5 || visited.has(type)) {
+    return result;
+  }
+  visited.add(type);
+
+  if (type.kind === "Model") {
+    if (isArrayModelType(program, type) || isRecordModelType(program, type)) {
+      collectTypeSpecBodyMetadata(
+        program,
+        metadataInfo,
+        reqVisibility | Visibility.Item,
+        type.indexer.value,
+        prefix,
+        depth + 1,
+        visited,
+        result,
+        false,
+      );
+      return result;
+    }
+
+    for (const prop of walkPropertiesInherited(type)) {
+      const wireName = resolveEncodedName(program, prop, "application/json");
+      const propPath = prefix ? `${prefix}.${wireName}` : wireName;
+      const readOnly = isReadonlyProperty(program, prop);
+      const visibleInReq = metadataInfo.isPayloadProperty(prop, reqVisibility);
+      const visibleInRead = metadataInfo.isPayloadProperty(prop, Visibility.Read);
+
+      if (readOnly || (!visibleInReq && visibleInRead)) {
+        result.readOnly.add(propPath);
+      } else if (
+        visibleInReq &&
+        visibleInRead &&
+        propPath !== "id" &&
+        propPath !== "name" &&
+        propPath !== "type" &&
+        propPath !== "systemData"
+      ) {
+        result.writable.add(propPath);
+      }
+
+      if (
+        isSecret(program, prop) ||
+        isSecret(program, prop.type) ||
+        SECRET_PROPERTY_NAME_RE.test(wireName)
+      ) {
+        result.secrets.add(propPath);
+      }
+
+      const isPropRequired = !prop.optional && !metadataInfo.isOptional(prop, reqVisibility);
+      const doc = getDoc(program, prop) ?? "";
+      const depHint = detectExternalDependencyFromTypeSpec(program, propPath, prop.type, doc);
+      if (depHint && !result.externalDeps.has(propPath)) {
+        result.externalDeps.set(propPath, {
+          ...depHint,
+          required: requiredInParent && isPropRequired,
+        });
+      }
+
+      if (visibleInReq || visibleInRead) {
+        collectTypeSpecBodyMetadata(
+          program,
+          metadataInfo,
+          reqVisibility,
+          prop.type,
+          propPath,
+          depth + 1,
+          visited,
+          result,
+          requiredInParent ? isPropRequired : depth === 0 ? isPropRequired : false,
+        );
+      }
+    }
+  } else if (type.kind === "Union") {
+    for (const variant of type.variants.values()) {
+      collectTypeSpecBodyMetadata(
+        program,
+        metadataInfo,
+        reqVisibility,
+        variant.type,
+        prefix,
+        depth,
+        visited,
+        result,
+        requiredInParent,
+      );
+    }
+  }
+
+  return result;
+}
+
+function collectTypeSpecResponseSecrets(program: Program, httpOp: HttpOperation): string[] {
+  const secrets = new Set<string>();
+  const visited = new Set<Type>();
+
+  function walk(type: Type | undefined, prefix = "", depth = 0): void {
+    if (!type || depth > 5 || visited.has(type)) {
+      return;
+    }
+    visited.add(type);
+    if (type.kind === "Model") {
+      if (isArrayModelType(program, type)) {
+        walk(type.indexer.value, prefix ? `${prefix}[]` : "[]", depth + 1);
+        return;
+      }
+      for (const prop of walkPropertiesInherited(type)) {
+        const wireName = resolveEncodedName(program, prop, "application/json");
+        const propPath = prefix ? `${prefix}.${wireName}` : wireName;
+        if (
+          isSecret(program, prop) ||
+          isSecret(program, prop.type) ||
+          SECRET_PROPERTY_NAME_RE.test(wireName)
+        ) {
+          secrets.add(propPath);
+        }
+        walk(prop.type, propPath, depth + 1);
+      }
+    } else if (type.kind === "Union") {
+      for (const variant of type.variants.values()) {
+        walk(variant.type, prefix, depth);
+      }
+    }
+  }
+
+  for (const resp of httpOp.responses) {
+    for (const content of resp.responses) {
+      if (content.body) {
+        walk(content.body.type);
+      }
+    }
+  }
+  return [...secrets];
+}
+
+function extractPageableFromTypeSpec(
+  program: Program,
+  httpOp: HttpOperation,
+): PageableContract | undefined {
+  const [paging] = getPagingOperation(program, httpOp.operation);
+  if (paging) {
+    const itemName = resolveEncodedName(
+      program,
+      paging.output.pageItems.property,
+      "application/json",
+    );
+    const nextLinkName = paging.output.nextLink
+      ? resolveEncodedName(program, paging.output.nextLink.property, "application/json")
+      : null;
+    return { itemName, nextLinkName };
+  }
+
+  // Fallback for ARM list models returning { value: T[], nextLink?: string } without @list.
+  if (httpOp.verb === "get") {
+    const okResp = httpOp.responses.find((r) => r.statusCodes === 200);
+    const bodyType = okResp?.responses.find((c) => c.body !== undefined)?.body?.type;
+    if (bodyType?.kind === "Model") {
+      let hasValueArray = false;
+      let hasNextLink = false;
+      for (const prop of walkPropertiesInherited(bodyType)) {
+        const wireName = resolveEncodedName(program, prop, "application/json");
+        if (
+          wireName === "value" &&
+          prop.type.kind === "Model" &&
+          isArrayModelType(program, prop.type)
+        ) {
+          hasValueArray = true;
+        }
+        if (wireName === "nextLink") {
+          hasNextLink = true;
+        }
+      }
+      if (hasValueArray && hasNextLink) {
+        return { itemName: "value", nextLinkName: "nextLink" };
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function scanExistingTypeSpecExamples(
+  typespecProjectDir: string,
+  apiVersion: string,
+): Map<string, Array<{ title: string; filePath: string }>> {
+  const index = new Map<string, Array<{ title: string; filePath: string }>>();
+  const examplesDir = path.join(typespecProjectDir, "examples", apiVersion);
+  if (!fs.existsSync(examplesDir)) {
+    return index;
+  }
+
+  const stack = [examplesDir];
+  while (stack.length > 0) {
+    const dir = stack.shift()!;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile() && entry.name.endsWith(".json")) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(full, "utf8")) as {
+            operationId?: string;
+            title?: string;
+          };
+          if (parsed.operationId) {
+            const key = parsed.operationId;
+            const list = index.get(key) ?? [];
+            list.push({
+              title: parsed.title ?? path.basename(full, ".json"),
+              filePath: full,
+            });
+            index.set(key, list);
+          }
+        } catch {
+          // Ignore malformed JSON in examples directory.
+        }
+      }
+    }
+  }
+  return index;
+}
+
+const PHASE_PRIORITY: Record<LifecyclePhase, number> = {
+  "preflight-discovery": 1,
+  "external-fixture": 2,
+  "negative-precheck": 3,
+  create: 4,
+  read: 5,
+  list: 6,
+  update: 7,
+  action: 8,
+  delete: 9,
+  "deleted-resource": 10,
+};
+
+export function computeTopologicalExecutionOrder(operations: OperationContract[]): string[] {
+  return [...operations]
+    .sort((a, b) => {
+      const aIsPreflight = a.phase === "preflight-discovery" ? 0 : 1;
+      const bIsPreflight = b.phase === "preflight-discovery" ? 0 : 1;
+      if (aIsPreflight !== bIsPreflight) {
+        return aIsPreflight - bIsPreflight;
+      }
+
+      const aIsDeleted = a.phase === "deleted-resource" ? 1 : 0;
+      const bIsDeleted = b.phase === "deleted-resource" ? 1 : 0;
+      if (aIsDeleted !== bIsDeleted) {
+        return aIsDeleted - bIsDeleted;
+      }
+
+      const aIsDelete = a.phase === "delete" ? 1 : 0;
+      const bIsDelete = b.phase === "delete" ? 1 : 0;
+      if (aIsDelete !== bIsDelete) {
+        return aIsDelete - bIsDelete;
+      }
+
+      // For delete operations, delete deeper child resources BEFORE parent resources!
+      if (a.phase === "delete" && b.phase === "delete" && a.depth !== b.depth) {
+        return b.depth - a.depth;
+      }
+
+      // For positive lifecycle operations, create/read/update/action parent resources BEFORE children!
+      if (a.depth !== b.depth) {
+        return a.depth - b.depth;
+      }
+
+      const phaseDiff = PHASE_PRIORITY[a.phase] - PHASE_PRIORITY[b.phase];
+      if (phaseDiff !== 0) {
+        return phaseDiff;
+      }
+
+      return a.operationId.localeCompare(b.operationId);
+    })
+    .map((op) => op.operationId);
+}
+
+export async function fetchProviderLiveMetadata(options: {
+  armBaseUrl: string;
+  subscriptionId: string;
+  providerNamespace: string;
+  targetApiVersion: string;
+  bearerToken?: string;
+}): Promise<ProviderLiveMetadata> {
+  const token = getArmBearerToken({
+    explicitToken: options.bearerToken,
+    subscriptionId: options.subscriptionId,
+  });
+  const base = options.armBaseUrl.replace(/\/+$/, "");
+  const url = `${base}/subscriptions/${encodeURIComponent(options.subscriptionId)}/providers/${encodeURIComponent(options.providerNamespace)}?api-version=2021-04-01`;
+  const resp = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!resp.ok) {
+    throw new Error(
+      `Failed to query live ARM provider metadata for ${options.providerNamespace}: HTTP ${resp.status}`,
+    );
+  }
+
+  const data = (await resp.json()) as {
+    namespace?: string;
+    registrationState?: string;
+    resourceTypes?: Array<{
+      resourceType?: string;
+      apiVersions?: string[];
+      defaultApiVersion?: string;
+      locations?: string[];
+    }>;
+  };
+
+  const resourceTypes = (data.resourceTypes ?? [])
+    .filter((rt) => Boolean(rt.resourceType))
+    .map((rt) => ({
+      resourceType: rt.resourceType!,
+      apiVersions: rt.apiVersions ?? [],
+      defaultApiVersion: rt.defaultApiVersion,
+      locations: rt.locations ?? [],
+    }));
+
+  const targetVersionSupportedOnArm = resourceTypes.some((rt) =>
+    rt.apiVersions.includes(options.targetApiVersion),
+  );
+
+  const locationCounts = new Map<string, number>();
+  for (const rt of resourceTypes) {
+    for (const loc of rt.locations) {
+      const normalized = loc.toLowerCase().replace(/\s+/g, "");
+      if (normalized && normalized !== "global") {
+        locationCounts.set(normalized, (locationCounts.get(normalized) ?? 0) + 1);
+      }
+    }
+  }
+  const preferredOrder = ["eastus", "eastus2", "westus2", "westus3", "centralus", "westeurope"];
+  const recommendedLocations = preferredOrder.filter((loc) => locationCounts.has(loc));
+  if (recommendedLocations.length === 0) {
+    recommendedLocations.push(...[...locationCounts.keys()].slice(0, 5));
+  }
+
+  return {
+    namespace: data.namespace ?? options.providerNamespace,
+    registrationState: data.registrationState,
+    resourceTypes,
+    targetVersionSupportedOnArm,
+    recommendedLocations,
+  };
+}
+
+export async function discoverSpecInventory(
+  options: DiscoverInventoryOptions,
+): Promise<CoverageLedger> {
+  const service = await loadProjectedTypeSpecService(options.specPath, options.apiVersion);
+  const {
+    program,
+    tcgcContext,
+    typespecProjectDir,
+    entrypointFile,
+    apiVersion,
+    availableApiVersions,
+    httpOperations,
+  } = service;
+  const armBaseUrl = (options.armBaseUrl ?? "https://management.azure.com").replace(/\/+$/, "");
+
+  const metadataInfo = createMetadataInfo(program);
+  const existingExamplesIndex = scanExistingTypeSpecExamples(typespecProjectDir, apiVersion);
+
+  const operationsMap: Record<string, OperationContract> = {};
+  const externalDepsMap = new Map<string, ExternalDependencyHint>();
+  let detectedNamespace = service.providerNamespace;
+
+  for (const httpOp of httpOperations) {
+    const method = httpOp.verb.toUpperCase() as HttpMethod;
+    const pathTemplate = httpOp.path;
+    const operationId = resolveCanonicalOperationId(tcgcContext, program, httpOp.operation);
+    const sourceLocation = extractOperationSourceLocation(httpOp.operation);
+
+    const { providerNamespace, resourceType, depth } = extractProviderAndResource(pathTemplate);
+    if (providerNamespace !== "Microsoft.Resources" && providerNamespace !== "Unknown.Provider") {
+      detectedNamespace = providerNamespace;
+    }
+
+    const pageable = extractPageableFromTypeSpec(program, httpOp);
+    const lroMeta = getLroMetadata(program, httpOp.operation);
+    const openApiExtensions = getExtensions(program, httpOp.operation);
+    const isLroDeclared =
+      Boolean(lroMeta) || openApiExtensions.get("x-ms-long-running-operation") === true;
+    const lroFinalStateVia = lroMeta?.finalStateVia;
+
+    const reqVisibility = resolveRequestVisibility(program, httpOp.operation, httpOp.verb);
+    const secretProperties = new Set<string>(collectTypeSpecResponseSecrets(program, httpOp));
+    let writableBodyProperties: string[] = [];
+    let readOnlyBodyProperties: string[] = [];
+    const opExternalDeps: ExternalDependencyHint[] = [];
+    const paramSpecs: OperationParameterSpec[] = [];
+
+    for (const p of httpOp.parameters.parameters) {
+      if (p.type === "cookie") {
+        continue;
+      }
+      const desc = describeTypeSpecType(p.param.type);
+      const format = getFormat(program, p.param) ?? getFormat(program, p.param.type);
+      const isSecretParam =
+        isSecret(program, p.param) ||
+        isSecret(program, p.param.type) ||
+        SECRET_PROPERTY_NAME_RE.test(p.name);
+      if (isSecretParam) {
+        secretProperties.add(p.name);
+      }
+
+      paramSpecs.push({
+        name: p.name,
+        in: p.type,
+        required: !p.param.optional,
+        type: desc.typeName,
+        format,
+        enumValues: desc.enumValues,
+        readOnly: isReadonlyProperty(program, p.param),
+        secretCandidate: isSecretParam,
+        externalResourceReference: p.name.toLowerCase().endsWith("resourceid")
+          ? "generic-arm-resource"
+          : undefined,
+      });
+    }
+
+    const reqBody = httpOp.parameters.body;
+    if (reqBody && !isVoidType(reqBody.type)) {
+      const bodyParamName = resolveBodyParameterName(tcgcContext, reqBody.property);
+      const bodyRequired = reqBody.property ? !reqBody.property.optional : true;
+      const bodyMeta = collectTypeSpecBodyMetadata(
+        program,
+        metadataInfo,
+        reqVisibility,
+        reqBody.type,
+        "",
+        0,
+        new Set<Type>(),
+        undefined,
+        bodyRequired,
+      );
+      writableBodyProperties = [...bodyMeta.writable].sort();
+      readOnlyBodyProperties = [...bodyMeta.readOnly].sort();
+      for (const s of bodyMeta.secrets) {
+        secretProperties.add(s);
+      }
+      for (const dep of bodyMeta.externalDeps.values()) {
+        opExternalDeps.push(dep);
+        const depKey = `${dep.kind}:${dep.propertyPath}`;
+        if (!externalDepsMap.has(depKey)) {
+          externalDepsMap.set(depKey, dep);
+        }
+      }
+
+      const bodyDesc = describeTypeSpecType(reqBody.type);
+      paramSpecs.push({
+        name: bodyParamName,
+        in: "body",
+        required: bodyRequired,
+        type: bodyDesc.typeName,
+        secretCandidate:
+          (reqBody.property ? isSecret(program, reqBody.property) : false) ||
+          isSecret(program, reqBody.type),
+      });
+    }
+
+    const declaredStatusCodesSet = new Set<string>();
+    const declaredResponseHeaders: Record<string, string[]> = {};
+    const declaredResponseHasSchema: Record<string, boolean> = {};
+    let hasDefaultErrorResponse = false;
+
+    for (const resp of httpOp.responses) {
+      if (resp.statusCodes === "*" || isErrorModel(program, resp.type)) {
+        hasDefaultErrorResponse = true;
+        if (resp.statusCodes === "*") {
+          continue;
+        }
+      }
+
+      const codes: string[] = [];
+      if (typeof resp.statusCodes === "number") {
+        codes.push(String(resp.statusCodes));
+      } else if (typeof resp.statusCodes === "object") {
+        for (let c = resp.statusCodes.start; c <= resp.statusCodes.end; c++) {
+          codes.push(String(c));
+        }
+      }
+
+      const headerSet = new Set<string>();
+      let hasBodySchema = false;
+      for (const content of resp.responses) {
+        for (const hName of Object.keys(content.headers ?? {})) {
+          headerSet.add(hName.toLowerCase());
+        }
+        if (content.body && !isVoidType(content.body.type)) {
+          hasBodySchema = true;
+        }
+      }
+
+      for (const code of codes) {
+        declaredStatusCodesSet.add(code);
+        if (headerSet.size > 0) {
+          const merged = new Set([...(declaredResponseHeaders[code] ?? []), ...headerSet]);
+          declaredResponseHeaders[code] = [...merged].sort();
+        }
+        declaredResponseHasSchema[code] = Boolean(declaredResponseHasSchema[code]) || hasBodySchema;
+      }
+    }
+
+    const matchedExamples = existingExamplesIndex.get(operationId) ?? [];
+
+    operationsMap[operationId] = {
+      operationId,
+      method,
+      pathTemplate,
+      typespecProjectDir,
+      entrypointFile,
+      sourceLocation,
+      apiVersion,
+      scope: inferScope(pathTemplate),
+      resourceType,
+      depth,
+      phase: classifyPhase(method, pathTemplate, operationId, pageable),
+      declaredStatusCodes: [...declaredStatusCodesSet].sort(),
+      declaredResponseHeaders,
+      declaredResponseHasSchema,
+      isLroDeclared,
+      lroFinalStateVia,
+      pageable,
+      hasDefaultErrorResponse,
+      parameters: paramSpecs,
+      writableBodyProperties,
+      readOnlyBodyProperties,
+      secretProperties: [...secretProperties].sort(),
+      externalDependencies: opExternalDeps,
+      existingExampleNames: matchedExamples.map((e) => e.title),
+      existingExamplePaths: matchedExamples.map((e) => e.filePath),
+    };
+  }
+
+  const allOperations = Object.values(operationsMap);
+  const executionOrder = computeTopologicalExecutionOrder(allOperations);
+
+  const coverage: Record<string, OperationCoverageEntry> = {};
+  for (const opId of executionOrder) {
+    const contract = operationsMap[opId];
+    coverage[opId] = {
+      operationId: opId,
+      method: contract.method,
+      pathTemplate: contract.pathTemplate,
+      sourceLocation: contract.sourceLocation,
+      phase: contract.phase,
+      resourceType: contract.resourceType,
+      status: "pending",
+      attempts: 0,
+      traceFiles: [],
+      discrepancyCount: 0,
+      generatedExamples: [],
+    };
+  }
+
+  const normalizedProject = typespecProjectDir.replace(/\\/g, "/");
+  const serviceMatch = /\/specification\/([^/]+)\//.exec(normalizedProject);
+  const serviceName = serviceMatch?.[1] ?? detectedNamespace;
+
+  let providerLiveMetadata: ProviderLiveMetadata | undefined;
+  if (
+    options.checkLiveProvider &&
+    options.subscriptionId &&
+    detectedNamespace !== "Unknown.Provider"
+  ) {
+    providerLiveMetadata = await fetchProviderLiveMetadata({
+      armBaseUrl,
+      subscriptionId: options.subscriptionId,
+      providerNamespace: detectedNamespace,
+      targetApiVersion: apiVersion,
+      bearerToken: options.bearerToken,
+    });
+  }
+
+  const now = new Date().toISOString();
+  const ledger: CoverageLedger = {
+    schemaVersion: "2.0-typespec",
+    createdAt: now,
+    updatedAt: now,
+    serviceName,
+    providerNamespace: detectedNamespace,
+    apiVersion,
+    availableApiVersions,
+    typespecProjectDir,
+    entrypointFile,
+    subscriptionId: options.subscriptionId,
+    location: options.location ?? providerLiveMetadata?.recommendedLocations[0],
+    armBaseUrl,
+    providerLiveMetadata,
+    externalDependencies: [...externalDepsMap.values()],
+    provisionedFixtures: [],
+    executionOrder,
+    operations: operationsMap,
+    coverage,
+  };
+
+  saveLedger(options.workDir, ledger);
+  return ledger;
+}

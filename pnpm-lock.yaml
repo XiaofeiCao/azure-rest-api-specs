@@ -724,6 +724,43 @@ importers:
         specifier: 'catalog:'
         version: 6.2.0
 
+  .github/skills/azure-arm-blackbox-test:
+    dependencies:
+      '@azure-tools/specs-shared':
+        specifier: workspace:*
+        version: link:../../shared
+      '@azure-tools/typespec-azure-core':
+        specifier: 'catalog:'
+        version: 0.73.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/http@1.17.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/streams@0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3))))(@typespec/rest@0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/http@1.17.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/streams@0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3)))))
+      '@azure-tools/typespec-azure-resource-manager':
+        specifier: 'catalog:'
+        version: 0.73.0(7f327fbcf017dd6acead538a3c60488b)
+      '@azure-tools/typespec-client-generator-core':
+        specifier: 'catalog:'
+        version: 0.73.0(92ef1a4b707fdf3547641bd00a0f6725)
+      '@typespec/compiler':
+        specifier: 'catalog:'
+        version: 1.17.0(@types/node@26.6.3)
+      '@typespec/http':
+        specifier: 'catalog:'
+        version: 1.17.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/streams@0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3)))
+      '@typespec/openapi':
+        specifier: 'catalog:'
+        version: 1.17.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/http@1.17.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/streams@0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3))))
+      '@typespec/rest':
+        specifier: 'catalog:'
+        version: 0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/http@1.17.0(@typespec/compiler@1.17.0(@types/node@26.6.3))(@typespec/streams@0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3))))
+      '@typespec/versioning':
+        specifier: 'catalog:'
+        version: 0.87.0(@typespec/compiler@1.17.0(@types/node@26.6.3))
+      yaml:
+        specifier: 'catalog:'
+        version: 2.9.1
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 26.6.3
+
   .github/skills/azure-typespec-assessment:
     dependencies:
       yaml:
