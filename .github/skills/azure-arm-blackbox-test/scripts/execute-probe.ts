@@ -3,6 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   analyzeBehavioralDiscrepancies,
   extractProvisioningState,
+  isFailedOrCanceledState,
   isNonTerminalProvisioningState,
   runTypeSpecLiveValidation,
   runTypeSpecMonitorResultValidation,
@@ -165,7 +166,11 @@ function synthesizeSlotName(
   );
 }
 
-function doesUrlMatchPathTemplate(pathTemplate: string, actualUrl: string): boolean {
+function doesUrlMatchPathTemplate(
+  pathTemplate: string,
+  actualUrl: string,
+  parameters: OperationParameterSpec[] = [],
+): boolean {
   const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
   const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
   const templateSegs = cleanTemplate.split("/").filter(Boolean);
@@ -173,7 +178,14 @@ function doesUrlMatchPathTemplate(pathTemplate: string, actualUrl: string): bool
     .map((seg) => {
       const m = /^\{([^}]+)\}$/.exec(seg);
       if (m) {
-        return m[1].toLowerCase() === "scope" ? "(.+)" : "([^/]+)";
+        const slotName = m[1];
+        const paramSpec = parameters.find(
+          (p) => p.in === "path" && p.name.toLowerCase() === slotName.toLowerCase(),
+        );
+        // Allow slash-spanning matches for any @path(#{ allowReserved: true }) parameter as well as {scope} (#4158)!
+        const canSpanSlashes =
+          Boolean(paramSpec?.allowReserved) || slotName.toLowerCase() === "scope";
+        return canSpanSlashes ? "(.+)" : "([^/]+)";
       }
       return seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     })
@@ -383,18 +395,19 @@ function extractAsyncMonitorStatus(body: unknown): string | undefined {
   return extractProvisioningState(body);
 }
 
-function parseRetryAfterMs(
-  headers: Record<string, string>,
-  fallbackMs: number,
-  maxStepWaitMs = 15_000,
-): number {
-  const raw = headers["retry-after"];
+function parseRetryAfterMs(headers: Record<string, string>, fallbackMs: number): number {
+  const raw = headers["retry-after"]?.trim();
   if (!raw) {
     return fallbackMs;
   }
+  // Honor server-requested Retry-After (both delta-seconds and HTTP-date) without shortening (#4190)!
   const seconds = Number(raw);
   if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(Math.max(seconds * 1000, Math.min(fallbackMs, 250)), maxStepWaitMs);
+    return seconds === 0 ? Math.min(fallbackMs, 250) : Math.round(seconds * 1000);
+  }
+  const parsedDateMs = Date.parse(raw);
+  if (Number.isFinite(parsedDateMs)) {
+    return Math.max(0, parsedDateMs - Date.now());
   }
   return fallbackMs;
 }
@@ -582,7 +595,10 @@ export async function executeOperationProbe(
     contract.apiVersion,
     input.query,
   );
-  if (!expectError && !doesUrlMatchPathTemplate(contract.pathTemplate, targetUrl)) {
+  if (
+    !expectError &&
+    !doesUrlMatchPathTemplate(contract.pathTemplate, targetUrl, contract.parameters)
+  ) {
     throw new Error(
       `Positive probe URL "${new URL(targetUrl).pathname}" does not match declared route template "${contract.pathTemplate}" for "${contract.operationId}".`,
     );
@@ -647,12 +663,16 @@ export async function executeOperationProbe(
         },
       });
       ownedTargetResources.push(identity);
+      // Persist newly created target-RP resource ownership immediately before LRO polling so interrupted runs can still purge (#4267)!
+      saveLedger(options.workDir, ledger);
     }
   }
 
   const shouldPoll = input.pollLro !== false && !expectError && method !== "GET";
   const maxPollAttempts = input.maxPollAttempts ?? 45;
   const defaultPollIntervalMs = input.pollIntervalMs ?? 2000;
+  const maxPollDurationMs = input.maxPollDurationMs ?? 15 * 60_000;
+  const pollDeadlineMs = Date.now() + maxPollDurationMs;
 
   const lroInit =
     initialExchange.response.status >= 200 &&
@@ -672,271 +692,282 @@ export async function executeOperationProbe(
   };
 
   let lroFailureReason: string | undefined;
+  let paginationCompletedCleanly = true;
+  let paginationFailureReason: string | undefined;
+  let followUpException: unknown;
 
-  if (observedLro.detected) {
-    if (!shouldPoll || !lroInit.pollTargetUrl) {
-      observedLro.completionStatus = "timed_out";
-      lroFailureReason = !shouldPoll
-        ? "LRO detected on wire, but polling was disabled (--no-poll)."
-        : "LRO detected on wire, but no polling target URL could be determined.";
-    } else {
-      let currentPollUrl = resolvePollingUrl(ledger.armBaseUrl, lroInit.pollTargetUrl);
-      let lastWaitHeaders = initialExchange.response.headers;
-      let pollFinished = false;
-      let monitorDeliveredPayload = false;
-
-      for (let attempt = 1; attempt <= maxPollAttempts; attempt++) {
-        const waitMs = parseRetryAfterMs(
-          lastWaitHeaders,
-          defaultPollIntervalMs,
-          Math.max(defaultPollIntervalMs * 5, 15_000),
-        );
-        if (waitMs > 0) {
-          await delay(waitMs);
-        }
-
-        const pollExchange = await sendRawHttpExchange({
-          step: "poll",
-          method: "GET",
-          url: currentPollUrl,
-          bearerToken: token,
-          extraSensitiveHeaders: secretHeaderNames,
-          safetyContext,
-        });
-        exchanges.push(pollExchange);
-        observedLro.pollCount++;
-        lastWaitHeaders = pollExchange.response.headers;
-
-        if (pollExchange.response.status >= 400) {
-          pollFinished = true;
-          observedLro.completionStatus = "failed";
-          observedLro.terminalProvisioningState = "Failed";
-          lroFailureReason = `LRO poll returned HTTP ${pollExchange.response.status}.`;
-          break;
-        }
-
-        if (
-          lroInit.pollingHeaderUsed === "azure-asyncoperation" ||
-          lroInit.pollingHeaderUsed === "operation-location"
-        ) {
-          const monitorStatus = extractAsyncMonitorStatus(pollExchange.response.body);
-          if (monitorStatus) {
-            observedLro.terminalProvisioningState = monitorStatus;
-          }
-          if (monitorStatus && !isNonTerminalProvisioningState(monitorStatus)) {
-            pollFinished = true;
-            const lowerTerm = monitorStatus.toLowerCase();
-            if (lowerTerm === "failed" || lowerTerm === "canceled") {
-              observedLro.completionStatus = "failed";
-              lroFailureReason = `LRO terminated with status "${monitorStatus}".`;
-            } else {
-              observedLro.completionStatus = "succeeded";
-            }
-            const bodyObj =
-              pollExchange.response.body && typeof pollExchange.response.body === "object"
-                ? (pollExchange.response.body as Record<string, unknown>)
-                : undefined;
-            if (bodyObj && (bodyObj.properties !== undefined || bodyObj.result !== undefined)) {
-              monitorDeliveredPayload = true;
-            }
-            break;
-          }
-        } else if (lroInit.pollingHeaderUsed === "location") {
-          if (pollExchange.response.headers.location) {
-            currentPollUrl = resolvePollingUrl(
-              ledger.armBaseUrl,
-              pollExchange.response.headers.location,
-            );
-          }
-          const pollProvState = extractProvisioningState(pollExchange.response.body);
-          if (pollProvState) {
-            observedLro.terminalProvisioningState = pollProvState;
-          }
-          // Continue polling when Location returns 202 OR returns 200 with a non-terminal provisioningState (#8098)!
-          if (
-            pollExchange.response.status !== 202 &&
-            !isNonTerminalProvisioningState(pollProvState)
-          ) {
-            pollFinished = true;
-            const termState =
-              pollProvState ?? (pollExchange.response.status < 300 ? "Succeeded" : "Failed");
-            observedLro.terminalProvisioningState = termState;
-            const lowerTerm = termState.toLowerCase();
-            if (
-              pollExchange.response.status >= 300 ||
-              lowerTerm === "failed" ||
-              lowerTerm === "canceled"
-            ) {
-              observedLro.completionStatus = "failed";
-              lroFailureReason = `Location LRO completed with status ${pollExchange.response.status} (${termState}).`;
-            } else {
-              observedLro.completionStatus = "succeeded";
-            }
-            observedLro.finalResultSource =
-              pollExchange.response.body !== undefined ? "location-body" : "none";
-            break;
-          }
-        } else if (lroInit.pollingHeaderUsed === "resource-get") {
-          const provState = extractProvisioningState(pollExchange.response.body);
-          observedLro.terminalProvisioningState = provState;
-          if (!isNonTerminalProvisioningState(provState)) {
-            pollFinished = true;
-            const lowerTerm = (provState ?? "Succeeded").toLowerCase();
-            if (lowerTerm === "failed" || lowerTerm === "canceled") {
-              observedLro.completionStatus = "failed";
-              lroFailureReason = `Resource provisioning terminated with state "${provState}".`;
-            } else {
-              observedLro.completionStatus = "succeeded";
-            }
-            observedLro.finalResultSource = "final-resource-get";
-            break;
-          }
-        }
-      }
-
-      if (!pollFinished) {
+  try {
+    if (observedLro.detected) {
+      if (!shouldPoll || !lroInit.pollTargetUrl) {
         observedLro.completionStatus = "timed_out";
-        lroFailureReason = `LRO did not reach a terminal state within ${maxPollAttempts} poll attempts.`;
-      }
+        lroFailureReason = !shouldPoll
+          ? "LRO detected on wire, but polling was disabled (--no-poll)."
+          : "LRO detected on wire, but no polling target URL could be determined.";
+      } else {
+        let currentPollUrl = resolvePollingUrl(ledger.armBaseUrl, lroInit.pollTargetUrl);
+        let lastWaitHeaders = initialExchange.response.headers;
+        let pollFinished = false;
+        let monitorDeliveredPayload = false;
 
-      if (
-        pollFinished &&
-        observedLro.completionStatus === "succeeded" &&
-        (lroInit.pollingHeaderUsed === "azure-asyncoperation" ||
-          lroInit.pollingHeaderUsed === "operation-location")
-      ) {
-        if (method === "PUT" || method === "PATCH") {
-          const finalGet = await sendRawHttpExchange({
-            step: "final-get",
+        for (let attempt = 1; attempt <= maxPollAttempts; attempt++) {
+          const waitMs = parseRetryAfterMs(lastWaitHeaders, defaultPollIntervalMs);
+          if (Date.now() + waitMs > pollDeadlineMs) {
+            lroFailureReason = `LRO polling exceeded maxPollDurationMs (${maxPollDurationMs}ms) while honoring Retry-After (${waitMs}ms).`;
+            break;
+          }
+          if (waitMs > 0) {
+            await delay(waitMs);
+          }
+
+          const pollExchange = await sendRawHttpExchange({
+            step: "poll",
             method: "GET",
-            url: targetUrl,
+            url: currentPollUrl,
             bearerToken: token,
             extraSensitiveHeaders: secretHeaderNames,
             safetyContext,
           });
-          exchanges.push(finalGet);
-          const finalProv = extractProvisioningState(finalGet.response.body);
-          if (finalProv) {
-            observedLro.terminalProvisioningState = finalProv;
-          }
-          observedLro.finalResultSource = "final-resource-get";
-          if (
-            finalGet.response.status < 200 ||
-            finalGet.response.status >= 300 ||
-            isNonTerminalProvisioningState(finalProv) ||
-            finalProv?.toLowerCase() === "failed" ||
-            finalProv?.toLowerCase() === "canceled"
-          ) {
-            observedLro.completionStatus = "failed";
-            lroFailureReason = `Final resource GET failed with HTTP ${finalGet.response.status}${finalProv ? ` (${finalProv})` : ""}.`;
-          }
-        } else if (method === "POST") {
-          const declaresLocationFinalState =
-            contract.lroFinalStateVia?.toLowerCase() === "location";
-          const locationHeaderUrl =
-            initialExchange.response.headers.location ?? lastWaitHeaders.location;
+          exchanges.push(pollExchange);
+          observedLro.pollCount++;
+          lastWaitHeaders = pollExchange.response.headers;
 
-          // Honor declared final-state-via="location" BEFORE falling back to status-monitor fields (#14).
-          if (declaresLocationFinalState && locationHeaderUrl) {
-            const locUrl = resolvePollingUrl(ledger.armBaseUrl, locationHeaderUrl);
-            const locGet = await sendRawHttpExchange({
+          // Honor Retry-After on transient 429 poll responses instead of immediately failing (#4190).
+          if (pollExchange.response.status === 429) {
+            continue;
+          }
+
+          if (pollExchange.response.status >= 400) {
+            pollFinished = true;
+            observedLro.completionStatus = "failed";
+            observedLro.terminalProvisioningState = "Failed";
+            lroFailureReason = `LRO poll returned HTTP ${pollExchange.response.status}.`;
+            break;
+          }
+
+          if (
+            lroInit.pollingHeaderUsed === "azure-asyncoperation" ||
+            lroInit.pollingHeaderUsed === "operation-location"
+          ) {
+            const monitorStatus = extractAsyncMonitorStatus(pollExchange.response.body);
+            if (monitorStatus) {
+              observedLro.terminalProvisioningState = monitorStatus;
+            }
+            if (monitorStatus && !isNonTerminalProvisioningState(monitorStatus)) {
+              pollFinished = true;
+              if (isFailedOrCanceledState(monitorStatus)) {
+                observedLro.completionStatus = "failed";
+                lroFailureReason = `LRO terminated with status "${monitorStatus}".`;
+              } else {
+                observedLro.completionStatus = "succeeded";
+              }
+              const bodyObj =
+                pollExchange.response.body && typeof pollExchange.response.body === "object"
+                  ? (pollExchange.response.body as Record<string, unknown>)
+                  : undefined;
+              if (bodyObj && (bodyObj.properties !== undefined || bodyObj.result !== undefined)) {
+                monitorDeliveredPayload = true;
+              }
+              break;
+            }
+          } else if (lroInit.pollingHeaderUsed === "location") {
+            if (pollExchange.response.headers.location) {
+              currentPollUrl = resolvePollingUrl(
+                ledger.armBaseUrl,
+                pollExchange.response.headers.location,
+              );
+            }
+            const pollProvState = extractProvisioningState(pollExchange.response.body);
+            if (pollProvState) {
+              observedLro.terminalProvisioningState = pollProvState;
+            }
+            if (
+              pollExchange.response.status !== 202 &&
+              !isNonTerminalProvisioningState(pollProvState)
+            ) {
+              pollFinished = true;
+              const termState =
+                pollProvState ?? (pollExchange.response.status < 300 ? "Succeeded" : "Failed");
+              observedLro.terminalProvisioningState = termState;
+              if (pollExchange.response.status >= 300 || isFailedOrCanceledState(termState)) {
+                observedLro.completionStatus = "failed";
+                lroFailureReason = `Location LRO completed with status ${pollExchange.response.status} (${termState}).`;
+              } else {
+                observedLro.completionStatus = "succeeded";
+              }
+              observedLro.finalResultSource =
+                pollExchange.response.body !== undefined ? "location-body" : "none";
+              break;
+            }
+          } else if (lroInit.pollingHeaderUsed === "resource-get") {
+            const provState = extractProvisioningState(pollExchange.response.body);
+            observedLro.terminalProvisioningState = provState;
+            if (!isNonTerminalProvisioningState(provState)) {
+              pollFinished = true;
+              const termState = provState ?? "Succeeded";
+              if (isFailedOrCanceledState(termState)) {
+                observedLro.completionStatus = "failed";
+                lroFailureReason = `Resource provisioning terminated with state "${provState}".`;
+              } else {
+                observedLro.completionStatus = "succeeded";
+              }
+              observedLro.finalResultSource = "final-resource-get";
+              break;
+            }
+          }
+        }
+
+        if (!pollFinished) {
+          observedLro.completionStatus = "timed_out";
+          lroFailureReason ??= `LRO did not reach a terminal state within ${maxPollAttempts} poll attempts.`;
+        }
+
+        if (
+          pollFinished &&
+          observedLro.completionStatus === "succeeded" &&
+          (lroInit.pollingHeaderUsed === "azure-asyncoperation" ||
+            lroInit.pollingHeaderUsed === "operation-location")
+        ) {
+          if (method === "PUT" || method === "PATCH") {
+            const finalGet = await sendRawHttpExchange({
               step: "final-get",
               method: "GET",
-              url: locUrl,
+              url: targetUrl,
               bearerToken: token,
               extraSensitiveHeaders: secretHeaderNames,
               safetyContext,
             });
-            exchanges.push(locGet);
-            observedLro.finalResultSource =
-              locGet.response.body !== undefined ? "location-body" : "none";
-            if (locGet.response.status < 200 || locGet.response.status >= 300) {
-              observedLro.completionStatus = "failed";
-              lroFailureReason = `POST Location final-result GET failed with HTTP ${locGet.response.status}.`;
+            exchanges.push(finalGet);
+            const finalProv = extractProvisioningState(finalGet.response.body);
+            if (finalProv) {
+              observedLro.terminalProvisioningState = finalProv;
             }
-          } else if (monitorDeliveredPayload) {
-            observedLro.finalResultSource = "status-monitor-body";
-          } else if (locationHeaderUrl) {
-            const locUrl = resolvePollingUrl(ledger.armBaseUrl, locationHeaderUrl);
-            const locGet = await sendRawHttpExchange({
-              step: "final-get",
-              method: "GET",
-              url: locUrl,
-              bearerToken: token,
-              extraSensitiveHeaders: secretHeaderNames,
-              safetyContext,
-            });
-            exchanges.push(locGet);
-            observedLro.finalResultSource =
-              locGet.response.body !== undefined ? "location-body" : "none";
-            if (locGet.response.status < 200 || locGet.response.status >= 300) {
+            observedLro.finalResultSource = "final-resource-get";
+            if (
+              finalGet.response.status < 200 ||
+              finalGet.response.status >= 300 ||
+              isNonTerminalProvisioningState(finalProv) ||
+              isFailedOrCanceledState(finalProv)
+            ) {
               observedLro.completionStatus = "failed";
-              lroFailureReason = `POST Location final-result GET failed with HTTP ${locGet.response.status}.`;
+              lroFailureReason = `Final resource GET failed with HTTP ${finalGet.response.status}${finalProv ? ` (${finalProv})` : ""}.`;
             }
-          } else {
+          } else if (method === "POST") {
+            const declaresLocationFinalState =
+              contract.lroFinalStateVia?.toLowerCase() === "location";
+            const locationHeaderUrl =
+              initialExchange.response.headers.location ?? lastWaitHeaders.location;
+
+            if (declaresLocationFinalState && locationHeaderUrl) {
+              const locUrl = resolvePollingUrl(ledger.armBaseUrl, locationHeaderUrl);
+              const locGet = await sendRawHttpExchange({
+                step: "final-get",
+                method: "GET",
+                url: locUrl,
+                bearerToken: token,
+                extraSensitiveHeaders: secretHeaderNames,
+                safetyContext,
+              });
+              exchanges.push(locGet);
+              observedLro.finalResultSource =
+                locGet.response.body !== undefined ? "location-body" : "none";
+              if (locGet.response.status < 200 || locGet.response.status >= 300) {
+                observedLro.completionStatus = "failed";
+                lroFailureReason = `POST Location final-result GET failed with HTTP ${locGet.response.status}.`;
+              }
+            } else if (monitorDeliveredPayload) {
+              observedLro.finalResultSource = "status-monitor-body";
+            } else if (locationHeaderUrl) {
+              const locUrl = resolvePollingUrl(ledger.armBaseUrl, locationHeaderUrl);
+              const locGet = await sendRawHttpExchange({
+                step: "final-get",
+                method: "GET",
+                url: locUrl,
+                bearerToken: token,
+                extraSensitiveHeaders: secretHeaderNames,
+                safetyContext,
+              });
+              exchanges.push(locGet);
+              observedLro.finalResultSource =
+                locGet.response.body !== undefined ? "location-body" : "none";
+              if (locGet.response.status < 200 || locGet.response.status >= 300) {
+                observedLro.completionStatus = "failed";
+                lroFailureReason = `POST Location final-result GET failed with HTTP ${locGet.response.status}.`;
+              }
+            } else {
+              observedLro.finalResultSource = "none";
+            }
+          } else if (method === "DELETE") {
             observedLro.finalResultSource = "none";
           }
-        } else if (method === "DELETE") {
-          observedLro.finalResultSource = "none";
         }
       }
     }
-  }
 
-  // Traverse all nextLink continuation pages with cycle & maxPages bounds (#15 / #16).
-  const maxPages = input.maxPaginationPages ?? 25;
-  const visitedNextLinks = new Set<string>([targetUrl]);
-  let currentPageExchange = initialExchange;
-  let pagesFetched = 1;
-  let paginationCompletedCleanly = true;
-  let paginationFailureReason: string | undefined;
+    // Traverse all nextLink continuation pages with cycle & maxPages bounds (#15 / #16).
+    const maxPages = input.maxPaginationPages ?? 25;
+    const visitedNextLinks = new Set<string>([targetUrl]);
+    let currentPageExchange = initialExchange;
+    let pagesFetched = 1;
+    const pagingHint = contract.pageable ?? contract.inferredPagination;
+
+    while (
+      input.followNextLink !== false &&
+      !expectError &&
+      method === "GET" &&
+      currentPageExchange.response.status === 200 &&
+      currentPageExchange.response.body &&
+      typeof currentPageExchange.response.body === "object"
+    ) {
+      const nextLinkField = pagingHint?.nextLinkName ?? "nextLink";
+      const nextLinkVal = nextLinkField
+        ? (currentPageExchange.response.body as Record<string, unknown>)[nextLinkField]
+        : undefined;
+      if (typeof nextLinkVal !== "string" || nextLinkVal.length === 0) {
+        break;
+      }
+      const resolvedNext = resolvePollingUrl(ledger.armBaseUrl, nextLinkVal);
+      if (visitedNextLinks.has(resolvedNext)) {
+        paginationCompletedCleanly = false;
+        paginationFailureReason = `Pagination cycle detected on nextLink: ${resolvedNext}`;
+        break;
+      }
+      if (pagesFetched >= maxPages) {
+        paginationCompletedCleanly = false;
+        paginationFailureReason = `Pagination exceeded maxPaginationPages (${maxPages}) without exhausting nextLink.`;
+        break;
+      }
+      visitedNextLinks.add(resolvedNext);
+      const nextPageExchange = await sendRawHttpExchange({
+        step: "next-page",
+        method: "GET",
+        url: resolvedNext,
+        bearerToken: token,
+        extraSensitiveHeaders: secretHeaderNames,
+        safetyContext,
+      });
+      exchanges.push(nextPageExchange);
+      pagesFetched++;
+      currentPageExchange = nextPageExchange;
+      if (nextPageExchange.response.status < 200 || nextPageExchange.response.status >= 300) {
+        paginationCompletedCleanly = false;
+        paginationFailureReason = `Continuation page ${pagesFetched} failed with HTTP ${nextPageExchange.response.status}.`;
+        break;
+      }
+    }
+  } catch (err) {
+    // Persist partial trace & failure status if any follow-up poll/final-get/nextLink throws or fails safety check (#4267)!
+    followUpException = err;
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (observedLro.detected && observedLro.completionStatus !== "succeeded") {
+      observedLro.completionStatus = "failed";
+      lroFailureReason = errMsg;
+    } else {
+      paginationCompletedCleanly = false;
+      paginationFailureReason = errMsg;
+    }
+  }
 
   const pagingHint = contract.pageable ?? contract.inferredPagination;
-
-  while (
-    input.followNextLink !== false &&
-    !expectError &&
-    method === "GET" &&
-    currentPageExchange.response.status === 200 &&
-    currentPageExchange.response.body &&
-    typeof currentPageExchange.response.body === "object"
-  ) {
-    const nextLinkField = pagingHint?.nextLinkName ?? "nextLink";
-    const nextLinkVal = nextLinkField
-      ? (currentPageExchange.response.body as Record<string, unknown>)[nextLinkField]
-      : undefined;
-    if (typeof nextLinkVal !== "string" || nextLinkVal.length === 0) {
-      break;
-    }
-    const resolvedNext = resolvePollingUrl(ledger.armBaseUrl, nextLinkVal);
-    if (visitedNextLinks.has(resolvedNext)) {
-      paginationCompletedCleanly = false;
-      paginationFailureReason = `Pagination cycle detected on nextLink: ${resolvedNext}`;
-      break;
-    }
-    if (pagesFetched >= maxPages) {
-      paginationCompletedCleanly = false;
-      paginationFailureReason = `Pagination exceeded maxPaginationPages (${maxPages}) without exhausting nextLink.`;
-      break;
-    }
-    visitedNextLinks.add(resolvedNext);
-    const nextPageExchange = await sendRawHttpExchange({
-      step: "next-page",
-      method: "GET",
-      url: resolvedNext,
-      bearerToken: token,
-      extraSensitiveHeaders: secretHeaderNames,
-      safetyContext,
-    });
-    exchanges.push(nextPageExchange);
-    pagesFetched++;
-    currentPageExchange = nextPageExchange;
-    if (nextPageExchange.response.status < 200 || nextPageExchange.response.status >= 300) {
-      paginationCompletedCleanly = false;
-      paginationFailureReason = `Continuation page ${pagesFetched} failed with HTTP ${nextPageExchange.response.status}.`;
-      break;
-    }
-  }
 
   const { requestErrors: requestSchemaErrors, responseErrors: responseSchemaErrors } =
     await runTypeSpecLiveValidation(
@@ -988,12 +1019,17 @@ export async function executeOperationProbe(
     }
   }
 
-  // Also validate LRO results delivered inside an Azure-AsyncOperation / Operation-Location status monitor (#8127).
+  // Validate LRO results on completed monitored POSTs whenever no separate final GET occurred
+  // (including when the monitor returned only { status: "Succeeded" } and omitted a required logical result: #4241)!
+  let missingRequiredMonitorResult = false;
   if (
     !hasSeparateFinalGet &&
     lastPollExchange &&
     observedLro.completionStatus === "succeeded" &&
-    observedLro.finalResultSource === "status-monitor-body"
+    (observedLro.finalResultSource === "status-monitor-body" ||
+      (method === "POST" &&
+        (lroInit.pollingHeaderUsed === "azure-asyncoperation" ||
+          lroInit.pollingHeaderUsed === "operation-location")))
   ) {
     const monitorIssues = await runTypeSpecMonitorResultValidation(
       contract.typespecProjectDir,
@@ -1002,6 +1038,9 @@ export async function executeOperationProbe(
       lastPollExchange.response.body,
     );
     appendUniqueResponseErrors(monitorIssues);
+    if (monitorIssues.some((e) => e.code === "MISSING_LRO_MONITOR_RESULT")) {
+      missingRequiredMonitorResult = true;
+    }
   }
 
   const normalizedTargetPath = new URL(targetUrl).pathname.replace(/\/+$/, "").toLowerCase();
@@ -1027,22 +1066,27 @@ export async function executeOperationProbe(
   const isInitial2xx =
     initialExchange.response.status >= 200 && initialExchange.response.status < 300;
   const initialWriteTerminalState =
-    method !== "GET"
-      ? extractProvisioningState(initialExchange.response.body)?.toLowerCase()
-      : undefined;
-  const isImmediateFailedWrite =
-    initialWriteTerminalState === "failed" ||
-    initialWriteTerminalState === "canceled" ||
-    initialWriteTerminalState === "cancelled";
+    method !== "GET" ? extractProvisioningState(initialExchange.response.body) : undefined;
+  const isImmediateFailedWrite = isFailedOrCanceledState(initialWriteTerminalState);
 
   const lroCompletedOk = !observedLro.detected || observedLro.completionStatus === "succeeded";
   const probeSucceeded = expectError
-    ? initialExchange.response.status >= 400 && initialExchange.response.status < 500
-    : isInitial2xx && !isImmediateFailedWrite && lroCompletedOk && paginationCompletedCleanly;
+    ? followUpException === undefined &&
+      initialExchange.response.status >= 400 &&
+      initialExchange.response.status < 500
+    : followUpException === undefined &&
+      isInitial2xx &&
+      !isImmediateFailedWrite &&
+      !missingRequiredMonitorResult &&
+      lroCompletedOk &&
+      paginationCompletedCleanly;
 
   const failureReason = !probeSucceeded
     ? ((isImmediateFailedWrite
         ? `Operation returned HTTP ${initialExchange.response.status} with terminal provisioningState "${initialWriteTerminalState}".`
+        : undefined) ??
+      (missingRequiredMonitorResult
+        ? `Monitored POST LRO completed without delivering declared final result payload.`
         : undefined) ??
       lroFailureReason ??
       paginationFailureReason ??
@@ -1152,5 +1196,13 @@ export async function executeOperationProbe(
   }
 
   saveLedger(options.workDir, ledger);
+  if (followUpException !== undefined) {
+    if (followUpException instanceof Error) {
+      throw followUpException;
+    }
+    throw new Error(
+      typeof followUpException === "string" ? followUpException : JSON.stringify(followUpException),
+    );
+  }
   return { trace, traceFile };
 }

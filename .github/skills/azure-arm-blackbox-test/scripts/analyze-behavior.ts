@@ -13,6 +13,14 @@ import {
 } from "./types.ts";
 
 const TERMINAL_PROVISIONING_STATES = new Set(["succeeded", "failed", "canceled", "cancelled"]);
+const FAILED_OR_CANCELED_STATES = new Set(["failed", "canceled", "cancelled"]);
+
+export function isFailedOrCanceledState(state: string | undefined): boolean {
+  if (!state) {
+    return false;
+  }
+  return FAILED_OR_CANCELED_STATES.has(state.trim().toLowerCase());
+}
 
 export function extractProvisioningState(body: unknown): string | undefined {
   if (!body || typeof body !== "object") {
@@ -187,28 +195,51 @@ export function analyzeBehavioralDiscrepancies(
       });
     } else {
       const declaredHeaders = contract.declaredResponseHeaders[initialStatus] ?? [];
-      const expectsAzureAsync = declaredHeaders.includes("azure-asyncoperation");
-      const expectsLocation = declaredHeaders.includes("location");
+      const requiredAlternatives = contract.declaredRequiredResponseHeaders?.[initialStatus];
       const actualHasAzureAsync = Boolean(initial.response.headers["azure-asyncoperation"]);
       const actualHasLocation = Boolean(initial.response.headers.location);
+      const actualHasOpLocation = Boolean(initial.response.headers["operation-location"]);
+
+      // Respect optional polling headers & response alternatives (#4113):
+      // only report missing headers when NO declared response alternative has its required polling headers satisfied.
+      const missingRequiredHeader =
+        requiredAlternatives && requiredAlternatives.length > 0
+          ? !requiredAlternatives.some((reqSet) =>
+              reqSet
+                .filter(
+                  (h) =>
+                    h === "azure-asyncoperation" || h === "location" || h === "operation-location",
+                )
+                .every((h) => Boolean(initial.response.headers[h])),
+            )
+          : (declaredHeaders.includes("azure-asyncoperation") &&
+              !actualHasAzureAsync &&
+              !actualHasLocation) ||
+            (declaredHeaders.includes("location") && !actualHasLocation && !actualHasAzureAsync);
+
+      const allowsAzureAsync = declaredHeaders.includes("azure-asyncoperation");
+      const unexpectedAzureAsync =
+        declaredHeaders.length > 0 && !allowsAzureAsync && actualHasAzureAsync;
+
       if (
         (initial.response.status === 201 || initial.response.status === 202) &&
         observedLro.detected &&
-        ((expectsAzureAsync && !actualHasAzureAsync) ||
-          (expectsLocation && !actualHasLocation) ||
-          (declaredHeaders.length > 0 && !expectsAzureAsync && actualHasAzureAsync))
+        (missingRequiredHeader || unexpectedAzureAsync)
       ) {
         discrepancies.push({
           ruleId: DISCREPANCY_RULES.LRO_HEADER_DRIFT,
           severity: "warning",
           operationId: contract.operationId,
+          sourceLocation: contract.sourceLocation,
           summary: `Declared LRO polling headers for HTTP ${initialStatus} on ${contract.operationId} do not match live wire headers.`,
-          specExpectation: `Declared response headers on ${initialStatus}: [${declaredHeaders.join(", ")}].`,
-          actualWireBehavior: `Live response provided: azure-asyncoperation=${actualHasAzureAsync}, location=${actualHasLocation}.`,
+          specExpectation: `Declared response headers on ${initialStatus}: [${declaredHeaders.join(", ")}]${requiredAlternatives ? ` (required alternatives: ${JSON.stringify(requiredAlternatives)})` : ""}.`,
+          actualWireBehavior: `Live response provided: azure-asyncoperation=${actualHasAzureAsync}, location=${actualHasLocation}, operation-location=${actualHasOpLocation}.`,
           evidence: {
             declaredHeaders,
+            requiredAlternatives,
             actualAsyncOperation: actualHasAzureAsync,
             actualLocation: actualHasLocation,
+            actualOperationLocation: actualHasOpLocation,
           },
         });
       }

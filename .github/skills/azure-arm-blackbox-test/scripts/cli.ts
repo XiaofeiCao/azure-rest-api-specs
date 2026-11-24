@@ -46,6 +46,7 @@ export async function runCli(argv: string[]): Promise<void> {
         location: { type: "string" },
         "arm-base-url": { type: "string" },
         "check-live-provider": { type: "boolean", default: false },
+        reset: { type: "boolean", default: false },
       },
     });
     if (!values.spec || !values["work-dir"]) {
@@ -59,6 +60,7 @@ export async function runCli(argv: string[]): Promise<void> {
       location: values.location,
       armBaseUrl: values["arm-base-url"],
       checkLiveProvider: values["check-live-provider"],
+      reset: values.reset,
     });
     console.log(
       JSON.stringify(

@@ -78,6 +78,39 @@ function extractPathParametersFromUrl(
   return extracted;
 }
 
+function sanitizeResponseBodyForStatus(
+  contract: OperationContract,
+  statusCode: string,
+  body: unknown,
+  sanitizeCtx: SanitizeContext,
+): unknown {
+  if (body === undefined) {
+    return undefined;
+  }
+  if (contract.secretResponseStatuses?.includes(statusCode)) {
+    return "<redacted>";
+  }
+  return sanitizePayload(body, sanitizeCtx);
+}
+
+function sanitizeSafeExampleStem(raw: string): string {
+  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^\.+/, "_");
+  return cleaned || "operation";
+}
+
+function assertContainedFilePath(parentDir: string, candidateFile: string): void {
+  const resolvedParent = path.resolve(parentDir);
+  const resolvedChild = path.resolve(candidateFile);
+  if (
+    resolvedChild !== resolvedParent &&
+    !resolvedChild.startsWith(`${resolvedParent}${path.sep}`)
+  ) {
+    throw new Error(
+      `Refusing to write example path outside target directory "${resolvedParent}": "${resolvedChild}"`,
+    );
+  }
+}
+
 function pickDeclaredHeaders(
   contract: OperationContract,
   statusCode: string,
@@ -162,7 +195,14 @@ export function buildXMsExampleFromTrace(
   responses[initialCode] = {
     ...(initialHeaders ? { headers: initialHeaders } : {}),
     ...(initial.response.body !== undefined
-      ? { body: sanitizePayload(initial.response.body, sanitizeCtx) }
+      ? {
+          body: sanitizeResponseBodyForStatus(
+            contract,
+            initialCode,
+            initial.response.body,
+            sanitizeCtx,
+          ),
+        }
       : {}),
   };
 
@@ -193,7 +233,14 @@ export function buildXMsExampleFromTrace(
       responses[finalCode] = {
         ...(finalHeaders ? { headers: finalHeaders } : {}),
         ...(terminalResourceExchange.response.body !== undefined
-          ? { body: sanitizePayload(terminalResourceExchange.response.body, sanitizeCtx) }
+          ? {
+              body: sanitizeResponseBodyForStatus(
+                contract,
+                finalCode,
+                terminalResourceExchange.response.body,
+                sanitizeCtx,
+              ),
+            }
           : {}),
       };
     } else if (
@@ -226,7 +273,7 @@ export function buildXMsExampleFromTrace(
         lastPoll.response.body !== undefined
       ) {
         responses["200"] = {
-          body: sanitizePayload(lastPoll.response.body, sanitizeCtx),
+          body: sanitizeResponseBodyForStatus(contract, "200", lastPoll.response.body, sanitizeCtx),
         };
       } else if (
         trace.observedLro.finalResultSource === "status-monitor-body" &&
@@ -237,7 +284,7 @@ export function buildXMsExampleFromTrace(
         const extractedResult = monitorObj.result ?? monitorObj.properties;
         if (extractedResult !== undefined) {
           responses["200"] = {
-            body: sanitizePayload(extractedResult, sanitizeCtx),
+            body: sanitizeResponseBodyForStatus(contract, "200", extractedResult, sanitizeCtx),
           };
         }
       } else if (
@@ -334,13 +381,15 @@ export async function generateLiveExamples(
     };
 
     const exampleDoc = buildXMsExampleFromTrace(contract, trace, sanitizeCtx);
+    const safeOpStem = sanitizeSafeExampleStem(contract.operationId);
     const suffix =
       trace.scenario && trace.scenario !== "default"
         ? `_${trace.scenario.replace(/[^a-zA-Z0-9_-]/g, "")}`
         : "";
-    const exampleName = `${contract.operationId}${suffix}`;
+    const exampleName = `${safeOpStem}${suffix}`;
     const filename = `${exampleName}.json`;
     const scratchPath = path.join(scratchExamplesDir, filename);
+    assertContainedFilePath(scratchExamplesDir, scratchPath);
     const serialized = `${JSON.stringify(exampleDoc, null, 2)}\n`;
     fs.writeFileSync(scratchPath, serialized, "utf8");
 
@@ -349,6 +398,7 @@ export async function generateLiveExamples(
       const tspExDir = path.join(ledger.typespecProjectDir, "examples", ledger.apiVersion);
       fs.mkdirSync(tspExDir, { recursive: true });
       const tspExPath = path.join(tspExDir, filename);
+      assertContainedFilePath(tspExDir, tspExPath);
       fs.writeFileSync(tspExPath, serialized, "utf8");
       writtenSpecPaths.push(tspExPath);
     }

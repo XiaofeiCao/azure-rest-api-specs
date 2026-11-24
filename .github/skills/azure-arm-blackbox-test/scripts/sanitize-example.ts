@@ -28,14 +28,18 @@ function escapeRegExp(value: string): string {
 function parseSecretPatternSegments(pattern: string): string[] {
   const segments: string[] = [];
   for (const part of pattern.split(".")) {
-    if (part.endsWith("[]")) {
-      const base = part.slice(0, -2);
-      if (base) {
-        segments.push(base);
-      }
+    let base = part;
+    let arrayDepth = 0;
+    // Expand EVERY trailing [] marker into a separate segment so nested arrays (e.g. credentials[][].opaqueMaterial) match (#4080)!
+    while (base.endsWith("[]")) {
+      arrayDepth++;
+      base = base.slice(0, -2);
+    }
+    if (base.length > 0) {
+      segments.push(base);
+    }
+    for (let i = 0; i < arrayDepth; i++) {
       segments.push("[]");
-    } else if (part.length > 0) {
-      segments.push(part);
     }
   }
   return segments;

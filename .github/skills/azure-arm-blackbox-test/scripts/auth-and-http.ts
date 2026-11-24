@@ -155,6 +155,70 @@ export function assertTrustedArmOrigin(targetUrl: string, trustedArmBaseUrl?: st
   return parsed;
 }
 
+const CROSS_SCOPE_BODY_KEY_RE =
+  /^(targetresourcegroup|targetsubscriptionid|destinationresourceid|targetresourceid|destinationcontainer|targetid|movedresourceid)$/i;
+
+function assertNoCrossScopeBodyTargets(
+  body: unknown,
+  ctx: SafetyGuardContext,
+  ancestors = new Set<object>(),
+): void {
+  if (!body || typeof body !== "object") {
+    return;
+  }
+  if (ancestors.has(body)) {
+    return;
+  }
+  const nextAncestors = new Set(ancestors);
+  nextAncestors.add(body);
+
+  if (Array.isArray(body)) {
+    for (const item of body) {
+      assertNoCrossScopeBodyTargets(item, ctx, nextAncestors);
+    }
+    return;
+  }
+
+  const expectedSub = ctx.subscriptionId?.toLowerCase();
+  const expectedRg = ctx.disposableRgName?.toLowerCase();
+
+  for (const [key, val] of Object.entries(body as Record<string, unknown>)) {
+    if (typeof val === "string" && CROSS_SCOPE_BODY_KEY_RE.test(key)) {
+      const lowerKey = key.toLowerCase();
+      if (lowerKey === "targetsubscriptionid") {
+        if (!expectedSub || val.trim().toLowerCase() !== expectedSub) {
+          throw new Error(
+            `Blocked cross-scope mutation field "${key}" targeting subscription "${val}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
+          );
+        }
+      } else {
+        const subMatch = /\/subscriptions\/([^/]+)/i.exec(val);
+        const rgMatch = /\/resourcegroups\/([^/]+)/i.exec(val);
+        if (subMatch && expectedSub && subMatch[1].toLowerCase() !== expectedSub) {
+          throw new Error(
+            `Blocked cross-scope mutation field "${key}" targeting subscription "${subMatch[1]}" (expected "${ctx.subscriptionId}").`,
+          );
+        }
+        if (rgMatch) {
+          if (!expectedRg || rgMatch[1].toLowerCase() !== expectedRg) {
+            throw new Error(
+              `Blocked cross-scope mutation field "${key}" targeting Resource Group "${rgMatch[1]}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+            );
+          }
+        } else if (lowerKey === "targetresourcegroup") {
+          if (!expectedRg || val.trim().toLowerCase() !== expectedRg) {
+            throw new Error(
+              `Blocked cross-scope mutation field "${key}" targeting Resource Group "${val}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+            );
+          }
+        }
+      }
+    } else if (val && typeof val === "object") {
+      assertNoCrossScopeBodyTargets(val, ctx, nextAncestors);
+    }
+  }
+}
+
 /**
  * Enforces hard-coded origin, subscription, and write protection so ARM requests
  * never leak tokens off-origin or mutate resources outside the session's disposable test Resource Group.
@@ -163,12 +227,15 @@ export function assertSafeArmTarget(
   method: string,
   targetUrl: string,
   ctx: SafetyGuardContext,
+  requestBody?: unknown,
 ): void {
   const parsed = assertTrustedArmOrigin(targetUrl, ctx.trustedArmBaseUrl);
   const upperMethod = method.toUpperCase();
   if (upperMethod === "GET" || upperMethod === "HEAD" || upperMethod === "OPTIONS") {
     return;
   }
+
+  assertNoCrossScopeBodyTargets(requestBody, ctx);
 
   const pathname = decodeURIComponent(parsed.pathname).replace(/\/+$/, "");
   const subSegmentMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(pathname);
@@ -224,8 +291,10 @@ export function assertSafeArmTarget(
     );
   }
 
-  // Operations scoped inside the disposable RG.
-  const rgScopedMatch = /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/.+$/i.exec(pathname);
+  // Operations scoped to a Resource Provider inside the disposable RG (rejects RG-level cross-scope actions such as /moveResources: #3904).
+  const rgScopedMatch = /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/.+$/i.exec(
+    pathname,
+  );
   if (rgScopedMatch) {
     if (rgScopedMatch[1].toLowerCase() === rgLower) {
       return;
@@ -315,7 +384,7 @@ export interface SendRawRequestOptions {
 export async function sendRawHttpExchange(
   options: SendRawRequestOptions,
 ): Promise<WireHttpExchange> {
-  assertSafeArmTarget(options.method, options.url, options.safetyContext);
+  assertSafeArmTarget(options.method, options.url, options.safetyContext, options.body);
 
   const requestHeaders: Record<string, string> = {
     Accept: "application/json",

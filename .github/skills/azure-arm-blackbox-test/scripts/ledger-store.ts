@@ -37,15 +37,24 @@ export function saveProbeTrace(workDir: string, trace: ProbeTrace): string {
   return fullPath;
 }
 
+function parseTraceSequenceNumber(filename: string): number {
+  const m = /^(\d+)-/.exec(filename);
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+}
+
 export function loadAllProbeTraces(workDir: string): ProbeTrace[] {
   const tracesDir = path.join(workDir, TRACES_DIRNAME);
   if (!fs.existsSync(tracesDir)) {
     return [];
   }
+  // Sort numerically by sequence prefix so trace 1000-... sorts after 999-... (#4322)!
   const files = fs
     .readdirSync(tracesDir)
     .filter((name) => name.endsWith(".json"))
-    .sort();
+    .sort((a, b) => {
+      const diff = parseTraceSequenceNumber(a) - parseTraceSequenceNumber(b);
+      return diff !== 0 ? diff : a.localeCompare(b);
+    });
   return files.map(
     (name) => JSON.parse(fs.readFileSync(path.join(tracesDir, name), "utf8")) as ProbeTrace,
   );
@@ -57,5 +66,12 @@ export function nextTraceSequence(workDir: string): number {
     return 1;
   }
   const existing = fs.readdirSync(tracesDir).filter((name) => name.endsWith(".json"));
-  return existing.length + 1;
+  let maxSeq = 0;
+  for (const name of existing) {
+    const seq = parseTraceSequenceNumber(name);
+    if (Number.isFinite(seq) && seq !== Number.MAX_SAFE_INTEGER && seq > maxSeq) {
+      maxSeq = seq;
+    }
+  }
+  return Math.max(maxSeq, existing.length) + 1;
 }

@@ -1,6 +1,10 @@
 import * as crypto from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { extractProvisioningState, isNonTerminalProvisioningState } from "./analyze-behavior.ts";
+import {
+  extractProvisioningState,
+  isFailedOrCanceledState,
+  isNonTerminalProvisioningState,
+} from "./analyze-behavior.ts";
 import {
   DISPOSABLE_RG_PREFIX,
   getActiveAzSubscriptionId,
@@ -32,6 +36,30 @@ export async function createDisposableResourceGroup(options: {
   bearerToken?: string;
 }): Promise<{ rgName: string; location: string; subscriptionId: string }> {
   const ledger = loadLedger(options.workDir);
+  const activeExistingRg =
+    ledger.disposableResourceGroup &&
+    ledger.disposableResourceGroup.cleanupStatus !== "deleted" &&
+    ledger.disposableResourceGroup.cleanupStatus !== "not_created"
+      ? ledger.disposableResourceGroup
+      : undefined;
+
+  if (activeExistingRg) {
+    if (options.rgName && options.rgName.toLowerCase() !== activeExistingRg.name.toLowerCase()) {
+      throw new Error(
+        `Cannot switch disposable Resource Group from "${activeExistingRg.name}" to "${options.rgName}" while cleanupStatus is "${activeExistingRg.cleanupStatus}"; delete the active group first.`,
+      );
+    }
+    if (
+      options.subscriptionId &&
+      ledger.subscriptionId &&
+      options.subscriptionId.toLowerCase() !== ledger.subscriptionId.toLowerCase()
+    ) {
+      throw new Error(
+        `Cannot switch subscriptionId from "${ledger.subscriptionId}" to "${options.subscriptionId}" while disposable Resource Group "${activeExistingRg.name}" has cleanupStatus "${activeExistingRg.cleanupStatus}".`,
+      );
+    }
+  }
+
   const subscriptionId =
     options.subscriptionId ?? ledger.subscriptionId ?? getActiveAzSubscriptionId();
   const location = options.location ?? ledger.location ?? "eastus";
@@ -347,7 +375,7 @@ async function putArmFixtureAndWait(options: {
           ? rec.status.trim().toLowerCase()
           : extractProvisioningState(poll.response.body)?.toLowerCase();
 
-      if (status === "failed" || status === "canceled") {
+      if (isFailedOrCanceledState(status)) {
         throw new Error(
           `Fixture LRO failed (${options.resourcePathWithQuery}): ${JSON.stringify(poll.response.body ?? "")}`,
         );
@@ -385,11 +413,7 @@ async function putArmFixtureAndWait(options: {
     );
   }
   const finalProv = extractProvisioningState(finalGet.response.body);
-  if (
-    isNonTerminalProvisioningState(finalProv) ||
-    finalProv?.toLowerCase() === "failed" ||
-    finalProv?.toLowerCase() === "canceled"
-  ) {
+  if (isNonTerminalProvisioningState(finalProv) || isFailedOrCanceledState(finalProv)) {
     throw new Error(
       `Fixture final GET returned non-ready provisioningState "${finalProv}" (${options.resourcePathWithQuery}).`,
     );

@@ -242,6 +242,18 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       ),
     ).toThrow(/Blocked (?:mutating|soft-delete) POST/);
 
+    // Cross-scope RG moveResources and external body targetResourceGroup are blocked (#3904)!
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-appconfig-abc123/moveResources?api-version=2024-03-01`,
+        ctx,
+        {
+          targetResourceGroup: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-production`,
+        },
+      ),
+    ).toThrow(/Blocked cross-scope|outside disposable Resource Group/);
+
     // Mutations targeting another RG are blocked!
     expect(() =>
       assertSafeArmTarget(
@@ -1348,18 +1360,39 @@ interface PrivateConns {
     expect(backupExText).not.toContain("TOP_SECRET_HEADER_MATERIAL");
     expect(backupExText).toContain("https://contoso.blob.core.windows.net/bk.zip");
 
-    // Verify wildcard dictionary secrets redact keys containing dots OR empty keys (#7984)!
+    // Verify nested 2D array secret paths (credentials[][].value) AND dotted/empty dictionary keys (#4080, #7984)!
     const dictSanitized = sanitizePayload(
       {
         credentials: {
           "dotted.key.name": { value: "DOTTED_KEY_SECRET_123" },
           "": { value: "EMPTY_KEY_SECRET_456" },
         },
+        matrix: [[{ secretTokenVal: "MATRIX_2D_SECRET_789" }]],
       },
-      { extraSecretPropertyPaths: ["credentials.*.value"] },
-    ) as { credentials: Record<string, { value: string }> };
+      { extraSecretPropertyPaths: ["credentials.*.value", "matrix[][].secretTokenVal"] },
+    ) as {
+      credentials: Record<string, { value: string }>;
+      matrix: Array<Array<{ secretTokenVal: string }>>;
+    };
     expect(dictSanitized.credentials["dotted.key.name"].value).toBe("<redacted>");
     expect(dictSanitized.credentials[""].value).toBe("<redacted>");
+    expect(dictSanitized.matrix[0][0].secretTokenVal).toBe("<redacted>");
+
+    // Re-running discover or switching RG while active disposable RG exists is blocked (#4360, #4409)!
+    await expect(
+      discoverSpecInventory({
+        specPath: projectDir,
+        apiVersion: "2025-03-01",
+        workDir,
+      }),
+    ).rejects.toThrow(/Refusing to overwrite/);
+    await expect(
+      createDisposableResourceGroup({
+        workDir,
+        rgName: "rg-arm-blackbox-other-999999",
+        bearerToken: MOCK_TOKEN,
+      }),
+    ).rejects.toThrow(/Cannot switch disposable Resource Group/);
 
     // Positive probe with mismatched HTTP method or off-contract route is rejected (#7862)!
     await expect(

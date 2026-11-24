@@ -73,6 +73,7 @@ export interface OperationContract {
   phase: LifecyclePhase;
   declaredStatusCodes: string[];
   declaredResponseHeaders: Record<string, string[]>;
+  declaredRequiredResponseHeaders?: Record<string, string[][]>;
   declaredResponseHasSchema: Record<string, boolean>;
   isLroDeclared: boolean;
   lroFinalStateVia?: string;
@@ -84,6 +85,7 @@ export interface OperationContract {
   readOnlyBodyProperties: string[];
   secretProperties: string[];
   secretResponseHeaders?: string[];
+  secretResponseStatuses?: string[];
   externalDependencies: ExternalDependencyHint[];
   existingExampleNames: string[];
   existingExamplePaths: string[];
@@ -269,6 +271,7 @@ export interface ProbeRequestInput {
   maxPaginationPages?: number;
   pollLro?: boolean;
   maxPollAttempts?: number;
+  maxPollDurationMs?: number;
   pollIntervalMs?: number;
 }
 

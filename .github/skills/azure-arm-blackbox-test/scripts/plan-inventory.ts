@@ -32,7 +32,13 @@ import {
 } from "@typespec/http";
 import { getExtensions, isReadonlyProperty } from "@typespec/openapi";
 import { assertTrustedArmOrigin, getArmBearerToken } from "./auth-and-http.ts";
-import { saveLedger } from "./ledger-store.ts";
+import {
+  GENERATED_EXAMPLES_DIRNAME,
+  getLedgerPath,
+  loadLedger,
+  saveLedger,
+  TRACES_DIRNAME,
+} from "./ledger-store.ts";
 import {
   extractOperationSourceLocation,
   loadProjectedTypeSpecService,
@@ -63,6 +69,7 @@ export interface DiscoverInventoryOptions {
   subscriptionId?: string;
   location?: string;
   checkLiveProvider?: boolean;
+  reset?: boolean;
   bearerToken?: string;
 }
 
@@ -390,7 +397,7 @@ function collectTypeSpecBodyMetadata(
   secrets: Set<string>;
   externalDeps: Map<string, ExternalDependencyHint>;
 } {
-  if (!type || depth > 7 || ancestors.has(type)) {
+  if (!type || ancestors.has(type)) {
     return result;
   }
   const branchAncestors = new Set(ancestors);
@@ -444,6 +451,7 @@ function collectTypeSpecBodyMetadata(
       if (readOnly || (!visibleInReq && visibleInRead)) {
         result.readOnly.add(propPath);
       } else if (
+        depth <= 7 &&
         visibleInReq &&
         visibleInRead &&
         !propPath.includes("[]") &&
@@ -488,6 +496,21 @@ function collectTypeSpecBodyMetadata(
         );
       }
     }
+
+    // Also traverse derived models at the same payload path so discriminated subtype-only @secret properties are discovered (#4008)!
+    for (const derived of type.derivedModels) {
+      collectTypeSpecBodyMetadata(
+        program,
+        metadataInfo,
+        reqVisibility,
+        derived,
+        prefix,
+        depth,
+        branchAncestors,
+        result,
+        false,
+      );
+    }
   } else if (type.kind === "Union") {
     for (const variant of type.variants.values()) {
       collectTypeSpecBodyMetadata(
@@ -510,12 +533,13 @@ function collectTypeSpecBodyMetadata(
 function collectTypeSpecResponseSecrets(
   program: Program,
   httpOp: HttpOperation,
-): { bodySecrets: string[]; headerSecrets: string[] } {
+): { bodySecrets: string[]; headerSecrets: string[]; secretStatusCodes: string[] } {
   const secrets = new Set<string>();
   const headerSecrets = new Set<string>();
+  const secretStatusCodes = new Set<string>();
 
   function walk(type: Type | undefined, prefix = "", depth = 0, ancestors = new Set<Type>()): void {
-    if (!type || depth > 7 || ancestors.has(type)) {
+    if (!type || ancestors.has(type)) {
       return;
     }
     const branchAncestors = new Set(ancestors);
@@ -550,6 +574,9 @@ function collectTypeSpecResponseSecrets(
         }
         walk(prop.type, propPath, depth + 1, branchAncestors);
       }
+      for (const derived of type.derivedModels) {
+        walk(derived, prefix, depth, branchAncestors);
+      }
     } else if (type.kind === "Union") {
       for (const variant of type.variants.values()) {
         walk(variant.type, prefix, depth, branchAncestors);
@@ -558,6 +585,15 @@ function collectTypeSpecResponseSecrets(
   }
 
   for (const resp of httpOp.responses) {
+    const respCodes: string[] = [];
+    if (typeof resp.statusCodes === "number") {
+      respCodes.push(String(resp.statusCodes));
+    } else if (typeof resp.statusCodes === "object") {
+      for (let c = resp.statusCodes.start; c <= resp.statusCodes.end; c++) {
+        respCodes.push(String(c));
+      }
+    }
+
     for (const content of resp.responses) {
       for (const [hWireName, hProp] of Object.entries(content.headers ?? {})) {
         if (
@@ -571,6 +607,14 @@ function collectTypeSpecResponseSecrets(
         }
       }
       if (content.body) {
+        const isWholeBodySecret =
+          (content.body.property ? isSecret(program, content.body.property) : false) ||
+          isSecret(program, content.body.type);
+        if (isWholeBodySecret) {
+          for (const code of respCodes) {
+            secretStatusCodes.add(code);
+          }
+        }
         walk(content.body.type);
       }
     }
@@ -578,6 +622,7 @@ function collectTypeSpecResponseSecrets(
   return {
     bodySecrets: [...secrets],
     headerSecrets: [...headerSecrets],
+    secretStatusCodes: [...secretStatusCodes],
   };
 }
 
@@ -815,6 +860,30 @@ export async function fetchProviderLiveMetadata(options: {
 export async function discoverSpecInventory(
   options: DiscoverInventoryOptions,
 ): Promise<CoverageLedger> {
+  if (fs.existsSync(getLedgerPath(options.workDir))) {
+    const existingLedger = loadLedger(options.workDir);
+    const activeRg = existingLedger.disposableResourceGroup;
+    if (
+      activeRg &&
+      activeRg.cleanupStatus !== "deleted" &&
+      activeRg.cleanupStatus !== "not_created"
+    ) {
+      throw new Error(
+        `Refusing to overwrite "${options.workDir}/coverage-ledger.json" while disposable Resource Group "${activeRg.name}" has cleanupStatus "${activeRg.cleanupStatus}". Run "rg delete" first or choose a fresh --work-dir.`,
+      );
+    }
+    if (!options.reset) {
+      throw new Error(
+        `Work directory "${options.workDir}" already contains coverage-ledger.json. Pass --reset (after RG cleanup) or choose a fresh --work-dir so stale traces are not mixed.`,
+      );
+    }
+    fs.rmSync(path.join(options.workDir, TRACES_DIRNAME), { recursive: true, force: true });
+    fs.rmSync(path.join(options.workDir, GENERATED_EXAMPLES_DIRNAME), {
+      recursive: true,
+      force: true,
+    });
+  }
+
   const service = await loadProjectedTypeSpecService(options.specPath, options.apiVersion);
   const {
     program,
@@ -949,6 +1018,7 @@ export async function discoverSpecInventory(
 
     const declaredStatusCodesSet = new Set<string>();
     const declaredResponseHeaders: Record<string, string[]> = {};
+    const declaredRequiredResponseHeaders: Record<string, string[][]> = {};
     const declaredResponseHasSchema: Record<string, boolean> = {};
     let hasDefaultErrorResponse = false;
 
@@ -970,11 +1040,18 @@ export async function discoverSpecInventory(
       }
 
       const headerSet = new Set<string>();
+      const contentRequiredAlts: string[][] = [];
       let hasBodySchema = false;
       for (const content of resp.responses) {
-        for (const hName of Object.keys(content.headers ?? {})) {
-          headerSet.add(hName.toLowerCase());
+        const reqHeadersForAlt: string[] = [];
+        for (const [hName, hProp] of Object.entries(content.headers ?? {})) {
+          const lowerH = hName.toLowerCase();
+          headerSet.add(lowerH);
+          if (!hProp.optional) {
+            reqHeadersForAlt.push(lowerH);
+          }
         }
+        contentRequiredAlts.push(reqHeadersForAlt.sort());
         if (content.body && !isVoidType(content.body.type)) {
           hasBodySchema = true;
         }
@@ -985,6 +1062,12 @@ export async function discoverSpecInventory(
         if (headerSet.size > 0) {
           const merged = new Set([...(declaredResponseHeaders[code] ?? []), ...headerSet]);
           declaredResponseHeaders[code] = [...merged].sort();
+        }
+        if (contentRequiredAlts.length > 0) {
+          declaredRequiredResponseHeaders[code] = [
+            ...(declaredRequiredResponseHeaders[code] ?? []),
+            ...contentRequiredAlts,
+          ];
         }
         declaredResponseHasSchema[code] = Boolean(declaredResponseHasSchema[code]) || hasBodySchema;
       }
@@ -1006,6 +1089,9 @@ export async function discoverSpecInventory(
       phase: classifyPhase(method, pathTemplate, operationId, pageable ?? inferredPagination),
       declaredStatusCodes: [...declaredStatusCodesSet].sort(),
       declaredResponseHeaders,
+      ...(Object.keys(declaredRequiredResponseHeaders).length > 0
+        ? { declaredRequiredResponseHeaders }
+        : {}),
       declaredResponseHasSchema,
       isLroDeclared,
       lroFinalStateVia,
@@ -1018,6 +1104,9 @@ export async function discoverSpecInventory(
       secretProperties: [...secretProperties].sort(),
       ...(secretResponseHeaders.size > 0
         ? { secretResponseHeaders: [...secretResponseHeaders].sort() }
+        : {}),
+      ...(respSecrets.secretStatusCodes.length > 0
+        ? { secretResponseStatuses: [...respSecrets.secretStatusCodes].sort() }
         : {}),
       externalDependencies: opExternalDeps,
       existingExampleNames: matchedExamples.map((e) => e.title),
