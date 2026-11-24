@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { analyzeBehavioralDiscrepancies } from "../scripts/analyze-behavior.ts";
 import { assertSafeArmTarget } from "../scripts/auth-and-http.ts";
 import { executeOperationProbe } from "../scripts/execute-probe.ts";
 import { generateLiveExamples } from "../scripts/generate-examples.ts";
@@ -14,10 +15,25 @@ import {
 import { discoverSpecInventory } from "../scripts/plan-inventory.ts";
 import { buildSummaryReport } from "../scripts/render-report.ts";
 import { sanitizePayload } from "../scripts/sanitize-example.ts";
-import { DISCREPANCY_RULES, type CoverageLedger } from "../scripts/types.ts";
+import {
+  DISCREPANCY_RULES,
+  type CoverageLedger,
+  type OperationContract,
+} from "../scripts/types.ts";
 
 const REAL_SUB_ID = "87654321-4321-4321-4321-210987654321";
 const MOCK_TOKEN = "mock-bearer-token-value";
+
+function ledgerRawSnapshotForContract(workDir: string, operationId: string): OperationContract {
+  const ledger = JSON.parse(
+    fs.readFileSync(path.join(workDir, "coverage-ledger.json"), "utf8"),
+  ) as CoverageLedger;
+  const found = ledger.operations[operationId];
+  if (!found) {
+    throw new Error(`Missing operation ${operationId}`);
+  }
+  return found;
+}
 
 function createMinimalArmMockTypeSpecProject(dir: string): string {
   const projectDir = path.join(dir, "MockWidget.Management");
@@ -1451,6 +1467,83 @@ interface PrivateConns {
     expect(dictSanitized.tree.opaqueNodeSecret).toBe("<redacted>");
     expect(dictSanitized.tree.children[0].opaqueNodeSecret).toBe("<redacted>");
     expect(dictSanitized.tree.children[0].children![0].opaqueNodeSecret).toBe("<redacted>");
+
+    // Deep >32-level recursive secret model completes cycle reduction, and budget exhaustion fails closed!
+    let deepNode: Record<string, unknown> = { opaqueNodeSecret: "DEEP_LEVEL_40_SECRET" };
+    for (let d = 0; d < 40; d++) {
+      deepNode = { children: [deepNode] };
+    }
+    const deepSanitized = sanitizePayload(
+      { tree: deepNode },
+      {
+        extraSecretPropertyPaths: ["tree.opaqueNodeSecret"],
+        secretCycleRules: [{ basePath: "tree", repeatPath: "children[]" }],
+      },
+    );
+    expect(JSON.stringify(deepSanitized)).not.toContain("DEEP_LEVEL_40_SECRET");
+    expect(JSON.stringify(deepSanitized)).toContain("<redacted>");
+
+    expect(() =>
+      sanitizePayload(
+        { tree: deepNode },
+        {
+          extraSecretPropertyPaths: ["tree.opaqueNodeSecret"],
+          secretCycleRules: [{ basePath: "tree", repeatPath: "children[]" }],
+          maxSecretCycleVariants: 8,
+        },
+      ),
+    ).toThrow(/exceeded expansion budget/);
+
+    // Failed or timed-out PUT LRO must NOT emit false ROUNDTRIP-MUTABILITY-DRIFT!
+    const vaultPutContract = ledgerRawSnapshotForContract(workDir, "Vaults_CreateOrUpdate");
+    const timedOutPutDiscrepancies = analyzeBehavioralDiscrepancies({
+      contract: vaultPutContract,
+      expectError: false,
+      exchanges: [
+        {
+          step: "initial",
+          timestamp: new Date().toISOString(),
+          durationMs: 10,
+          request: {
+            method: "PUT",
+            url: `${baseUrl}/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-test/providers/Microsoft.V2Vault/vaults/v-fail?api-version=2025-03-01`,
+            headers: {},
+            body: { location: "eastus", properties: { persistedFlag: "submitted-val" } },
+          },
+          response: {
+            status: 201,
+            headers: { "azure-asyncoperation": `${baseUrl}/monitors/put-1` },
+            body: { properties: { provisioningState: "Creating" } },
+          },
+        },
+        {
+          step: "poll",
+          timestamp: new Date().toISOString(),
+          durationMs: 10,
+          request: { method: "GET", url: `${baseUrl}/monitors/put-1`, headers: {} },
+          response: {
+            status: 200,
+            headers: {},
+            body: { status: "Failed", error: { code: "InternalError", message: "boom" } },
+          },
+        },
+      ],
+      observedLro: {
+        detected: true,
+        detectionSignals: ["azure-asyncoperation"],
+        pollingHeaderUsed: "azure-asyncoperation",
+        pollCount: 1,
+        completionStatus: "failed",
+        terminalProvisioningState: "Failed",
+      },
+      requestSchemaErrors: [],
+      responseSchemaErrors: [],
+    });
+    expect(
+      timedOutPutDiscrepancies.some(
+        (d) => d.ruleId === DISCREPANCY_RULES.ROUNDTRIP_MUTABILITY_DRIFT,
+      ),
+    ).toBe(false);
 
     // Ambiguous multi-project root directory is rejected (#8112)!
     const multiRoot = path.join(tempRoot, "multi-spec-root", "resource-manager");

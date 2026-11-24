@@ -448,16 +448,36 @@ export function analyzeBehavioralDiscrepancies(
     }
   }
 
-  // 9. Round-trip mutability check (PUT body vs terminal/GET body).
+  // 9. Round-trip mutability check (PUT body vs completed 2xx terminal/GET resource body).
   const putBodySource = contract.method === "PUT" ? initial.request.body : priorPutBody;
   const terminalBody = terminalExchange.response.body;
+  const isTerminal2xx =
+    terminalExchange.response.status >= 200 && terminalExchange.response.status < 300;
+  const lroCompletedSuccessfully =
+    !observedLro.detected || observedLro.completionStatus === "succeeded";
+  const isMonitoredPutWithoutFinalResourceGet =
+    contract.method === "PUT" &&
+    observedLro.detected &&
+    (observedLro.pollingHeaderUsed === "azure-asyncoperation" ||
+      observedLro.pollingHeaderUsed === "operation-location") &&
+    terminalExchange.step !== "final-get";
+  const terminalProvState = extractProvisioningState(terminalBody);
+  const isTerminalResourceReady =
+    !isNonTerminalProvisioningState(terminalProvState) &&
+    !isFailedOrCanceledState(terminalProvState);
   if (
     !expectError &&
     isInitial2xx &&
+    isTerminal2xx &&
+    lroCompletedSuccessfully &&
+    !isMonitoredPutWithoutFinalResourceGet &&
+    isTerminalResourceReady &&
     putBodySource &&
     typeof putBodySource === "object" &&
+    !Array.isArray(putBodySource) &&
     terminalBody &&
     typeof terminalBody === "object" &&
+    !Array.isArray(terminalBody) &&
     (contract.method === "PUT" || (contract.method === "GET" && priorPutBody !== undefined))
   ) {
     const secretSet = new Set(contract.secretProperties.map((s) => s.toLowerCase()));

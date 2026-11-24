@@ -23,7 +23,10 @@ export interface SanitizeContext {
   extraSecretPropertyPaths?: string[];
   secretCycleRules?: SecretCycleRule[];
   secretConstraints?: Record<string, SecretStringConstraint>;
+  maxSecretCycleVariants?: number;
 }
+
+const DEFAULT_MAX_SECRET_CYCLE_VARIANTS = 2048;
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -69,6 +72,7 @@ function matchesSecretSegments(patternSegs: string[], actualSegs: string[]): boo
 function foldCycleVariants(
   actualSegs: string[],
   cycleRules: SecretCycleRule[] | undefined,
+  maxVariants = DEFAULT_MAX_SECRET_CYCLE_VARIANTS,
 ): string[][] {
   if (!cycleRules || cycleRules.length === 0 || actualSegs.length === 0) {
     return [actualSegs];
@@ -84,11 +88,12 @@ function foldCycleVariants(
     return [actualSegs];
   }
 
+  const effectiveBudget = Math.max(1, maxVariants);
   const variants: string[][] = [actualSegs];
   const seen = new Set<string>([JSON.stringify(actualSegs)]);
   const queue: string[][] = [actualSegs];
 
-  while (queue.length > 0 && variants.length < 32) {
+  while (queue.length > 0) {
     const cur = queue.shift()!;
     for (const rule of parsedRules) {
       const bLen = rule.baseSegs.length;
@@ -103,6 +108,11 @@ function foldCycleVariants(
         const reduced = [...cur.slice(0, bLen), ...cur.slice(bLen + rLen)];
         const key = JSON.stringify(reduced);
         if (!seen.has(key)) {
+          if (variants.length >= effectiveBudget) {
+            throw new Error(
+              `Secret cycle reduction exceeded expansion budget (${effectiveBudget}) for path "${actualSegs.join(".")}"; aborting sanitization fail-closed to prevent credential leakage.`,
+            );
+          }
           seen.add(key);
           variants.push(reduced);
           queue.push(reduced);
@@ -118,7 +128,7 @@ function matchesAnyDeclaredSecretPath(actualSegs: string[], ctx: SanitizeContext
   if (rawSecretPaths.length === 0 || actualSegs.length === 0) {
     return false;
   }
-  const variants = foldCycleVariants(actualSegs, ctx.secretCycleRules);
+  const variants = foldCycleVariants(actualSegs, ctx.secretCycleRules, ctx.maxSecretCycleVariants);
   for (const sp of rawSecretPaths) {
     const patSegs = parseSecretPatternSegments(sp);
     if (variants.some((v) => matchesSecretSegments(patSegs, v))) {
@@ -213,7 +223,11 @@ function findMatchingSecretConstraint(
   if (dotPath && map[dotPath.toLowerCase()]) {
     return map[dotPath.toLowerCase()];
   }
-  const variants = foldCycleVariants(effectiveSegments, ctx.secretCycleRules);
+  const variants = foldCycleVariants(
+    effectiveSegments,
+    ctx.secretCycleRules,
+    ctx.maxSecretCycleVariants,
+  );
   for (const [patKey, constraint] of Object.entries(map)) {
     const patSegs = parseSecretPatternSegments(patKey);
     if (variants.some((v) => matchesSecretSegments(patSegs, v))) {
