@@ -971,28 +971,55 @@ export async function fetchProviderLiveMetadata(options: {
 export async function discoverSpecInventory(
   options: DiscoverInventoryOptions,
 ): Promise<CoverageLedger> {
+  let preSeededLedger: CoverageLedger | undefined;
   if (fs.existsSync(getLedgerPath(options.workDir))) {
     const existingLedger = loadLedger(options.workDir);
-    const activeRg = existingLedger.disposableResourceGroup;
-    if (
-      activeRg &&
-      activeRg.cleanupStatus !== "deleted" &&
-      activeRg.cleanupStatus !== "not_created"
-    ) {
-      throw new Error(
-        `Refusing to overwrite "${options.workDir}/coverage-ledger.json" while disposable Resource Group "${activeRg.name}" has cleanupStatus "${activeRg.cleanupStatus}". Run "rg delete" first or choose a fresh --work-dir.`,
-      );
+    const activeRg =
+      existingLedger.disposableResourceGroup &&
+      existingLedger.disposableResourceGroup.cleanupStatus !== "deleted" &&
+      existingLedger.disposableResourceGroup.cleanupStatus !== "not_created"
+        ? existingLedger.disposableResourceGroup
+        : undefined;
+    const isRgOnlyPreSeeded =
+      Object.keys(existingLedger.operations).length === 0 && !existingLedger.entrypointFile;
+
+    if (isRgOnlyPreSeeded && !options.reset) {
+      if (
+        activeRg &&
+        options.subscriptionId &&
+        existingLedger.subscriptionId &&
+        options.subscriptionId.toLowerCase() !== existingLedger.subscriptionId.toLowerCase()
+      ) {
+        throw new Error(
+          `Cannot switch subscriptionId from "${existingLedger.subscriptionId}" to "${options.subscriptionId}" while disposable Resource Group "${activeRg.name}" has cleanupStatus "${activeRg.cleanupStatus}".`,
+        );
+      }
+      if (activeRg && options.armBaseUrl) {
+        const normalizedNewBase = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
+        if (normalizedNewBase.toLowerCase() !== existingLedger.armBaseUrl.toLowerCase()) {
+          throw new Error(
+            `Cannot switch armBaseUrl from "${existingLedger.armBaseUrl}" to "${normalizedNewBase}" while disposable Resource Group "${activeRg.name}" has cleanupStatus "${activeRg.cleanupStatus}".`,
+          );
+        }
+      }
+      preSeededLedger = existingLedger;
+    } else {
+      if (activeRg) {
+        throw new Error(
+          `Refusing to overwrite "${options.workDir}/coverage-ledger.json" while disposable Resource Group "${activeRg.name}" has cleanupStatus "${activeRg.cleanupStatus}". Run "rg delete" first or choose a fresh --work-dir.`,
+        );
+      }
+      if (!options.reset) {
+        throw new Error(
+          `Work directory "${options.workDir}" already contains coverage-ledger.json. Pass --reset (after RG cleanup) or choose a fresh --work-dir so stale traces are not mixed.`,
+        );
+      }
+      fs.rmSync(path.join(options.workDir, TRACES_DIRNAME), { recursive: true, force: true });
+      fs.rmSync(path.join(options.workDir, GENERATED_EXAMPLES_DIRNAME), {
+        recursive: true,
+        force: true,
+      });
     }
-    if (!options.reset) {
-      throw new Error(
-        `Work directory "${options.workDir}" already contains coverage-ledger.json. Pass --reset (after RG cleanup) or choose a fresh --work-dir so stale traces are not mixed.`,
-      );
-    }
-    fs.rmSync(path.join(options.workDir, TRACES_DIRNAME), { recursive: true, force: true });
-    fs.rmSync(path.join(options.workDir, GENERATED_EXAMPLES_DIRNAME), {
-      recursive: true,
-      force: true,
-    });
   }
 
   const service = await loadProjectedTypeSpecService(options.specPath, options.apiVersion);
@@ -1005,14 +1032,19 @@ export async function discoverSpecInventory(
     availableApiVersions,
     httpOperations,
   } = service;
-  const armBaseUrl = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
+  const armBaseUrl = options.armBaseUrl
+    ? validateAndNormalizeArmBaseUrl(options.armBaseUrl)
+    : preSeededLedger?.armBaseUrl
+      ? validateAndNormalizeArmBaseUrl(preSeededLedger.armBaseUrl)
+      : validateAndNormalizeArmBaseUrl(undefined);
   const parsedBase = new URL(armBaseUrl);
   const isLoopbackBase = parsedBase.protocol === "http:";
-  const allowedArmOrigins = validateAndNormalizeAllowedArmOrigins(
-    options.allowedArmOrigins,
-    isLoopbackBase,
-  );
-  const armTokenResource = inferArmTokenResource(armBaseUrl, options.armTokenResource);
+  const allowedArmOrigins = options.allowedArmOrigins
+    ? validateAndNormalizeAllowedArmOrigins(options.allowedArmOrigins, isLoopbackBase)
+    : validateAndNormalizeAllowedArmOrigins(preSeededLedger?.allowedArmOrigins, isLoopbackBase);
+  const armTokenResource = options.armTokenResource
+    ? inferArmTokenResource(armBaseUrl, options.armTokenResource)
+    : (preSeededLedger?.armTokenResource ?? inferArmTokenResource(armBaseUrl, undefined));
 
   const metadataInfo = createMetadataInfo(program);
   const existingExamplesIndex = scanExistingTypeSpecExamples(typespecProjectDir, apiVersion);
@@ -1312,17 +1344,18 @@ export async function discoverSpecInventory(
   const serviceMatch = /\/specification\/([^/]+)\//.exec(normalizedProject);
   const serviceName = serviceMatch?.[1] ?? detectedNamespace;
 
+  const effectiveSubscriptionId = options.subscriptionId ?? preSeededLedger?.subscriptionId;
   let providerLiveMetadata: ProviderLiveMetadata | undefined;
   if (
     options.checkLiveProvider &&
-    options.subscriptionId &&
+    effectiveSubscriptionId &&
     detectedNamespace !== "Unknown.Provider"
   ) {
     providerLiveMetadata = await fetchProviderLiveMetadata({
       armBaseUrl,
       armTokenResource,
       allowedArmOrigins,
-      subscriptionId: options.subscriptionId,
+      subscriptionId: effectiveSubscriptionId,
       providerNamespace: detectedNamespace,
       targetApiVersion: apiVersion,
       bearerToken: options.bearerToken,
@@ -1332,8 +1365,8 @@ export async function discoverSpecInventory(
   const now = new Date().toISOString();
   const ledger: CoverageLedger = {
     schemaVersion: "2.0-typespec",
-    runId: crypto.randomBytes(4).toString("hex"),
-    createdAt: now,
+    runId: preSeededLedger?.runId ?? crypto.randomBytes(4).toString("hex"),
+    createdAt: preSeededLedger?.createdAt ?? now,
     updatedAt: now,
     serviceName,
     providerNamespace: detectedNamespace,
@@ -1341,15 +1374,22 @@ export async function discoverSpecInventory(
     availableApiVersions,
     typespecProjectDir,
     entrypointFile,
-    subscriptionId: options.subscriptionId,
-    location: options.location ?? providerLiveMetadata?.recommendedLocations[0],
+    subscriptionId: effectiveSubscriptionId,
+    location:
+      options.location ??
+      preSeededLedger?.location ??
+      preSeededLedger?.disposableResourceGroup?.location ??
+      providerLiveMetadata?.recommendedLocations[0],
     armBaseUrl,
     armTokenResource,
     ...(allowedArmOrigins.length > 0 ? { allowedArmOrigins } : {}),
+    ...(preSeededLedger?.disposableResourceGroup
+      ? { disposableResourceGroup: preSeededLedger.disposableResourceGroup }
+      : {}),
     providerLiveMetadata,
     externalDependencies: [...externalDepsMap.values()],
-    provisionedFixtures: [],
-    runtimeState: {
+    provisionedFixtures: preSeededLedger?.provisionedFixtures ?? [],
+    runtimeState: preSeededLedger?.runtimeState ?? {
       pathSlotValues: {},
       putBodiesByResourceType: {},
       listItemNamesByResourceType: {},

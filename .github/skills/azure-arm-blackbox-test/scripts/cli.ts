@@ -23,8 +23,8 @@ export async function runCli(argv: string[]): Promise<void> {
         "Usage: node scripts/cli.ts <command> [options]",
         "",
         "Commands:",
-        "  discover           Compile ARM TypeSpec in-memory for an api-version and build coverage-ledger.json",
         "  rg                 Create or delete the disposable test Resource Group (create | delete)",
+        "  discover           Compile ARM TypeSpec in-memory for an api-version and build the base DAG in coverage-ledger.json",
         "  fixture            Provision an external cross-RP setup fixture inside the disposable RG",
         "  probe              Execute a raw HTTP operation probe with wire-level LRO polling & TypeSpec validation",
         "  mark-blocked       Record an explicit Azure quota/feature/environment blocker for an operation",
@@ -107,6 +107,10 @@ export async function runCli(argv: string[]): Promise<void> {
         "subscription-id": { type: "string" },
         location: { type: "string" },
         name: { type: "string" },
+        "service-hint": { type: "string" },
+        "arm-base-url": { type: "string" },
+        "arm-token-resource": { type: "string" },
+        "allowed-arm-origins": { type: "string" },
         wait: { type: "boolean", default: false },
       },
     });
@@ -119,6 +123,15 @@ export async function runCli(argv: string[]): Promise<void> {
         subscriptionId: values["subscription-id"],
         location: values.location,
         rgName: values.name,
+        serviceHint: values["service-hint"],
+        armBaseUrl: values["arm-base-url"],
+        armTokenResource: values["arm-token-resource"],
+        allowedArmOrigins: values["allowed-arm-origins"]
+          ? values["allowed-arm-origins"]
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined,
       });
       console.log(JSON.stringify(created, null, 2));
       return;

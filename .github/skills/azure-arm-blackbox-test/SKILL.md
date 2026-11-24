@@ -27,38 +27,38 @@ All CLI commands run from the repository root using Node 24's native TypeScript 
 node .github/skills/azure-arm-blackbox-test/scripts/cli.ts <subcommand> [options]
 ```
 
-### Step 1: Discover Inventory, Check Live ARM Provider, and Build Lifecycle DAG
+### Step 1: Isolate Disposable Test Resource Group
 
-1. Resolve the active Azure subscription (`az account show --query "{id:id, name:name}" -o json`) and pick an isolated scratch `--work-dir` (for example under session artifacts or `$TEMP/arm-blackbox-<service>`).
-2. Run `discover` with `--check-live-provider`:
+1. Resolve the active Azure subscription (`az account show --query "{id:id, name:name}" -o json`), pick an isolated scratch `--work-dir` (for example under session artifacts or `$TEMP/arm-blackbox-<service>`), and create the disposable `rg-arm-blackbox-*` Resource Group upfront:
+
+   ```bash
+   node .github/skills/azure-arm-blackbox-test/scripts/cli.ts rg create \
+     --work-dir <work-dir> \
+     --subscription-id <subscription-id> \
+     --location <location> \
+     --service-hint <service>
+   ```
+
+   _(Optional Canary / EUAP / Dogfood / Sovereign cloud target: pass `--arm-base-url <https-url>` such as `https://eastus2euap.management.azure.com` or `https://api-dogfood.resources.windows-int.net`, plus optional `--arm-token-resource <audience>` or `--allowed-arm-origins <csv>` when custom Entra audiences or companion LRO polling hosts are needed. Running `discover` before `rg create` is also supported.)_
+
+### Step 2: Build Two-Layer Execution DAG (TypeSpec Base DAG + Cross-RP Fixture Weaving)
+
+1. **DAG Layer 1 — Compile TypeSpec & Build Base Intra-Service DAG (`discover`)**:
 
    ```bash
    node .github/skills/azure-arm-blackbox-test/scripts/cli.ts discover \
      --spec specification/<service>/resource-manager \
      --api-version <target-api-version> \
-     --subscription-id <subscription-id> \
      --check-live-provider \
      --work-dir <work-dir>
    ```
 
-   _(Optional Canary / EUAP / Dogfood / Sovereign cloud target: pass `--arm-base-url <https-url>` such as `https://eastus2euap.management.azure.com` or `https://api-dogfood.resources.windows-int.net`, plus optional `--arm-token-resource <audience>` or `--allowed-arm-origins <csv>` when custom Entra audiences or companion LRO polling hosts are needed.)_
+   Inspect the JSON output and `<work-dir>/coverage-ledger.json`:
+   - Confirm `providerLiveMetadata.targetVersionSupportedOnArm` is `true` (if `false`, check deployed `apiVersions` in `providerLiveMetadata`).
+   - Review `executionOrder` (top-down parent-to-child create/read/update/action, bottom-up delete, soft-delete purge) and `externalDependencies`.
 
-3. Inspect the JSON output and `<work-dir>/coverage-ledger.json`:
-   - Confirm `providerLiveMetadata.targetVersionSupportedOnArm` is `true`. If `false`, inspect `providerLiveMetadata` in `coverage-ledger.json` to see which `apiVersions` are actually deployed on ARM and select or confirm a deployed `api-version` before running live probes.
-   - Choose a region from `recommendedLocations` (defaulting to `eastus` / `eastus2` / `westus2`).
-   - Review `executionOrder` and `externalDependencies`.
-
-### Step 2: Create Disposable Test Resource Group & External Setup Fixtures
-
-1. Create the disposable test RG:
-
-   ```bash
-   node .github/skills/azure-arm-blackbox-test/scripts/cli.ts rg create \
-     --work-dir <work-dir> \
-     --location <location>
-   ```
-
-2. When operations in `executionOrder` require cross-RP dependencies (`managed-identity`, `vnet-subnet`, `private-endpoint`, `storage-account`, `log-analytics`), provision them inside the disposable RG via `fixture` (see [references/fixture-and-lifecycle-playbook.md](references/fixture-and-lifecycle-playbook.md)):
+2. **DAG Layer 2 — Weave External Cross-RP Fixtures (`fixture`)**:
+   When operations in `executionOrder` require cross-RP dependencies (`managed-identity`, `vnet-subnet`, `private-endpoint`, `storage-account`, `log-analytics`), weave them into the lifecycle via `fixture` (see [references/fixture-and-lifecycle-playbook.md](references/fixture-and-lifecycle-playbook.md)):
 
    ```bash
    node .github/skills/azure-arm-blackbox-test/scripts/cli.ts fixture \
@@ -66,7 +66,7 @@ node .github/skills/azure-arm-blackbox-test/scripts/cli.ts <subcommand> [options
      --kind managed-identity
    ```
 
-   _(Note: Provision `private-endpoint` fixtures after the parent target RP resource is created so you can pass `--target-resource-id <storeId> --group-ids <groupId>`.)_
+   _(Note: Provision `private-endpoint` fixtures mid-loop after the parent target RP resource is created so you can pass `--target-resource-id <storeId> --group-ids <groupId>`.)_
 
 ### Step 3: Execute Stateful Lifecycle Probes Toward 100% Coverage
 

@@ -1986,5 +1986,49 @@ interface PrivateConns {
     // Inline script bundle escapes </script> to prevent XSS breakout!
     expect(canaryDataJs).not.toContain("</script>");
     expect(canaryDataJs).toContain("\\u003c/script\\u003e");
+
+    // 3. Verify Step 1 `rg create` -> Step 2 `discover` execution order on a fresh work-dir!
+    const workDirRgFirst = path.join(tempRoot, "work-rg-first");
+    const createdRgFirst = await createDisposableResourceGroup({
+      workDir: workDirRgFirst,
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus",
+      serviceHint: "mockwidget",
+      armBaseUrl: canaryBaseUrl,
+      allowedArmOrigins: [pollServerUrl],
+      bearerToken: MOCK_TOKEN,
+    });
+    expect(createdRgFirst.rgName).toMatch(/^rg-arm-blackbox-mockwidget-/);
+
+    // Conflicting subscriptionId or armBaseUrl on subsequent `discover` while RG is active is rejected!
+    await expect(
+      discoverSpecInventory({
+        specPath: projectDir,
+        apiVersion: "2025-01-01",
+        workDir: workDirRgFirst,
+        subscriptionId: "00000000-0000-0000-0000-000000000001",
+      }),
+    ).rejects.toThrow(/Cannot switch subscriptionId/);
+
+    const attachedLedger = await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-01-01",
+      workDir: workDirRgFirst,
+    });
+    expect(attachedLedger.disposableResourceGroup?.name).toBe(createdRgFirst.rgName);
+    expect(attachedLedger.disposableResourceGroup?.cleanupStatus).toBe("active");
+    expect(attachedLedger.executionOrder.length).toBeGreaterThan(0);
+
+    const rgFirstProbe = await executeOperationProbe({
+      workDir: workDirRgFirst,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Widgets_CreateOrUpdate",
+        body: { location: "eastus", properties: { skuTier: "Standard" } },
+        pollIntervalMs: 5,
+      },
+    });
+    expect(rgFirstProbe.trace.probeSucceeded).toBe(true);
+    await deleteDisposableResourceGroup({ workDir: workDirRgFirst, bearerToken: MOCK_TOKEN });
   });
 });

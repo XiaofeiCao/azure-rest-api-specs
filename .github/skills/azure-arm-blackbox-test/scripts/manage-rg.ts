@@ -1,4 +1,6 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   extractProvisioningState,
@@ -9,15 +11,18 @@ import {
   DISPOSABLE_RG_PREFIX,
   getActiveAzSubscriptionId,
   getArmBearerToken,
+  inferArmTokenResource,
   isValidDisposableRgName,
   parseRetryAfterMs,
   resolveArmRelativeOrAbsoluteUrl,
   RUN_OWNERSHIP_TAG,
   sendRawHttpExchange,
+  validateAndNormalizeAllowedArmOrigins,
+  validateAndNormalizeArmBaseUrl,
   verifyLiveDisposableRgOwnership,
 } from "./auth-and-http.ts";
-import { loadLedger, saveLedger } from "./ledger-store.ts";
-import type { ExternalDependencyKind, ProvisionedFixture } from "./types.ts";
+import { getLedgerPath, loadLedger, saveLedger } from "./ledger-store.ts";
+import type { CoverageLedger, ExternalDependencyKind, ProvisionedFixture } from "./types.ts";
 
 const ARM_RESOURCES_API_VERSION = "2024-03-01";
 
@@ -36,9 +41,49 @@ export async function createDisposableResourceGroup(options: {
   subscriptionId?: string;
   location?: string;
   rgName?: string;
+  serviceHint?: string;
+  armBaseUrl?: string;
+  armTokenResource?: string;
+  allowedArmOrigins?: string[];
   bearerToken?: string;
 }): Promise<{ rgName: string; location: string; subscriptionId: string }> {
-  const ledger = loadLedger(options.workDir);
+  let ledger: CoverageLedger;
+  if (fs.existsSync(getLedgerPath(options.workDir))) {
+    ledger = loadLedger(options.workDir);
+  } else {
+    const initialArmBaseUrl = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
+    const isLoopbackBase = new URL(initialArmBaseUrl).protocol === "http:";
+    const initialAllowedOrigins = validateAndNormalizeAllowedArmOrigins(
+      options.allowedArmOrigins,
+      isLoopbackBase,
+    );
+    const initialTokenResource = inferArmTokenResource(initialArmBaseUrl, options.armTokenResource);
+    const now = new Date().toISOString();
+    const fallbackHint = options.serviceHint ?? (path.basename(options.workDir) || "svc");
+    ledger = {
+      schemaVersion: "2.0-typespec",
+      runId: crypto.randomBytes(4).toString("hex"),
+      createdAt: now,
+      updatedAt: now,
+      serviceName: fallbackHint,
+      providerNamespace: "",
+      apiVersion: "",
+      availableApiVersions: [],
+      typespecProjectDir: "",
+      entrypointFile: "",
+      subscriptionId: options.subscriptionId,
+      location: options.location,
+      armBaseUrl: initialArmBaseUrl,
+      armTokenResource: initialTokenResource,
+      ...(initialAllowedOrigins.length > 0 ? { allowedArmOrigins: initialAllowedOrigins } : {}),
+      externalDependencies: [],
+      provisionedFixtures: [],
+      executionOrder: [],
+      operations: {},
+      coverage: {},
+    };
+  }
+
   const activeExistingRg =
     ledger.disposableResourceGroup &&
     ledger.disposableResourceGroup.cleanupStatus !== "deleted" &&
@@ -61,6 +106,24 @@ export async function createDisposableResourceGroup(options: {
         `Cannot switch subscriptionId from "${ledger.subscriptionId}" to "${options.subscriptionId}" while disposable Resource Group "${activeExistingRg.name}" has cleanupStatus "${activeExistingRg.cleanupStatus}".`,
       );
     }
+    if (options.armBaseUrl) {
+      const normalizedNewBase = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
+      if (normalizedNewBase.toLowerCase() !== ledger.armBaseUrl.toLowerCase()) {
+        throw new Error(
+          `Cannot switch armBaseUrl from "${ledger.armBaseUrl}" to "${normalizedNewBase}" while disposable Resource Group "${activeExistingRg.name}" has cleanupStatus "${activeExistingRg.cleanupStatus}".`,
+        );
+      }
+    }
+  } else if (options.armBaseUrl) {
+    ledger.armBaseUrl = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
+    const isLoopback = new URL(ledger.armBaseUrl).protocol === "http:";
+    if (options.allowedArmOrigins) {
+      ledger.allowedArmOrigins = validateAndNormalizeAllowedArmOrigins(
+        options.allowedArmOrigins,
+        isLoopback,
+      );
+    }
+    ledger.armTokenResource = inferArmTokenResource(ledger.armBaseUrl, options.armTokenResource);
   }
 
   const subscriptionId =
@@ -69,7 +132,7 @@ export async function createDisposableResourceGroup(options: {
   const rgName =
     options.rgName ??
     ledger.disposableResourceGroup?.name ??
-    generateDisposableRgName(ledger.serviceName);
+    generateDisposableRgName(options.serviceHint ?? ledger.serviceName);
 
   if (!isValidDisposableRgName(rgName)) {
     throw new Error(
