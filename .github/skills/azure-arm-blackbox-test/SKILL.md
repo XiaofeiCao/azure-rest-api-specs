@@ -41,6 +41,8 @@ node .github/skills/azure-arm-blackbox-test/scripts/cli.ts <subcommand> [options
      --work-dir <work-dir>
    ```
 
+   _(Optional Canary / EUAP / Dogfood / Sovereign cloud target: pass `--arm-base-url <https-url>` such as `https://eastus2euap.management.azure.com` or `https://api-dogfood.resources.windows-int.net`, plus optional `--arm-token-resource <audience>` or `--allowed-arm-origins <csv>` when custom Entra audiences or companion LRO polling hosts are needed.)_
+
 3. Inspect the JSON output and `<work-dir>/coverage-ledger.json`:
    - Confirm `providerLiveMetadata.targetVersionSupportedOnArm` is `true`. If `false`, inspect `providerLiveMetadata` in `coverage-ledger.json` to see which `apiVersions` are actually deployed on ARM and select or confirm a deployed `api-version` before running live probes.
    - Choose a region from `recommendedLocations` (defaulting to `eastus` / `eastus2` / `westus2`).
@@ -116,11 +118,11 @@ node .github/skills/azure-arm-blackbox-test/scripts/cli.ts generate-examples \
 
    _(Add `--wait` when synchronous confirmation of full RG deletion is desired.)_
 
-2. Generate `<work-dir>/blackbox-report.json` and `<work-dir>/blackbox-report.md`:
+2. Generate `<work-dir>/blackbox-report.json`, `<work-dir>/blackbox-report.md`, and the self-contained local interactive HTML dashboard `<work-dir>/report-html/index.html` (with `assets/{styles.css,app.js,portal-data.js,portal-data.json}` — works offline via `file://` or any local HTTP server; pass repeatable `--extra-work-dir <dir>` to combine multiple service runs):
 
    ```bash
    node .github/skills/azure-arm-blackbox-test/scripts/cli.ts report \
      --work-dir <work-dir>
    ```
 
-3. Consult [references/behavioral-discrepancy-rules.md](references/behavioral-discrepancy-rules.md) to summarize the API coverage percentage, detected TypeSpec-vs-service behavioral discrepancies (with `.tsp:line` citations), and generated real-life examples. Do not modify `.tsp` files.
+3. Consult [references/behavioral-discrepancy-rules.md](references/behavioral-discrepancy-rules.md) to summarize the API coverage percentage, parameter coverage, detected TypeSpec-vs-service behavioral discrepancies (with `.tsp:line` citations), generated real-life examples, and the path to `<work-dir>/report-html/index.html`. Do not modify `.tsp` files.

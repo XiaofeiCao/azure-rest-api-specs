@@ -31,7 +31,14 @@ import {
   type MetadataInfo,
 } from "@typespec/http";
 import { getExtensions, isReadonlyProperty } from "@typespec/openapi";
-import { assertTrustedArmOrigin, getArmBearerToken } from "./auth-and-http.ts";
+import {
+  assertTrustedArmOrigin,
+  getArmBearerToken,
+  inferArmTokenResource,
+  resolveArmRelativeOrAbsoluteUrl,
+  validateAndNormalizeAllowedArmOrigins,
+  validateAndNormalizeArmBaseUrl,
+} from "./auth-and-http.ts";
 import {
   GENERATED_EXAMPLES_DIRNAME,
   getLedgerPath,
@@ -68,6 +75,8 @@ export interface DiscoverInventoryOptions {
   apiVersion?: string;
   workDir: string;
   armBaseUrl?: string;
+  armTokenResource?: string;
+  allowedArmOrigins?: string[];
   subscriptionId?: string;
   location?: string;
   checkLiveProvider?: boolean;
@@ -876,6 +885,8 @@ export function computeTopologicalExecutionOrder(operations: OperationContract[]
 
 export async function fetchProviderLiveMetadata(options: {
   armBaseUrl: string;
+  armTokenResource?: string;
+  allowedArmOrigins?: string[];
   subscriptionId: string;
   providerNamespace: string;
   targetApiVersion: string;
@@ -884,10 +895,14 @@ export async function fetchProviderLiveMetadata(options: {
   const token = getArmBearerToken({
     explicitToken: options.bearerToken,
     subscriptionId: options.subscriptionId,
+    armBaseUrl: options.armBaseUrl,
+    tokenResource: options.armTokenResource,
   });
-  const base = options.armBaseUrl.replace(/\/+$/, "");
-  const url = `${base}/subscriptions/${encodeURIComponent(options.subscriptionId)}/providers/${encodeURIComponent(options.providerNamespace)}?api-version=2021-04-01`;
-  assertTrustedArmOrigin(url, options.armBaseUrl);
+  const url = resolveArmRelativeOrAbsoluteUrl(
+    options.armBaseUrl,
+    `/subscriptions/${encodeURIComponent(options.subscriptionId)}/providers/${encodeURIComponent(options.providerNamespace)}?api-version=2021-04-01`,
+  );
+  assertTrustedArmOrigin(url, options.armBaseUrl, options.allowedArmOrigins);
   const resp = await fetch(url, {
     headers: {
       Accept: "application/json",
@@ -987,7 +1002,14 @@ export async function discoverSpecInventory(
     availableApiVersions,
     httpOperations,
   } = service;
-  const armBaseUrl = (options.armBaseUrl ?? "https://management.azure.com").replace(/\/+$/, "");
+  const armBaseUrl = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
+  const parsedBase = new URL(armBaseUrl);
+  const isLoopbackBase = parsedBase.protocol === "http:";
+  const allowedArmOrigins = validateAndNormalizeAllowedArmOrigins(
+    options.allowedArmOrigins,
+    isLoopbackBase,
+  );
+  const armTokenResource = inferArmTokenResource(armBaseUrl, options.armTokenResource);
 
   const metadataInfo = createMetadataInfo(program);
   const existingExamplesIndex = scanExistingTypeSpecExamples(typespecProjectDir, apiVersion);
@@ -1295,6 +1317,8 @@ export async function discoverSpecInventory(
   ) {
     providerLiveMetadata = await fetchProviderLiveMetadata({
       armBaseUrl,
+      armTokenResource,
+      allowedArmOrigins,
       subscriptionId: options.subscriptionId,
       providerNamespace: detectedNamespace,
       targetApiVersion: apiVersion,
@@ -1317,6 +1341,8 @@ export async function discoverSpecInventory(
     subscriptionId: options.subscriptionId,
     location: options.location ?? providerLiveMetadata?.recommendedLocations[0],
     armBaseUrl,
+    armTokenResource,
+    ...(allowedArmOrigins.length > 0 ? { allowedArmOrigins } : {}),
     providerLiveMetadata,
     externalDependencies: [...externalDepsMap.values()],
     provisionedFixtures: [],

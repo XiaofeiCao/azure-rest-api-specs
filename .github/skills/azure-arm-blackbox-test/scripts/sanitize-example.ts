@@ -20,6 +20,8 @@ const JWT_VALUE_RE = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]
 export interface SanitizeContext {
   subscriptionId?: string;
   disposableRgName?: string;
+  armBaseUrl?: string;
+  allowedArmOrigins?: string[];
   extraSecretPropertyPaths?: string[];
   secretCycleRules?: SecretCycleRule[];
   secretConstraints?: Record<string, SecretStringConstraint>;
@@ -289,6 +291,41 @@ export function sanitizeStringValue(
   }
 
   let text = raw;
+
+  // Normalize custom Canary / EUAP / Dogfood / loopback ARM base URLs to canonical https://management.azure.com.
+  if (ctx.armBaseUrl) {
+    const cleanBase = ctx.armBaseUrl.replace(/\/+$/, "");
+    if (cleanBase && cleanBase.toLowerCase() !== "https://management.azure.com") {
+      text = text.replace(
+        new RegExp(escapeRegExp(cleanBase), "gi"),
+        "https://management.azure.com",
+      );
+      try {
+        const baseOrigin = new URL(cleanBase).origin;
+        if (baseOrigin.toLowerCase() !== "https://management.azure.com") {
+          text = text.replace(
+            new RegExp(escapeRegExp(baseOrigin), "gi"),
+            "https://management.azure.com",
+          );
+        }
+      } catch {
+        // Ignore non-URL strings.
+      }
+    }
+  }
+  for (const allowedOrigin of ctx.allowedArmOrigins ?? []) {
+    const cleanOrigin = allowedOrigin.replace(/\/+$/, "");
+    if (cleanOrigin && cleanOrigin.toLowerCase() !== "https://management.azure.com") {
+      text = text.replace(
+        new RegExp(escapeRegExp(cleanOrigin), "gi"),
+        "https://management.azure.com",
+      );
+    }
+  }
+  text = text.replace(
+    /https:\/\/(?:[a-z0-9-]+\.)?(?:management\.azure\.com|api-dogfood\.resources\.windows-int\.net)\b/gi,
+    "https://management.azure.com",
+  );
 
   if (ctx.subscriptionId) {
     const subRe = new RegExp(escapeRegExp(ctx.subscriptionId), "gi");

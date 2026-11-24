@@ -4,7 +4,12 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { analyzeBehavioralDiscrepancies } from "../scripts/analyze-behavior.ts";
-import { assertSafeArmTarget } from "../scripts/auth-and-http.ts";
+import {
+  assertSafeArmTarget,
+  assertTrustedArmOrigin,
+  inferArmTokenResource,
+  validateAndNormalizeArmBaseUrl,
+} from "../scripts/auth-and-http.ts";
 import { executeOperationProbe } from "../scripts/execute-probe.ts";
 import { generateLiveExamples } from "../scripts/generate-examples.ts";
 import {
@@ -1614,5 +1619,228 @@ interface PrivateConns {
     expect(mdText).toContain("Path C:\\\\foo\\\\bar\\|injected");
     // Vaults_Delete failed LRO -> only 6 of 7 operations positively covered!
     expect(finalReport.report.coverageSummary.testedOperations).toBe(6);
+
+    // Local interactive HTML report bundle is generated with zero leaked secrets and XSS-safe portal-data.js!
+    expect(finalReport.htmlIndexPath).toBeTruthy();
+    expect(fs.existsSync(finalReport.htmlIndexPath!)).toBe(true);
+    expect(fs.existsSync(path.join(finalReport.htmlDir!, "assets", "styles.css"))).toBe(true);
+    expect(fs.existsSync(path.join(finalReport.htmlDir!, "assets", "app.js"))).toBe(true);
+    const portalDataJs = fs.readFileSync(
+      path.join(finalReport.htmlDir!, "assets", "portal-data.js"),
+      "utf8",
+    );
+    expect(portalDataJs).toContain("window.__ARM_BLACKBOX_PORTAL_DATA__ =");
+    expect(portalDataJs).not.toContain("REQ_PRIMARY_SECRET");
+    expect(portalDataJs).not.toContain("RAW_PRIMARY_SECRET");
+    expect(portalDataJs).not.toContain("TOP_SECRET_HEADER_MATERIAL");
+    expect(portalDataJs).not.toContain(REAL_SUB_ID);
+  });
+
+  it("supports custom Canary/Dogfood ARM base URLs, base-path prefixes, companion polling origins, and XSS-safe local HTML reports", async () => {
+    // 1. Validate Canary / Dogfood / Sovereign URL normalization & token audience inference
+    expect(validateAndNormalizeArmBaseUrl("https://eastus2euap.management.azure.com/")).toBe(
+      "https://eastus2euap.management.azure.com",
+    );
+    expect(() => validateAndNormalizeArmBaseUrl("http://eastus2euap.management.azure.com")).toThrow(
+      /HTTPS is required/,
+    );
+    expect(inferArmTokenResource("https://eastus2euap.management.azure.com")).toBe(
+      "https://management.azure.com",
+    );
+    expect(inferArmTokenResource("https://api-dogfood.resources.windows-int.net")).toBe(
+      "https://management.core.windows.net/",
+    );
+    expect(inferArmTokenResource("https://management.usgovcloudapi.net")).toBe(
+      "https://management.usgovcloudapi.net",
+    );
+    expect(inferArmTokenResource("https://management.chinacloudapi.cn")).toBe(
+      "https://management.chinacloudapi.cn",
+    );
+    expect(
+      inferArmTokenResource(
+        "https://canary-arm.contoso.net/arm-canary",
+        "api://custom-canary-audience",
+      ),
+    ).toBe("api://custom-canary-audience");
+
+    // Regional EUAP canary automatically trusts canonical parent https://management.azure.com for LRO polling / nextLink,
+    // while blocking untrusted third-party or insecure origins.
+    expect(() =>
+      assertTrustedArmOrigin(
+        "https://management.azure.com/subscriptions/0000/providers/Microsoft.Foo/locations/eastus2euap/asyncOperations/op1?api-version=2025-01-01",
+        "https://eastus2euap.management.azure.com",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertTrustedArmOrigin(
+        "https://api-dogfood.resources.windows-int.net/subscriptions/0000/operationresults/op1",
+        "https://eastus2euap.api-dogfood.resources.windows-int.net",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertTrustedArmOrigin(
+        "https://evil.example.com/steal-token",
+        "https://eastus2euap.management.azure.com",
+      ),
+    ).toThrow(/untrusted origin/);
+
+    // 2. End-to-end Canary proxy with base-path prefix (/arm-canary) + separate companion LRO polling origin
+    const tempRoot = makeTempDir();
+    const projectDir = createMinimalArmMockTypeSpecProject(tempRoot);
+    const workDir = path.join(tempRoot, "work-canary");
+
+    let pollServerUrl = "";
+    let pollHits = 0;
+    const pollServer = http.createServer((req, res) => {
+      pollHits++;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          status: pollHits >= 1 ? "Succeeded" : "InProgress",
+        }),
+      );
+      req.resume();
+    });
+    await new Promise<void>((resolve) => {
+      pollServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    servers.push(pollServer);
+    pollServerUrl = `http://127.0.0.1:${(pollServer.address() as { port: number }).port}`;
+
+    let rgState: Record<string, unknown> | undefined;
+    let canaryBaseUrl = "";
+    const canaryServer = http.createServer((req, res) => {
+      void (async () => {
+        const chunks: Buffer[] = [];
+        for await (const c of req) {
+          chunks.push(c as Buffer);
+        }
+        const rawBody = Buffer.concat(chunks).toString("utf8");
+        const reqUrl = new URL(req.url ?? "/", canaryBaseUrl);
+        const pathname = decodeURIComponent(reqUrl.pathname);
+
+        // Every request to the canary server MUST arrive under the /arm-canary prefix!
+        if (!pathname.startsWith("/arm-canary/")) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "MissingCanaryPrefix", message: pathname } }));
+          return;
+        }
+        const armPath = pathname.slice("/arm-canary".length);
+
+        if (/^\/subscriptions\/[^/]+\/resourcegroups\/[^/]+$/i.test(armPath)) {
+          if (req.method === "GET") {
+            if (!rgState) {
+              res.writeHead(404, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: { code: "ResourceGroupNotFound", message: "404" } }));
+            } else {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(rgState));
+            }
+            return;
+          }
+          if (req.method === "PUT") {
+            const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+            rgState = { id: armPath, location: parsed.location, tags: parsed.tags };
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(rgState));
+            return;
+          }
+          if (req.method === "DELETE") {
+            rgState = undefined;
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end("");
+            return;
+          }
+        }
+
+        if (/\/providers\/Microsoft\.MockWidget\/widgets\/[^/]+$/i.test(armPath)) {
+          if (req.method === "PUT") {
+            res.writeHead(201, {
+              "Content-Type": "application/json",
+              "Azure-AsyncOperation": `${pollServerUrl}/asyncOps/w-canary-1`,
+            });
+            res.end(
+              JSON.stringify({
+                id: armPath,
+                name: "bbx-canary-w1",
+                type: "Microsoft.MockWidget/widgets",
+                location: "eastus",
+                tags: { xssCheck: "</script><script>alert(1)</script>" },
+                properties: { skuTier: "Standard", provisioningState: "Creating" },
+              }),
+            );
+            return;
+          }
+          if (req.method === "GET") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                id: armPath,
+                name: "bbx-canary-w1",
+                type: "Microsoft.MockWidget/widgets",
+                location: "eastus",
+                tags: { xssCheck: "</script><script>alert(1)</script>" },
+                properties: { skuTier: "Standard", provisioningState: "Succeeded" },
+              }),
+            );
+            return;
+          }
+        }
+
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "NotFound", message: armPath } }));
+      })();
+    });
+    await new Promise<void>((resolve) => {
+      canaryServer.listen(0, "127.0.0.1", () => resolve());
+    });
+    servers.push(canaryServer);
+    canaryBaseUrl = `http://127.0.0.1:${(canaryServer.address() as { port: number }).port}/arm-canary`;
+
+    await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-01-01",
+      workDir,
+      armBaseUrl: canaryBaseUrl,
+      allowedArmOrigins: [pollServerUrl],
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus",
+    });
+
+    await createDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
+    const putTrace = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Widgets_CreateOrUpdate",
+        body: {
+          location: "eastus",
+          tags: { xssCheck: "</script><script>alert(1)</script>" },
+          properties: { skuTier: "Standard" },
+        },
+        pollIntervalMs: 5,
+      },
+    });
+    expect(putTrace.trace.probeSucceeded).toBe(true);
+    expect(pollHits).toBeGreaterThanOrEqual(1);
+
+    const exArtifacts = await generateLiveExamples({ workDir, validateWithTypeSpec: true });
+    expect(exArtifacts.length).toBe(1);
+    const exText = fs.readFileSync(exArtifacts[0].scratchPath, "utf8");
+    // Canary base URL and companion polling origin are scrubbed to canonical https://management.azure.com!
+    expect(exText).not.toContain(canaryBaseUrl);
+    expect(exText).not.toContain(pollServerUrl);
+    expect(exText).toContain("https://management.azure.com/asyncOps/w-canary-1");
+
+    await deleteDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
+    const canaryReport = await buildSummaryReport(workDir);
+    expect(canaryReport.report.armBaseUrl).toBe(canaryBaseUrl);
+    const canaryDataJs = fs.readFileSync(
+      path.join(canaryReport.htmlDir!, "assets", "portal-data.js"),
+      "utf8",
+    );
+    // Inline script bundle escapes </script> to prevent XSS breakout!
+    expect(canaryDataJs).not.toContain("</script>");
+    expect(canaryDataJs).toContain("\\u003c/script\\u003e");
   });
 });

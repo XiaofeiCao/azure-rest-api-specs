@@ -189,6 +189,8 @@ export interface CoverageLedger {
   subscriptionId?: string;
   location?: string;
   armBaseUrl: string;
+  armTokenResource?: string;
+  allowedArmOrigins?: string[];
   disposableResourceGroup?: DisposableResourceGroupState;
   providerLiveMetadata?: ProviderLiveMetadata;
   externalDependencies: ExternalDependencyHint[];

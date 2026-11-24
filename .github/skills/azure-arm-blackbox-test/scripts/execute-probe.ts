@@ -11,7 +11,9 @@ import {
 import {
   getArmBearerToken,
   parseRetryAfterMs,
+  resolveArmRelativeOrAbsoluteUrl,
   sendRawHttpExchange,
+  stripConfiguredArmBasePath,
   type SafetyGuardContext,
 } from "./auth-and-http.ts";
 import { loadLedger, nextTraceSequence, saveLedger, saveProbeTrace } from "./ledger-store.ts";
@@ -171,9 +173,13 @@ function doesUrlMatchPathTemplate(
   pathTemplate: string,
   actualUrl: string,
   parameters: OperationParameterSpec[] = [],
+  armBaseUrl?: string,
 ): boolean {
   const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
-  const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  const actualPathname = stripConfiguredArmBasePath(actualUrl, armBaseUrl).replace(
+    /^\/+|\/+$/g,
+    "",
+  );
   const templateSegs = cleanTemplate.split("/").filter(Boolean);
   const regexStr = templateSegs
     .map((seg) => {
@@ -194,9 +200,16 @@ function doesUrlMatchPathTemplate(
   return new RegExp(`^${regexStr}$`, "i").test(actualPathname);
 }
 
-function extractPathSlotsFromUrl(pathTemplate: string, actualUrl: string): Record<string, string> {
+function extractPathSlotsFromUrl(
+  pathTemplate: string,
+  actualUrl: string,
+  armBaseUrl?: string,
+): Record<string, string> {
   const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
-  const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  const actualPathname = stripConfiguredArmBasePath(actualUrl, armBaseUrl).replace(
+    /^\/+|\/+$/g,
+    "",
+  );
   const templateSegs = cleanTemplate.split("/");
   const actualSegs = actualPathname.split("/");
   const extracted: Record<string, string> = {};
@@ -342,10 +355,7 @@ export function buildTargetUrl(
   apiVersion: string,
   extraQuery?: Record<string, string>,
 ): string {
-  const base = armBaseUrl.replace(/\/+$/, "");
-  const rawUrl = /^https?:\/\//i.test(pathOrUrl)
-    ? pathOrUrl
-    : `${base}${pathOrUrl.startsWith("/") ? "" : "/"}${pathOrUrl}`;
+  const rawUrl = resolveArmRelativeOrAbsoluteUrl(armBaseUrl, pathOrUrl);
   const parsed = new URL(rawUrl);
 
   for (const [existingKey, existingVal] of [...parsed.searchParams.entries()]) {
@@ -378,11 +388,7 @@ export function buildTargetUrl(
 }
 
 function resolvePollingUrl(armBaseUrl: string, headerVal: string): string {
-  if (/^https?:\/\//i.test(headerVal)) {
-    return headerVal;
-  }
-  const base = armBaseUrl.replace(/\/+$/, "");
-  return `${base}${headerVal.startsWith("/") ? "" : "/"}${headerVal}`;
+  return resolveArmRelativeOrAbsoluteUrl(armBaseUrl, headerVal);
 }
 
 function extractAsyncMonitorStatus(body: unknown): string | undefined {
@@ -400,9 +406,10 @@ function extractTargetResourceIdentityFromUrl(
   urlStr: string,
   fallbackLocation?: string,
   responseBody?: unknown,
+  armBaseUrl?: string,
 ): OwnedTargetResource | undefined {
   try {
-    const pathname = decodeURIComponent(new URL(urlStr).pathname).replace(/\/+$/, "");
+    const pathname = stripConfiguredArmBasePath(urlStr, armBaseUrl).replace(/\/+$/, "");
     const rgMatch =
       /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/([^/]+)\/([^/]+)\/([^/]+)$/i.exec(
         pathname,
@@ -550,6 +557,8 @@ export async function executeOperationProbe(
   const token = getArmBearerToken({
     explicitToken: options.bearerToken,
     subscriptionId: ledger.subscriptionId,
+    armBaseUrl: ledger.armBaseUrl,
+    tokenResource: ledger.armTokenResource,
   });
 
   if (!ledger.runId) {
@@ -559,6 +568,7 @@ export async function executeOperationProbe(
   const ownedTargetResources = getOwnedTargetResourcesFromLedger(ledger);
   const safetyContext: SafetyGuardContext = {
     trustedArmBaseUrl: ledger.armBaseUrl,
+    allowedArmOrigins: ledger.allowedArmOrigins,
     subscriptionId: ledger.subscriptionId,
     disposableRgName: ledger.disposableResourceGroup?.name,
     ownedTargetResources,
@@ -582,10 +592,15 @@ export async function executeOperationProbe(
   );
   if (
     !expectError &&
-    !doesUrlMatchPathTemplate(contract.pathTemplate, targetUrl, contract.parameters)
+    !doesUrlMatchPathTemplate(
+      contract.pathTemplate,
+      targetUrl,
+      contract.parameters,
+      ledger.armBaseUrl,
+    )
   ) {
     throw new Error(
-      `Positive probe URL "${new URL(targetUrl).pathname}" does not match declared route template "${contract.pathTemplate}" for "${contract.operationId}".`,
+      `Positive probe URL "${stripConfiguredArmBasePath(targetUrl, ledger.armBaseUrl)}" does not match declared route template "${contract.pathTemplate}" for "${contract.operationId}".`,
     );
   }
 
@@ -628,6 +643,7 @@ export async function executeOperationProbe(
       targetUrl,
       reqLocation,
       initialExchange.response.body,
+      ledger.armBaseUrl,
     );
     if (
       identity &&
@@ -1028,7 +1044,9 @@ export async function executeOperationProbe(
     }
   }
 
-  const normalizedTargetPath = new URL(targetUrl).pathname.replace(/\/+$/, "").toLowerCase();
+  const normalizedTargetPath = stripConfiguredArmBasePath(targetUrl, ledger.armBaseUrl)
+    .replace(/\/+$/, "")
+    .toLowerCase();
 
   // Auto-attach saved priorPutBody strictly by exact resource path so GET of resource B never compares against resource A (#7963).
   const effectivePriorPutBody =
@@ -1079,7 +1097,7 @@ export async function executeOperationProbe(
 
   // Record observed path slots, PUT bodies, and List child item names into runtimeState on positive success.
   if (!expectError && probeSucceeded) {
-    const boundSlots = extractPathSlotsFromUrl(contract.pathTemplate, targetUrl);
+    const boundSlots = extractPathSlotsFromUrl(contract.pathTemplate, targetUrl, ledger.armBaseUrl);
     for (const [k, v] of Object.entries(boundSlots)) {
       const lowerK = k.toLowerCase();
       if (

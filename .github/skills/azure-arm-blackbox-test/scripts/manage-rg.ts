@@ -11,6 +11,7 @@ import {
   getArmBearerToken,
   isValidDisposableRgName,
   parseRetryAfterMs,
+  resolveArmRelativeOrAbsoluteUrl,
   sendRawHttpExchange,
 } from "./auth-and-http.ts";
 import { loadLedger, saveLedger } from "./ledger-store.ts";
@@ -78,15 +79,20 @@ export async function createDisposableResourceGroup(options: {
   const token = getArmBearerToken({
     explicitToken: options.bearerToken,
     subscriptionId,
+    armBaseUrl: ledger.armBaseUrl,
+    tokenResource: ledger.armTokenResource,
   });
 
   const runId = ledger.runId ?? crypto.randomBytes(4).toString("hex");
   ledger.runId = runId;
 
-  const base = ledger.armBaseUrl.replace(/\/+$/, "");
-  const url = `${base}/subscriptions/${encodeURIComponent(subscriptionId)}/resourcegroups/${encodeURIComponent(rgName)}?api-version=${ARM_RESOURCES_API_VERSION}`;
+  const url = resolveArmRelativeOrAbsoluteUrl(
+    ledger.armBaseUrl,
+    `/subscriptions/${encodeURIComponent(subscriptionId)}/resourcegroups/${encodeURIComponent(rgName)}?api-version=${ARM_RESOURCES_API_VERSION}`,
+  );
   const safetyContext = {
     trustedArmBaseUrl: ledger.armBaseUrl,
+    allowedArmOrigins: ledger.allowedArmOrigins,
     subscriptionId,
     disposableRgName: rgName,
     allowDisposableRgLifecycle: true,
@@ -185,11 +191,16 @@ export async function deleteDisposableResourceGroup(options: {
   const token = getArmBearerToken({
     explicitToken: options.bearerToken,
     subscriptionId: ledger.subscriptionId,
+    armBaseUrl: ledger.armBaseUrl,
+    tokenResource: ledger.armTokenResource,
   });
-  const base = ledger.armBaseUrl.replace(/\/+$/, "");
-  const url = `${base}/subscriptions/${encodeURIComponent(ledger.subscriptionId)}/resourcegroups/${encodeURIComponent(rg.name)}?api-version=${ARM_RESOURCES_API_VERSION}`;
+  const url = resolveArmRelativeOrAbsoluteUrl(
+    ledger.armBaseUrl,
+    `/subscriptions/${encodeURIComponent(ledger.subscriptionId)}/resourcegroups/${encodeURIComponent(rg.name)}?api-version=${ARM_RESOURCES_API_VERSION}`,
+  );
   const safetyContext = {
     trustedArmBaseUrl: ledger.armBaseUrl,
+    allowedArmOrigins: ledger.allowedArmOrigins,
     subscriptionId: ledger.subscriptionId,
     disposableRgName: rg.name,
     allowDisposableRgLifecycle: true,
@@ -280,6 +291,7 @@ export async function deleteDisposableResourceGroup(options: {
         bearerToken: token,
         safetyContext: {
           trustedArmBaseUrl: ledger.armBaseUrl,
+          allowedArmOrigins: ledger.allowedArmOrigins,
           subscriptionId: ledger.subscriptionId,
           disposableRgName: rg.name,
           allowDisposableRgLifecycle: true,
@@ -299,6 +311,7 @@ export async function deleteDisposableResourceGroup(options: {
 
 async function putArmFixtureAndWait(options: {
   armBaseUrl: string;
+  allowedArmOrigins?: string[];
   subscriptionId: string;
   resourcePathWithQuery: string;
   body: unknown;
@@ -307,10 +320,10 @@ async function putArmFixtureAndWait(options: {
   pollIntervalMs?: number;
   maxPollAttempts?: number;
 }): Promise<Record<string, unknown>> {
-  const base = options.armBaseUrl.replace(/\/+$/, "");
-  const url = `${base}${options.resourcePathWithQuery}`;
+  const url = resolveArmRelativeOrAbsoluteUrl(options.armBaseUrl, options.resourcePathWithQuery);
   const safetyContext = {
     trustedArmBaseUrl: options.armBaseUrl,
+    allowedArmOrigins: options.allowedArmOrigins,
     subscriptionId: options.subscriptionId,
     disposableRgName: options.disposableRgName,
     allowDisposableRgLifecycle: false,
@@ -347,9 +360,7 @@ async function putArmFixtureAndWait(options: {
 
   if (needsPoll) {
     const pollUrl = asyncHeader
-      ? /^https?:\/\//i.test(asyncHeader)
-        ? asyncHeader
-        : `${base}${asyncHeader.startsWith("/") ? "" : "/"}${asyncHeader}`
+      ? resolveArmRelativeOrAbsoluteUrl(options.armBaseUrl, asyncHeader)
       : url;
     let lastWaitHeaders = initial.response.headers;
     let pollCompleted = false;
@@ -467,6 +478,8 @@ export async function provisionExternalFixture(options: {
   const token = getArmBearerToken({
     explicitToken: options.bearerToken,
     subscriptionId: sub,
+    armBaseUrl: ledger.armBaseUrl,
+    tokenResource: ledger.armTokenResource,
   });
 
   const rgPrefix = `/subscriptions/${encodeURIComponent(sub)}/resourceGroups/${encodeURIComponent(rg)}`;
@@ -477,6 +490,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
       subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-01-31`,
       body: { location },
@@ -499,6 +513,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.Network/virtualNetworks/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
       subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-11-01`,
       body: {
@@ -575,6 +590,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.Network/privateEndpoints/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: freshLedger.armBaseUrl,
+      allowedArmOrigins: freshLedger.allowedArmOrigins,
       subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-11-01`,
       body: {
@@ -614,6 +630,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.Storage/storageAccounts/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
       subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-05-01`,
       body: {
@@ -640,6 +657,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.OperationalInsights/workspaces/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
       subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-09-01`,
       body: {

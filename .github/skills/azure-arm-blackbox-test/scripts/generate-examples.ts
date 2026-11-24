@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { stripConfiguredArmBasePath } from "./auth-and-http.ts";
 import {
   GENERATED_EXAMPLES_DIRNAME,
   loadAllProbeTraces,
@@ -38,9 +39,13 @@ interface XMsExampleDocument {
 function extractPathParametersFromUrl(
   pathTemplate: string,
   actualUrl: string,
+  armBaseUrl?: string,
 ): Record<string, string> {
   const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
-  const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  const actualPathname = stripConfiguredArmBasePath(actualUrl, armBaseUrl).replace(
+    /^\/+|\/+$/g,
+    "",
+  );
 
   const templateSegs = cleanTemplate.split("/");
   const actualSegs = actualPathname.split("/");
@@ -142,7 +147,11 @@ export function buildXMsExampleFromTrace(
   }
 
   const parsedUrl = new URL(initial.request.url);
-  const rawPathParams = extractPathParametersFromUrl(contract.pathTemplate, initial.request.url);
+  const rawPathParams = extractPathParametersFromUrl(
+    contract.pathTemplate,
+    initial.request.url,
+    sanitizeCtx.armBaseUrl,
+  );
 
   const parameters: Record<string, unknown> = {};
   for (const paramSpec of contract.parameters) {
@@ -377,6 +386,8 @@ export async function generateLiveExamples(
     const sanitizeCtx: SanitizeContext = {
       subscriptionId: ledger.subscriptionId,
       disposableRgName: ledger.disposableResourceGroup?.name,
+      armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
       extraSecretPropertyPaths: contract.secretProperties,
       secretCycleRules: contract.secretCycleRules,
       secretConstraints: contract.secretConstraints,

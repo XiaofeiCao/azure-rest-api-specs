@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import type { ExchangeStep, OwnedTargetResource, WireHttpExchange } from "./types.ts";
 
 export const DISPOSABLE_RG_PREFIX = "rg-arm-blackbox-";
+export const DEFAULT_ARM_BASE_URL = "https://management.azure.com";
 
 const SENSITIVE_HEADER_NAMES = new Set([
   "authorization",
@@ -19,11 +20,168 @@ interface CachedToken {
   expiresAtMs: number;
 }
 
-let cachedArmToken: CachedToken | undefined;
+const cachedArmTokens = new Map<string, CachedToken>();
 
 export interface TokenProviderOptions {
   explicitToken?: string;
   subscriptionId?: string;
+  armBaseUrl?: string;
+  tokenResource?: string;
+}
+
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+/**
+ * Validates and normalizes a user-supplied ARM / Canary / Dogfood base URL.
+ * Requires HTTPS except when explicitly targeting a local loopback mock server (`http://127.0.0.1` / `localhost`).
+ */
+export function validateAndNormalizeArmBaseUrl(rawBaseUrl?: string): string {
+  const candidate =
+    rawBaseUrl?.trim() || process.env.ARM_BLACKBOX_BASE_URL?.trim() || DEFAULT_ARM_BASE_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error(`Invalid ARM base URL "${candidate}": expected an absolute https:// URL.`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`Invalid ARM base URL "${parsed.origin}": embedded credentials are forbidden.`);
+  }
+  if (parsed.search || parsed.hash) {
+    throw new Error(
+      `Invalid ARM base URL "${candidate}": query strings and URL fragments are not permitted.`,
+    );
+  }
+  const isLoopbackHttp =
+    parsed.protocol === "http:" && LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+  if (parsed.protocol !== "https:" && !isLoopbackHttp) {
+    throw new Error(
+      `Invalid ARM base URL "${candidate}": HTTPS is required for non-loopback ARM/Canary endpoints.`,
+    );
+  }
+  const cleanPath = parsed.pathname.replace(/\/+$/, "");
+  return `${parsed.origin}${cleanPath}`;
+}
+
+export function validateAndNormalizeAllowedArmOrigins(
+  origins?: string[],
+  allowLoopbackHttp = false,
+): string[] {
+  if (!origins || origins.length === 0) {
+    return [];
+  }
+  const normalized = new Set<string>();
+  for (const raw of origins) {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      continue;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(trimmed);
+    } catch {
+      throw new Error(`Invalid allowed ARM origin "${trimmed}": expected an https:// origin.`);
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error(
+        `Invalid allowed ARM origin "${parsed.origin}": embedded credentials are forbidden.`,
+      );
+    }
+    if ((parsed.pathname && parsed.pathname !== "/") || parsed.search || parsed.hash) {
+      throw new Error(
+        `Invalid allowed ARM origin "${trimmed}": specify origin only (e.g. "https://management.azure.com") without path, query, or hash.`,
+      );
+    }
+    const isLoopback =
+      allowLoopbackHttp &&
+      parsed.protocol === "http:" &&
+      LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+    if (parsed.protocol !== "https:" && !isLoopback) {
+      throw new Error(`Invalid allowed ARM origin "${trimmed}": HTTPS is required.`);
+    }
+    normalized.add(parsed.origin.toLowerCase());
+  }
+  return [...normalized].sort();
+}
+
+/**
+ * Infers the Entra ID token resource audience for public Azure, regional EUAP/Canary, Dogfood, or Sovereign clouds.
+ */
+export function inferArmTokenResource(armBaseUrl?: string, explicitTokenResource?: string): string {
+  const override = explicitTokenResource?.trim() || process.env.ARM_BLACKBOX_TOKEN_RESOURCE?.trim();
+  if (override) {
+    return override;
+  }
+  if (!armBaseUrl) {
+    return DEFAULT_ARM_BASE_URL;
+  }
+  const host = new URL(validateAndNormalizeArmBaseUrl(armBaseUrl)).hostname.toLowerCase();
+  if (
+    host === "api-dogfood.resources.windows-int.net" ||
+    host.endsWith(".resources.windows-int.net")
+  ) {
+    return "https://management.core.windows.net/";
+  }
+  if (host === "management.usgovcloudapi.net" || host.endsWith(".usgovcloudapi.net")) {
+    return "https://management.usgovcloudapi.net";
+  }
+  if (host === "management.chinacloudapi.cn" || host.endsWith(".chinacloudapi.cn")) {
+    return "https://management.chinacloudapi.cn";
+  }
+  if (host === "management.microsoftazure.de" || host.endsWith(".microsoftazure.de")) {
+    return "https://management.microsoftazure.de";
+  }
+  return DEFAULT_ARM_BASE_URL;
+}
+
+/**
+ * Resolves a relative ARM path or absolute URL against `armBaseUrl` without duplicating any configured base path prefix.
+ */
+export function resolveArmRelativeOrAbsoluteUrl(armBaseUrl: string, pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    return pathOrUrl;
+  }
+  const normalizedBase = validateAndNormalizeArmBaseUrl(armBaseUrl);
+  const baseObj = new URL(normalizedBase);
+  const basePrefix = baseObj.pathname.replace(/\/+$/, "");
+  const cleanRel = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+  if (
+    basePrefix &&
+    (cleanRel.toLowerCase() === basePrefix.toLowerCase() ||
+      cleanRel.toLowerCase().startsWith(`${basePrefix.toLowerCase()}/`))
+  ) {
+    return `${baseObj.origin}${cleanRel}`;
+  }
+  return `${normalizedBase}${cleanRel}`;
+}
+
+/**
+ * Strips any configured `armBaseUrl` pathname prefix (e.g. `/arm-canary`) from a URL's pathname
+ * when the URL targets the configured base origin, yielding the canonical `/subscriptions/...` path.
+ */
+export function stripConfiguredArmBasePath(targetUrl: string, trustedArmBaseUrl?: string): string {
+  const parsedTarget = /^https?:\/\//i.test(targetUrl)
+    ? new URL(targetUrl)
+    : new URL(targetUrl.startsWith("/") ? targetUrl : `/${targetUrl}`, DEFAULT_ARM_BASE_URL);
+  const rawPathname = decodeURIComponent(parsedTarget.pathname);
+  if (!trustedArmBaseUrl) {
+    return rawPathname;
+  }
+  try {
+    const expectedBase = new URL(validateAndNormalizeArmBaseUrl(trustedArmBaseUrl));
+    const basePrefix = expectedBase.pathname.replace(/\/+$/, "");
+    if (basePrefix && parsedTarget.origin.toLowerCase() === expectedBase.origin.toLowerCase()) {
+      if (rawPathname.toLowerCase() === basePrefix.toLowerCase()) {
+        return "/";
+      }
+      if (rawPathname.toLowerCase().startsWith(`${basePrefix.toLowerCase()}/`)) {
+        return rawPathname.slice(basePrefix.length);
+      }
+    }
+  } catch {
+    // Fall back to raw decoded pathname if base URL cannot be parsed.
+  }
+  return rawPathname;
 }
 
 function resolveAzExecutable(): string {
@@ -60,19 +218,15 @@ export function getArmBearerToken(options?: TokenProviderOptions): string {
   if (envToken) {
     return envToken;
   }
+  const tokenResource = inferArmTokenResource(options?.armBaseUrl, options?.tokenResource);
+  const cacheKey = `${(options?.subscriptionId ?? "default").toLowerCase()}::${tokenResource.toLowerCase()}`;
   const now = Date.now();
-  if (cachedArmToken && cachedArmToken.expiresAtMs - now > 120_000) {
-    return cachedArmToken.accessToken;
+  const cached = cachedArmTokens.get(cacheKey);
+  if (cached && cached.expiresAtMs - now > 120_000) {
+    return cached.accessToken;
   }
 
-  const args = [
-    "account",
-    "get-access-token",
-    "--resource",
-    "https://management.azure.com",
-    "-o",
-    "json",
-  ];
+  const args = ["account", "get-access-token", "--resource", tokenResource, "-o", "json"];
   if (options?.subscriptionId) {
     args.push("--subscription", options.subscriptionId);
   }
@@ -88,7 +242,7 @@ export function getArmBearerToken(options?: TokenProviderOptions): string {
     expiresOn?: string;
   };
   if (!parsed.accessToken) {
-    throw new Error("Azure CLI did not return an accessToken for https://management.azure.com.");
+    throw new Error(`Azure CLI did not return an accessToken for ${tokenResource}.`);
   }
 
   const expiresAtMs =
@@ -98,11 +252,11 @@ export function getArmBearerToken(options?: TokenProviderOptions): string {
         ? Date.parse(parsed.expiresOn)
         : now + 15 * 60_000;
 
-  cachedArmToken = {
+  cachedArmTokens.set(cacheKey, {
     accessToken: parsed.accessToken,
     expiresAtMs: Number.isFinite(expiresAtMs) ? expiresAtMs : now + 15 * 60_000,
-  };
-  return cachedArmToken.accessToken;
+  });
+  return parsed.accessToken;
 }
 
 export function isValidDisposableRgName(rgName: string): boolean {
@@ -114,41 +268,76 @@ export function isValidDisposableRgName(rgName: string): boolean {
 
 export interface SafetyGuardContext {
   trustedArmBaseUrl?: string;
+  allowedArmOrigins?: string[];
   subscriptionId?: string;
   disposableRgName?: string;
   ownedTargetResources?: OwnedTargetResource[];
   allowDisposableRgLifecycle?: boolean;
 }
 
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+function inferCanonicalSameCloudArmOrigin(expectedBase: URL): string | undefined {
+  if (expectedBase.protocol !== "https:") {
+    return undefined;
+  }
+  const host = expectedBase.hostname.toLowerCase();
+  if (/^[a-z0-9-]+\.management\.azure\.com$/i.test(host)) {
+    return "https://management.azure.com";
+  }
+  if (/^[a-z0-9-]+\.api-dogfood\.resources\.windows-int\.net$/i.test(host)) {
+    return "https://api-dogfood.resources.windows-int.net";
+  }
+  if (/^[a-z0-9-]+\.management\.usgovcloudapi\.net$/i.test(host)) {
+    return "https://management.usgovcloudapi.net";
+  }
+  if (/^[a-z0-9-]+\.management\.chinacloudapi\.cn$/i.test(host)) {
+    return "https://management.chinacloudapi.cn";
+  }
+  return undefined;
+}
 
 /**
- * Validates that a target URL matches the configured trusted ARM origin and uses HTTPS
- * (allowing loopback HTTP only when trustedArmBaseUrl itself is explicitly configured to that loopback origin).
+ * Validates that a target URL matches the configured trusted ARM/Canary origin (or its same-cloud canonical ARM polling origin)
+ * and uses HTTPS (allowing loopback HTTP only when trustedArmBaseUrl itself is explicitly configured to loopback).
  */
-export function assertTrustedArmOrigin(targetUrl: string, trustedArmBaseUrl?: string): URL {
+export function assertTrustedArmOrigin(
+  targetUrl: string,
+  trustedArmBaseUrl?: string,
+  allowedArmOrigins?: string[],
+): URL {
   const parsed = new URL(targetUrl);
   if (parsed.username || parsed.password) {
     throw new Error(`Blocked request with embedded URL credentials: ${parsed.origin}`);
   }
 
-  const expectedBase = new URL(
-    (trustedArmBaseUrl ?? "https://management.azure.com").replace(/\/+$/, ""),
-  );
-  if (parsed.origin.toLowerCase() !== expectedBase.origin.toLowerCase()) {
+  const expectedBase = new URL(validateAndNormalizeArmBaseUrl(trustedArmBaseUrl));
+  const isExplicitLoopbackBase =
+    expectedBase.protocol === "http:" && LOOPBACK_HOSTS.has(expectedBase.hostname.toLowerCase());
+  const isTargetLoopbackHttp =
+    isExplicitLoopbackBase &&
+    parsed.protocol === "http:" &&
+    LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+
+  if (parsed.protocol !== "https:" && !isTargetLoopbackHttp) {
     throw new Error(
-      `Blocked request to untrusted origin "${parsed.origin}": requests carrying ARM Bearer tokens must match "${expectedBase.origin}".`,
+      `Blocked insecure transport "${parsed.protocol}" for ARM target "${parsed.origin}": HTTPS is required.`,
     );
   }
 
-  const isExplicitLoopbackTest =
-    expectedBase.protocol === "http:" &&
-    LOOPBACK_HOSTS.has(expectedBase.hostname.toLowerCase()) &&
-    LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+  const permittedOrigins = new Set<string>([expectedBase.origin.toLowerCase()]);
+  const canonicalParent = inferCanonicalSameCloudArmOrigin(expectedBase);
+  if (canonicalParent) {
+    permittedOrigins.add(canonicalParent.toLowerCase());
+  }
+  for (const extra of validateAndNormalizeAllowedArmOrigins(
+    allowedArmOrigins,
+    isExplicitLoopbackBase,
+  )) {
+    permittedOrigins.add(extra);
+  }
 
-  if (parsed.protocol !== "https:" && !isExplicitLoopbackTest) {
+  if (!permittedOrigins.has(parsed.origin.toLowerCase())) {
     throw new Error(
-      `Blocked insecure transport "${parsed.protocol}" for ARM target "${parsed.origin}": HTTPS is required.`,
+      `Blocked request to untrusted origin "${parsed.origin}": requests carrying ARM Bearer tokens must match [${[...permittedOrigins].join(", ")}].`,
     );
   }
 
@@ -245,7 +434,7 @@ export function assertSafeArmTarget(
   ctx: SafetyGuardContext,
   requestBody?: unknown,
 ): void {
-  const parsed = assertTrustedArmOrigin(targetUrl, ctx.trustedArmBaseUrl);
+  assertTrustedArmOrigin(targetUrl, ctx.trustedArmBaseUrl, ctx.allowedArmOrigins);
   const upperMethod = method.toUpperCase();
   if (upperMethod === "GET" || upperMethod === "HEAD" || upperMethod === "OPTIONS") {
     return;
@@ -253,7 +442,7 @@ export function assertSafeArmTarget(
 
   assertNoCrossScopeBodyTargets(requestBody, ctx);
 
-  const pathname = decodeURIComponent(parsed.pathname).replace(/\/+$/, "");
+  const pathname = stripConfiguredArmBasePath(targetUrl, ctx.trustedArmBaseUrl).replace(/\/+$/, "");
   const subSegmentMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(pathname);
 
   // Non-destructive ARM name-availability checks are subscription/provider scoped POSTs.

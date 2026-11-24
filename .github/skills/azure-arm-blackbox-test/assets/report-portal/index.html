@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ARM TypeSpec Blackbox Coverage Report</title>
+    <link rel="stylesheet" href="./assets/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <div class="brand-badge">ARM</div>
+          <div>
+            <h1>ARM TypeSpec Live Blackbox Coverage</h1>
+            <p class="subtitle">
+              Wire-accurate service behavior validation, API &amp; parameter coverage, and sanitized
+              live TypeSpec examples
+            </p>
+          </div>
+        </div>
+        <div class="auth-area" id="envArea">
+          <span class="user-pill" id="envPill">Local HTML Report</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="container" id="mainContainer">
+      <div class="loading-card" id="loadingState">
+        <div class="spinner"></div>
+        <p>Loading validated blackbox report bundle...</p>
+      </div>
+
+      <div id="dashboardContent" class="hidden">
+        <!-- 1. Management Services Selector -->
+        <section class="section-block">
+          <div class="section-header">
+            <div>
+              <h2>Validated Management Services</h2>
+              <p class="muted" id="generatedAtLabel"></p>
+            </div>
+            <button class="btn btn-secondary hidden" id="selectAllServicesBtn" type="button">
+              All Services View
+            </button>
+          </div>
+          <div class="services-grid" id="servicesGrid"></div>
+        </section>
+
+        <!-- 2. KPI Summary Cards (API Coverage + Parameter Coverage + Discrepancies) -->
+        <section class="kpi-grid" id="kpiGrid"></section>
+
+        <!-- 3. Primary Views: Coverage Details | Parameter Coverage | Discrepancies -->
+        <section class="section-block">
+          <div class="tabs-bar">
+            <div class="tabs" role="tablist">
+              <button class="tab active" data-tab="operations" type="button">
+                Coverage Details <span class="tab-count" id="opsTabCount">0</span>
+              </button>
+              <button class="tab" data-tab="parameters" type="button">
+                Parameter Coverage <span class="tab-count" id="paramsTabCount">0%</span>
+              </button>
+              <button class="tab" data-tab="discrepancies" type="button">
+                Discrepancies <span class="tab-count" id="discTabCount">0</span>
+              </button>
+            </div>
+
+            <div class="filters" id="operationsFilters">
+              <input
+                type="search"
+                id="opSearchInput"
+                class="input"
+                placeholder="Search operationId, route, or .tsp..."
+              />
+              <select id="opStatusFilter" class="select">
+                <option value="all">All Statuses</option>
+                <option value="passed">Passed Clean</option>
+                <option value="passed_with_mismatch">Passed w/ Mismatch</option>
+                <option value="blocked">Blocked</option>
+                <option value="failed_service_error">Failed</option>
+                <option value="pending">Pending / Untested</option>
+              </select>
+              <select id="opMethodFilter" class="select">
+                <option value="all">All Verbs</option>
+                <option value="GET">GET</option>
+                <option value="PUT">PUT</option>
+                <option value="PATCH">PATCH</option>
+                <option value="POST">POST</option>
+                <option value="DELETE">DELETE</option>
+              </select>
+            </div>
+
+            <div class="filters hidden" id="parametersFilters">
+              <select id="paramLocationFilter" class="select">
+                <option value="all">All Locations (path/query/header/body)</option>
+                <option value="path">path</option>
+                <option value="query">query</option>
+                <option value="header">header</option>
+                <option value="body">body property</option>
+              </select>
+              <select id="paramStateFilter" class="select">
+                <option value="all">Exercised &amp; Untested</option>
+                <option value="untested">Untested Only</option>
+                <option value="exercised">Exercised Only</option>
+                <option value="required">Required Only</option>
+                <option value="optional">Optional Only</option>
+              </select>
+            </div>
+
+            <div class="filters hidden" id="discrepanciesFilters">
+              <select id="discRuleFilter" class="select">
+                <option value="all">All Rules</option>
+              </select>
+              <select id="discSeverityFilter" class="select">
+                <option value="all">All Severities</option>
+                <option value="blocking">Blocking</option>
+                <option value="warning">Warning</option>
+                <option value="info">Info</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Tab Panel 1: Operation Coverage Details -->
+          <div id="tab-operations" class="tab-panel">
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Service</th>
+                    <th>Operation ID</th>
+                    <th>Verb &amp; Route</th>
+                    <th>TypeSpec</th>
+                    <th>Phase / LRO</th>
+                    <th>Status</th>
+                    <th>Param Coverage</th>
+                    <th>Issues</th>
+                  </tr>
+                </thead>
+                <tbody id="operationsTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Tab Panel 2: Parameter Coverage Breakdown -->
+          <div id="tab-parameters" class="tab-panel hidden">
+            <div class="param-summary-strip" id="paramLocationCards"></div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Service</th>
+                    <th>Operation ID</th>
+                    <th>Parameter / Body Property</th>
+                    <th>Location</th>
+                    <th>Required</th>
+                    <th>TypeSpec Type</th>
+                    <th>Coverage</th>
+                    <th>Sanitized Sample Value</th>
+                  </tr>
+                </thead>
+                <tbody id="parametersTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Tab Panel 3: Discrepancies -->
+          <div id="tab-discrepancies" class="tab-panel hidden">
+            <div id="discrepanciesList" class="disc-list"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- Slide-out Operation Detail Drawer -->
+    <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
+    <aside id="detailDrawer" class="drawer hidden" aria-label="Operation Details">
+      <div class="drawer-header">
+        <div>
+          <span class="muted" id="drawerServiceLabel"></span>
+          <h3 id="drawerOpTitle"></h3>
+        </div>
+        <button id="closeDrawerBtn" class="btn btn-ghost-dark" type="button">Close ✕</button>
+      </div>
+      <div class="drawer-body" id="drawerBody"></div>
+    </aside>
+
+    <script src="./assets/portal-data.js"></script>
+    <script src="./assets/app.js"></script>
+  </body>
+</html>

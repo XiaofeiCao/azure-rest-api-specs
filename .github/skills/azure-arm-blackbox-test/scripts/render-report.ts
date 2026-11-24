@@ -7,6 +7,7 @@ import {
   loadLedger,
   saveLedger,
 } from "./ledger-store.ts";
+import { renderLocalHtmlReportBundle } from "./render-html-report.ts";
 import type { BehavioralDiscrepancy, CoverageLedger } from "./types.ts";
 
 export interface BlackboxSummaryReport {
@@ -15,6 +16,7 @@ export interface BlackboxSummaryReport {
   providerNamespace: string;
   apiVersion: string;
   availableApiVersions: string[];
+  armBaseUrl: string;
   typespecProjectDir: string;
   entrypointFile: string;
   disposableResourceGroup?: CoverageLedger["disposableResourceGroup"];
@@ -63,9 +65,20 @@ function formatSourceLoc(
   return `${rel}:${loc.line}`;
 }
 
-export async function buildSummaryReport(workDir: string): Promise<{
+export interface BuildSummaryReportOptions {
+  emitHtml?: boolean;
+  extraWorkDirs?: string[];
+  htmlOutputDir?: string;
+}
+
+export async function buildSummaryReport(
+  workDir: string,
+  options?: BuildSummaryReportOptions,
+): Promise<{
   jsonPath: string;
   markdownPath: string;
+  htmlDir?: string;
+  htmlIndexPath?: string;
   report: BlackboxSummaryReport;
 }> {
   const { runTypeSpecLiveValidation } = await import("./analyze-behavior.ts");
@@ -177,6 +190,7 @@ export async function buildSummaryReport(workDir: string): Promise<{
     providerNamespace: ledger.providerNamespace,
     apiVersion: ledger.apiVersion,
     availableApiVersions: ledger.availableApiVersions,
+    armBaseUrl: ledger.armBaseUrl,
     typespecProjectDir: ledger.typespecProjectDir,
     entrypointFile: ledger.entrypointFile,
     disposableResourceGroup: ledger.disposableResourceGroup,
@@ -219,7 +233,26 @@ export async function buildSummaryReport(workDir: string): Promise<{
   fs.writeFileSync(jsonPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
   fs.writeFileSync(markdownPath, renderMarkdownReport(report), "utf8");
 
-  return { jsonPath, markdownPath, report };
+  let htmlDir: string | undefined;
+  let htmlIndexPath: string | undefined;
+  if (options?.emitHtml !== false) {
+    const htmlBundle = await renderLocalHtmlReportBundle({
+      workDir,
+      precomputedPrimaryReport: report,
+      extraWorkDirs: options?.extraWorkDirs,
+      outputDir: options?.htmlOutputDir,
+    });
+    htmlDir = htmlBundle.htmlDir;
+    htmlIndexPath = htmlBundle.htmlIndexPath;
+  }
+
+  return {
+    jsonPath,
+    markdownPath,
+    ...(htmlDir ? { htmlDir } : {}),
+    ...(htmlIndexPath ? { htmlIndexPath } : {}),
+    report,
+  };
 }
 
 function renderMarkdownReport(report: BlackboxSummaryReport): string {
@@ -230,6 +263,7 @@ function renderMarkdownReport(report: BlackboxSummaryReport): string {
   lines.push("");
   lines.push(`- **Generated at**: ${report.generatedAt}`);
   lines.push(`- **TypeSpec Project**: \`${report.typespecProjectDir}\``);
+  lines.push(`- **Target ARM Endpoint**: \`${report.armBaseUrl}\``);
   lines.push(
     `- **API Coverage**: **${report.coverageSummary.testedOperations} / ${report.coverageSummary.totalOperations} (${report.coverageSummary.coveragePercent}%)**`,
   );

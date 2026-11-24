@@ -29,7 +29,7 @@ export async function runCli(argv: string[]): Promise<void> {
         "  probe              Execute a raw HTTP operation probe with wire-level LRO polling & TypeSpec validation",
         "  mark-blocked       Record an explicit Azure quota/feature/environment blocker for an operation",
         "  generate-examples  Generate sanitized real-life TypeSpec example JSON files and validate against TypeSpec",
-        "  report             Render blackbox-report.json and blackbox-report.md",
+        "  report             Render blackbox-report.json, blackbox-report.md, and interactive local report-html/index.html",
       ].join("\n"),
     );
     return;
@@ -45,6 +45,8 @@ export async function runCli(argv: string[]): Promise<void> {
         "subscription-id": { type: "string" },
         location: { type: "string" },
         "arm-base-url": { type: "string" },
+        "arm-token-resource": { type: "string" },
+        "allowed-arm-origins": { type: "string" },
         "check-live-provider": { type: "boolean", default: false },
         reset: { type: "boolean", default: false },
       },
@@ -59,6 +61,13 @@ export async function runCli(argv: string[]): Promise<void> {
       subscriptionId: values["subscription-id"],
       location: values.location,
       armBaseUrl: values["arm-base-url"],
+      armTokenResource: values["arm-token-resource"],
+      allowedArmOrigins: values["allowed-arm-origins"]
+        ? values["allowed-arm-origins"]
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined,
       checkLiveProvider: values["check-live-provider"],
       reset: values.reset,
     });
@@ -273,17 +282,29 @@ export async function runCli(argv: string[]): Promise<void> {
       args: rest,
       options: {
         "work-dir": { type: "string" },
+        "extra-work-dir": { type: "string", multiple: true },
+        "html-dir": { type: "string" },
+        "no-html": { type: "boolean", default: false },
       },
     });
     if (!values["work-dir"]) {
       throw new Error("report requires --work-dir <dir>");
     }
-    const { jsonPath, markdownPath, report } = await buildSummaryReport(values["work-dir"]);
+    const { jsonPath, markdownPath, htmlDir, htmlIndexPath, report } = await buildSummaryReport(
+      values["work-dir"],
+      {
+        emitHtml: !values["no-html"],
+        extraWorkDirs: values["extra-work-dir"],
+        htmlOutputDir: values["html-dir"],
+      },
+    );
     console.log(
       JSON.stringify(
         {
           jsonPath,
           markdownPath,
+          ...(htmlDir ? { htmlDir } : {}),
+          ...(htmlIndexPath ? { htmlIndexPath } : {}),
           coverageSummary: report.coverageSummary,
           discrepancySummary: report.discrepancySummary,
           generatedExamplesCount: report.generatedExampleFiles.length,
