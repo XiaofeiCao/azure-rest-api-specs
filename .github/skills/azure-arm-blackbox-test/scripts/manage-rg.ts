@@ -10,6 +10,7 @@ import {
   getActiveAzSubscriptionId,
   getArmBearerToken,
   isValidDisposableRgName,
+  parseRetryAfterMs,
   sendRawHttpExchange,
 } from "./auth-and-http.ts";
 import { loadLedger, saveLedger } from "./ledger-store.ts";
@@ -342,6 +343,7 @@ async function putArmFixtureAndWait(options: {
 
   const pollIntervalMs = options.pollIntervalMs ?? 3000;
   const maxAttempts = options.maxPollAttempts ?? 40;
+  const pollDeadlineMs = Date.now() + 15 * 60_000;
 
   if (needsPoll) {
     const pollUrl = asyncHeader
@@ -349,10 +351,19 @@ async function putArmFixtureAndWait(options: {
         ? asyncHeader
         : `${base}${asyncHeader.startsWith("/") ? "" : "/"}${asyncHeader}`
       : url;
+    let lastWaitHeaders = initial.response.headers;
     let pollCompleted = false;
 
     for (let i = 0; i < maxAttempts; i++) {
-      await delay(pollIntervalMs);
+      const waitMs = parseRetryAfterMs(lastWaitHeaders, pollIntervalMs);
+      if (Date.now() + waitMs > pollDeadlineMs) {
+        throw new Error(
+          `Fixture LRO polling exceeded 15-minute deadline while honoring Retry-After (${waitMs}ms) (${options.resourcePathWithQuery}).`,
+        );
+      }
+      if (waitMs > 0) {
+        await delay(waitMs);
+      }
       const poll = await sendRawHttpExchange({
         step: "poll",
         method: "GET",
@@ -360,6 +371,10 @@ async function putArmFixtureAndWait(options: {
         bearerToken: options.bearerToken,
         safetyContext,
       });
+      lastWaitHeaders = poll.response.headers;
+      if (poll.response.status === 429) {
+        continue;
+      }
       if (poll.response.status < 200 || poll.response.status >= 300) {
         throw new Error(
           `Fixture LRO poll failed (${options.resourcePathWithQuery}): HTTP ${poll.response.status} ${JSON.stringify(poll.response.body ?? "")}`,

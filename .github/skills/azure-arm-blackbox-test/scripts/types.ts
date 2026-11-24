@@ -59,6 +59,17 @@ export interface PageableContract {
   itemName: string;
 }
 
+export interface SecretStringConstraint {
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+}
+
+export interface SecretCycleRule {
+  basePath: string;
+  repeatPath: string;
+}
+
 export interface OperationContract {
   operationId: string;
   method: HttpMethod;
@@ -84,6 +95,8 @@ export interface OperationContract {
   writableBodyProperties: string[];
   readOnlyBodyProperties: string[];
   secretProperties: string[];
+  secretCycleRules?: SecretCycleRule[];
+  secretConstraints?: Record<string, SecretStringConstraint>;
   secretResponseHeaders?: string[];
   secretResponseStatuses?: string[];
   externalDependencies: ExternalDependencyHint[];

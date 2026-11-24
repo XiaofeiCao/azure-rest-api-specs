@@ -150,7 +150,15 @@ export function resolveTypeSpecProject(specInputPath: string): {
     const norm = dir.replace(/\\/g, "/");
     return norm.includes("/resource-manager/") || norm.endsWith(".Management");
   });
-  const selected = armCandidates[0] ?? candidates[0];
+  const pool = armCandidates.length > 0 ? armCandidates : candidates;
+  if (pool.length > 1) {
+    throw new Error(
+      `Ambiguous TypeSpec root "${resolved}" contains ${pool.length} TypeSpec projects:\n` +
+        pool.map((p) => `  - ${p}`).join("\n") +
+        "\nPass the specific TypeSpec project directory via --spec.",
+    );
+  }
+  const selected = pool[0];
   return {
     typespecProjectDir: selected,
     entrypointFile: path.join(selected, "main.tsp"),

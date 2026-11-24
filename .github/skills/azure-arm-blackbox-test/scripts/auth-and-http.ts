@@ -156,7 +156,23 @@ export function assertTrustedArmOrigin(targetUrl: string, trustedArmBaseUrl?: st
 }
 
 const CROSS_SCOPE_BODY_KEY_RE =
-  /^(targetresourcegroup|targetsubscriptionid|destinationresourceid|targetresourceid|destinationcontainer|targetid|movedresourceid)$/i;
+  /^(targetresourcegroup|targetsubscriptionid|destinationresourceid|targetresourceid|destinationcontainer|targetid|movedresourceid|privatelinkserviceid|remoteprivatelinkserviceid)$/i;
+
+export function parseRetryAfterMs(headers: Record<string, string>, fallbackMs: number): number {
+  const raw = headers["retry-after"]?.trim();
+  if (!raw) {
+    return fallbackMs;
+  }
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds === 0 ? Math.min(fallbackMs, 250) : Math.round(seconds * 1000);
+  }
+  const parsedDateMs = Date.parse(raw);
+  if (Number.isFinite(parsedDateMs)) {
+    return Math.max(0, parsedDateMs - Date.now());
+  }
+  return fallbackMs;
+}
 
 function assertNoCrossScopeBodyTargets(
   body: unknown,

@@ -1,3 +1,5 @@
+import type { SecretCycleRule, SecretStringConstraint } from "./types.ts";
+
 const PLACEHOLDER_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000";
 const PLACEHOLDER_TENANT_ID = "11111111-1111-1111-1111-111111111111";
 const PLACEHOLDER_PRINCIPAL_ID = "22222222-2222-2222-2222-222222222222";
@@ -19,6 +21,8 @@ export interface SanitizeContext {
   subscriptionId?: string;
   disposableRgName?: string;
   extraSecretPropertyPaths?: string[];
+  secretCycleRules?: SecretCycleRule[];
+  secretConstraints?: Record<string, SecretStringConstraint>;
 }
 
 function escapeRegExp(value: string): string {
@@ -62,6 +66,166 @@ function matchesSecretSegments(patternSegs: string[], actualSegs: string[]): boo
   return true;
 }
 
+function foldCycleVariants(
+  actualSegs: string[],
+  cycleRules: SecretCycleRule[] | undefined,
+): string[][] {
+  if (!cycleRules || cycleRules.length === 0 || actualSegs.length === 0) {
+    return [actualSegs];
+  }
+  const parsedRules = cycleRules
+    .map((r) => ({
+      baseSegs: r.basePath ? parseSecretPatternSegments(r.basePath) : [],
+      repeatSegs: parseSecretPatternSegments(r.repeatPath),
+    }))
+    .filter((r) => r.repeatSegs.length > 0);
+
+  if (parsedRules.length === 0) {
+    return [actualSegs];
+  }
+
+  const variants: string[][] = [actualSegs];
+  const seen = new Set<string>([JSON.stringify(actualSegs)]);
+  const queue: string[][] = [actualSegs];
+
+  while (queue.length > 0 && variants.length < 32) {
+    const cur = queue.shift()!;
+    for (const rule of parsedRules) {
+      const bLen = rule.baseSegs.length;
+      const rLen = rule.repeatSegs.length;
+      if (cur.length < bLen + rLen) {
+        continue;
+      }
+      if (
+        matchesSecretSegments(rule.baseSegs, cur.slice(0, bLen)) &&
+        matchesSecretSegments(rule.repeatSegs, cur.slice(bLen, bLen + rLen))
+      ) {
+        const reduced = [...cur.slice(0, bLen), ...cur.slice(bLen + rLen)];
+        const key = JSON.stringify(reduced);
+        if (!seen.has(key)) {
+          seen.add(key);
+          variants.push(reduced);
+          queue.push(reduced);
+        }
+      }
+    }
+  }
+  return variants;
+}
+
+function matchesAnyDeclaredSecretPath(actualSegs: string[], ctx: SanitizeContext): boolean {
+  const rawSecretPaths = ctx.extraSecretPropertyPaths ?? [];
+  if (rawSecretPaths.length === 0 || actualSegs.length === 0) {
+    return false;
+  }
+  const variants = foldCycleVariants(actualSegs, ctx.secretCycleRules);
+  for (const sp of rawSecretPaths) {
+    const patSegs = parseSecretPatternSegments(sp);
+    if (variants.some((v) => matchesSecretSegments(patSegs, v))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function satisfiesConstraint(candidate: string, constraint: SecretStringConstraint): boolean {
+  if (constraint.minLength !== undefined && candidate.length < constraint.minLength) {
+    return false;
+  }
+  if (constraint.maxLength !== undefined && candidate.length > constraint.maxLength) {
+    return false;
+  }
+  if (constraint.pattern !== undefined) {
+    try {
+      if (!new RegExp(constraint.pattern).test(candidate)) {
+        return false;
+      }
+    } catch {
+      // Ignore non-JS regex dialects.
+    }
+  }
+  return true;
+}
+
+function adjustPlaceholderBounds(
+  seed: string,
+  padChar: string,
+  constraint: SecretStringConstraint,
+): string {
+  let out = seed;
+  if (
+    constraint.maxLength !== undefined &&
+    constraint.maxLength >= 0 &&
+    out.length > constraint.maxLength
+  ) {
+    out = out.slice(0, constraint.maxLength);
+  }
+  if (constraint.minLength !== undefined && out.length < constraint.minLength) {
+    out = out.padEnd(constraint.minLength, padChar);
+  }
+  return out;
+}
+
+function selectRedactedPlaceholder(
+  propertyName: string | undefined,
+  constraint: SecretStringConstraint | undefined,
+): string {
+  const defaultPlaceholder = /connectionstring/i.test(propertyName ?? "")
+    ? "Endpoint=https://contoso.azconfig.io;Id=0000;Secret=<redacted>"
+    : "<redacted>";
+
+  if (!constraint || satisfiesConstraint(defaultPlaceholder, constraint)) {
+    return defaultPlaceholder;
+  }
+
+  // Try constraint-safe non-secret placeholders when `<redacted>` violates @pattern/@minLength/@maxLength (#8063)!
+  const seeds: Array<[string, string]> = [
+    ["RedactedPlaceholder01", "a"],
+    ["redactedplaceholder01", "a"],
+    ["REDACTEDPLACEHOLDER01", "A"],
+    ["RedactedSecretValue", "a"],
+    ["000000000000", "0"],
+    ["https://contoso.example.com/redacted", "a"],
+    ["00000000-0000-0000-0000-000000000000", "0"],
+    ["", "a"],
+  ];
+
+  for (const [seed, padChar] of seeds) {
+    const candidate = adjustPlaceholderBounds(seed, padChar, constraint);
+    if (satisfiesConstraint(candidate, constraint)) {
+      return candidate;
+    }
+  }
+
+  return adjustPlaceholderBounds("Redacted01", "a", constraint);
+}
+
+function findMatchingSecretConstraint(
+  ctx: SanitizeContext,
+  propertyName: string | undefined,
+  dotPath: string | undefined,
+  effectiveSegments: string[],
+): SecretStringConstraint | undefined {
+  const map = ctx.secretConstraints;
+  if (!map) {
+    return undefined;
+  }
+  if (dotPath && map[dotPath.toLowerCase()]) {
+    return map[dotPath.toLowerCase()];
+  }
+  const variants = foldCycleVariants(effectiveSegments, ctx.secretCycleRules);
+  for (const [patKey, constraint] of Object.entries(map)) {
+    const patSegs = parseSecretPatternSegments(patKey);
+    if (variants.some((v) => matchesSecretSegments(patSegs, v))) {
+      return constraint;
+    }
+  }
+  if (propertyName && !dotPath && map[propertyName.toLowerCase()]) {
+    return map[propertyName.toLowerCase()];
+  }
+  return undefined;
+}
+
 export function sanitizeStringValue(
   raw: string,
   ctx: SanitizeContext,
@@ -69,9 +233,8 @@ export function sanitizeStringValue(
   dotPath?: string,
   parentObject?: Record<string, unknown>,
   pathSegments?: string[],
+  forceSecretSubtree = false,
 ): string {
-  // Check explicit secret property paths using structured path segments (handling dictionary keys with dots or empty keys!)
-  // as well as standalone scalar parameter names (#10 / #11) and secret key-name heuristics.
   const rawSecretPaths = ctx.extraSecretPropertyPaths ?? [];
   const secretPathsLower = new Set(rawSecretPaths.map((p) => p.toLowerCase()));
   const effectiveSegments =
@@ -85,24 +248,20 @@ export function sanitizeStringValue(
   const candidatePath = (dotPath || propertyName || "").toLowerCase();
 
   const matchesExplicitSecret =
+    forceSecretSubtree ||
     (!pathSegments?.length && Boolean(candidatePath) && secretPathsLower.has(candidatePath)) ||
     (propertyName && !dotPath && (!pathSegments || pathSegments.length === 0)
       ? secretPathsLower.has(propertyName.toLowerCase())
       : false) ||
-    (effectiveSegments.length > 0 &&
-      rawSecretPaths.some((sp) =>
-        matchesSecretSegments(parseSecretPatternSegments(sp), effectiveSegments),
-      ));
+    matchesAnyDeclaredSecretPath(effectiveSegments, ctx);
 
   if (
     matchesExplicitSecret ||
     (propertyName &&
       (SECRET_KEY_NAME_RE.test(propertyName) || SECRET_SUBSTRING_KEY_RE.test(propertyName)))
   ) {
-    if (/connectionstring/i.test(propertyName ?? "")) {
-      return "Endpoint=https://contoso.azconfig.io;Id=0000;Secret=<redacted>";
-    }
-    return "<redacted>";
+    const constraint = findMatchingSecretConstraint(ctx, propertyName, dotPath, effectiveSegments);
+    return selectRedactedPlaceholder(propertyName, constraint);
   }
 
   // Handle ApiKey objects where secret value is stored in a sibling "value" field next to "connectionString" + "readOnly".
@@ -175,13 +334,39 @@ export function sanitizePayload(
   dotPath = "",
   parentObject?: Record<string, unknown>,
   pathSegments: string[] = [],
+  forceSecretSubtree = false,
 ): unknown {
+  // Propagate @secret status from any matched container object/array through all its descendants (#7801)!
+  const isSecretContainer =
+    forceSecretSubtree ||
+    (pathSegments.length > 0 && matchesAnyDeclaredSecretPath(pathSegments, ctx)) ||
+    Boolean(
+      propertyName &&
+      (SECRET_KEY_NAME_RE.test(propertyName) || SECRET_SUBSTRING_KEY_RE.test(propertyName)),
+    );
+
   if (typeof value === "string") {
-    return sanitizeStringValue(value, ctx, propertyName, dotPath, parentObject, pathSegments);
+    return sanitizeStringValue(
+      value,
+      ctx,
+      propertyName,
+      dotPath,
+      parentObject,
+      pathSegments,
+      isSecretContainer,
+    );
   }
   if (Array.isArray(value)) {
     return value.map((item) =>
-      sanitizePayload(item, ctx, propertyName, `${dotPath}[]`, undefined, [...pathSegments, "[]"]),
+      sanitizePayload(
+        item,
+        ctx,
+        propertyName,
+        `${dotPath}[]`,
+        undefined,
+        [...pathSegments, "[]"],
+        isSecretContainer,
+      ),
     );
   }
   if (value && typeof value === "object") {
@@ -190,7 +375,15 @@ export function sanitizePayload(
     for (const [k, v] of Object.entries(rec)) {
       const nextPath = dotPath ? `${dotPath}.${k}` : k;
       const sanitizedKey = sanitizeStringValue(k, ctx);
-      sanitizedObj[sanitizedKey] = sanitizePayload(v, ctx, k, nextPath, rec, [...pathSegments, k]);
+      sanitizedObj[sanitizedKey] = sanitizePayload(
+        v,
+        ctx,
+        k,
+        nextPath,
+        rec,
+        [...pathSegments, k],
+        isSecretContainer,
+      );
     }
     return sanitizedObj;
   }

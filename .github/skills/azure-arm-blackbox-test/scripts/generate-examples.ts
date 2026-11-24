@@ -378,6 +378,8 @@ export async function generateLiveExamples(
       subscriptionId: ledger.subscriptionId,
       disposableRgName: ledger.disposableResourceGroup?.name,
       extraSecretPropertyPaths: contract.secretProperties,
+      secretCycleRules: contract.secretCycleRules,
+      secretConstraints: contract.secretConstraints,
     };
 
     const exampleDoc = buildXMsExampleFromTrace(contract, trace, sanitizeCtx);
@@ -392,16 +394,6 @@ export async function generateLiveExamples(
     assertContainedFilePath(scratchExamplesDir, scratchPath);
     const serialized = `${JSON.stringify(exampleDoc, null, 2)}\n`;
     fs.writeFileSync(scratchPath, serialized, "utf8");
-
-    const writtenSpecPaths: string[] = [];
-    if (options.writeToSpec) {
-      const tspExDir = path.join(ledger.typespecProjectDir, "examples", ledger.apiVersion);
-      fs.mkdirSync(tspExDir, { recursive: true });
-      const tspExPath = path.join(tspExDir, filename);
-      assertContainedFilePath(tspExDir, tspExPath);
-      fs.writeFileSync(tspExPath, serialized, "utf8");
-      writtenSpecPaths.push(tspExPath);
-    }
 
     let schemaValid = true;
     const schemaErrors: string[] = [];
@@ -418,6 +410,17 @@ export async function generateLiveExamples(
         schemaValid = false;
         schemaErrors.push(err instanceof Error ? err.message : String(err));
       }
+    }
+
+    // Only write into `<typespecProjectDir>/examples/` when schemaValid is true (or --skip-schema-check was passed: #8063)!
+    const writtenSpecPaths: string[] = [];
+    if (options.writeToSpec && schemaValid) {
+      const tspExDir = path.join(ledger.typespecProjectDir, "examples", ledger.apiVersion);
+      fs.mkdirSync(tspExDir, { recursive: true });
+      const tspExPath = path.join(tspExDir, filename);
+      assertContainedFilePath(tspExDir, tspExPath);
+      fs.writeFileSync(tspExPath, serialized, "utf8");
+      writtenSpecPaths.push(tspExPath);
     }
 
     const cov = ledger.coverage[contract.operationId];

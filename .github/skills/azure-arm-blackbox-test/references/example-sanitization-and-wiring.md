@@ -32,5 +32,5 @@ Repository rule `EX-COVERAGE` requires LRO examples to include **both** the init
 ## 3. Native TypeSpec Example Validation & Writing (`scripts/typespec-validator.ts`)
 
 - By default, `generate-examples` writes candidate examples only to `<work-dir>/examples/<api-version>/` and validates them directly in-memory against the projected TypeSpec `HttpOperation` parameter and response models (`validateExampleAgainstTypeSpec`).
-- If `schemaValid` is `false` on a generated example captured from a real 2xx live call, that failure proves that the **TypeSpec model/response contract disagrees with actual live service wire payloads** (for example, `RESPONSE_SCHEMA_NOT_IN_TYPESPEC` or `UNION_CASE_MISMATCH`).
-- When `--write-to-spec` is explicitly requested, files are written exclusively to `<typespecProjectDir>/examples/<api-version>/<ExampleName>.json` (never touching or generating Swagger files).
+- Wire-contract discrepancies (`SCHEMA-RESPONSE-DRIFT`, `UNION_CASE_MISMATCH`, etc.) are evaluated exclusively on the unsanitized live HTTP exchanges in `execute-probe.ts`. Post-sanitization example validation in `generate-examples` ensures that redaction placeholders and assembled dual LRO responses remain valid against TypeSpec constraints (`@pattern`, `@minLength`, `@maxLength`).
+- When `--write-to-spec` is explicitly requested, only schema-valid examples (`schemaValid: true`, or when `--skip-schema-check` is passed) are copied to `<typespecProjectDir>/examples/<api-version>/<ExampleName>.json` (never touching or generating Swagger files).

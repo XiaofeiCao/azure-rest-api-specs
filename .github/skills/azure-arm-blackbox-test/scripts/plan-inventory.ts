@@ -56,6 +56,8 @@ import type {
   OperationParameterSpec,
   PageableContract,
   ProviderLiveMetadata,
+  SecretCycleRule,
+  SecretStringConstraint,
 } from "./types.ts";
 
 const SECRET_PROPERTY_NAME_RE =
@@ -376,6 +378,58 @@ function hasWireJsonBody(
   return false;
 }
 
+function extractStringConstraintFromPropOrType(
+  program: Program,
+  prop: { type: Type } & Type,
+): SecretStringConstraint | undefined {
+  let minLength = getMinLength(program, prop) ?? getMinLength(program, prop.type);
+  let maxLength = getMaxLength(program, prop) ?? getMaxLength(program, prop.type);
+  let pattern = getPattern(program, prop) ?? getPattern(program, prop.type);
+  if (prop.type.kind === "Scalar") {
+    let cur = prop.type.baseScalar;
+    while (cur) {
+      minLength ??= getMinLength(program, cur);
+      maxLength ??= getMaxLength(program, cur);
+      pattern ??= getPattern(program, cur);
+      cur = cur.baseScalar;
+    }
+  }
+  if (minLength === undefined && maxLength === undefined && pattern === undefined) {
+    return undefined;
+  }
+  return {
+    ...(minLength !== undefined ? { minLength } : {}),
+    ...(maxLength !== undefined ? { maxLength } : {}),
+    ...(pattern !== undefined ? { pattern } : {}),
+  };
+}
+
+function recordCycleRuleIfRecurring(
+  ancestorPaths: Map<Type, string>,
+  type: Type,
+  currentPrefix: string,
+  cycleRules: Map<string, SecretCycleRule>,
+): boolean {
+  const priorPrefix = ancestorPaths.get(type);
+  if (priorPrefix === undefined) {
+    return false;
+  }
+  const relStep = priorPrefix
+    ? currentPrefix.startsWith(`${priorPrefix}.`)
+      ? currentPrefix.slice(priorPrefix.length + 1)
+      : currentPrefix.startsWith(`${priorPrefix}[]`)
+        ? currentPrefix.slice(priorPrefix.length)
+        : undefined
+    : currentPrefix || undefined;
+  if (relStep) {
+    cycleRules.set(`${priorPrefix}=>${relStep}`, {
+      basePath: priorPrefix,
+      repeatPath: relStep,
+    });
+  }
+  return true;
+}
+
 function collectTypeSpecBodyMetadata(
   program: Program,
   metadataInfo: MetadataInfo,
@@ -383,11 +437,13 @@ function collectTypeSpecBodyMetadata(
   type: Type | undefined,
   prefix = "",
   depth = 0,
-  ancestors = new Set<Type>(),
+  ancestorPaths = new Map<Type, string>(),
   result = {
     writable: new Set<string>(),
     readOnly: new Set<string>(),
     secrets: new Set<string>(),
+    secretConstraints: new Map<string, SecretStringConstraint>(),
+    cycleRules: new Map<string, SecretCycleRule>(),
     externalDeps: new Map<string, ExternalDependencyHint>(),
   },
   requiredInParent = false,
@@ -395,13 +451,18 @@ function collectTypeSpecBodyMetadata(
   writable: Set<string>;
   readOnly: Set<string>;
   secrets: Set<string>;
+  secretConstraints: Map<string, SecretStringConstraint>;
+  cycleRules: Map<string, SecretCycleRule>;
   externalDeps: Map<string, ExternalDependencyHint>;
 } {
-  if (!type || ancestors.has(type)) {
+  if (!type) {
     return result;
   }
-  const branchAncestors = new Set(ancestors);
-  branchAncestors.add(type);
+  if (recordCycleRuleIfRecurring(ancestorPaths, type, prefix, result.cycleRules)) {
+    return result;
+  }
+  const branchAncestors = new Map(ancestorPaths);
+  branchAncestors.set(type, prefix);
 
   if (type.kind === "Model") {
     if (isArrayModelType(program, type)) {
@@ -464,12 +525,18 @@ function collectTypeSpecBodyMetadata(
         result.writable.add(propPath);
       }
 
+      const propConstraint = extractStringConstraintFromPropOrType(program, prop);
       if (
         isSecret(program, prop) ||
         isSecret(program, prop.type) ||
         SECRET_PROPERTY_NAME_RE.test(wireName)
       ) {
         result.secrets.add(propPath);
+        if (propConstraint) {
+          result.secretConstraints.set(propPath.toLowerCase(), propConstraint);
+        }
+      } else if (propConstraint && SECRET_PROPERTY_NAME_RE.test(prop.name)) {
+        result.secretConstraints.set(propPath.toLowerCase(), propConstraint);
       }
 
       const isPropRequired = !prop.optional && !metadataInfo.isOptional(prop, reqVisibility);
@@ -533,17 +600,33 @@ function collectTypeSpecBodyMetadata(
 function collectTypeSpecResponseSecrets(
   program: Program,
   httpOp: HttpOperation,
-): { bodySecrets: string[]; headerSecrets: string[]; secretStatusCodes: string[] } {
+): {
+  bodySecrets: string[];
+  headerSecrets: string[];
+  secretStatusCodes: string[];
+  cycleRules: SecretCycleRule[];
+  secretConstraints: Record<string, SecretStringConstraint>;
+} {
   const secrets = new Set<string>();
   const headerSecrets = new Set<string>();
   const secretStatusCodes = new Set<string>();
+  const cycleRules = new Map<string, SecretCycleRule>();
+  const secretConstraints: Record<string, SecretStringConstraint> = {};
 
-  function walk(type: Type | undefined, prefix = "", depth = 0, ancestors = new Set<Type>()): void {
-    if (!type || ancestors.has(type)) {
+  function walk(
+    type: Type | undefined,
+    prefix = "",
+    depth = 0,
+    ancestorPaths = new Map<Type, string>(),
+  ): void {
+    if (!type) {
       return;
     }
-    const branchAncestors = new Set(ancestors);
-    branchAncestors.add(type);
+    if (recordCycleRuleIfRecurring(ancestorPaths, type, prefix, cycleRules)) {
+      return;
+    }
+    const branchAncestors = new Map(ancestorPaths);
+    branchAncestors.set(type, prefix);
 
     if (type.kind === "Model") {
       if (isArrayModelType(program, type)) {
@@ -571,6 +654,10 @@ function collectTypeSpecResponseSecrets(
           SECRET_PROPERTY_NAME_RE.test(wireName)
         ) {
           secrets.add(propPath);
+          const constraint = extractStringConstraintFromPropOrType(program, prop);
+          if (constraint) {
+            secretConstraints[propPath.toLowerCase()] = constraint;
+          }
         }
         walk(prop.type, propPath, depth + 1, branchAncestors);
       }
@@ -604,6 +691,10 @@ function collectTypeSpecResponseSecrets(
         ) {
           headerSecrets.add(hWireName);
           secrets.add(hWireName);
+          const constraint = extractStringConstraintFromPropOrType(program, hProp);
+          if (constraint) {
+            secretConstraints[hWireName.toLowerCase()] = constraint;
+          }
         }
       }
       if (content.body) {
@@ -623,6 +714,8 @@ function collectTypeSpecResponseSecrets(
     bodySecrets: [...secrets],
     headerSecrets: [...headerSecrets],
     secretStatusCodes: [...secretStatusCodes],
+    cycleRules: [...cycleRules.values()],
+    secretConstraints,
   };
 }
 
@@ -929,6 +1022,13 @@ export async function discoverSpecInventory(
     const respSecrets = collectTypeSpecResponseSecrets(program, httpOp);
     const secretProperties = new Set<string>(respSecrets.bodySecrets);
     const secretResponseHeaders = new Set<string>(respSecrets.headerSecrets);
+    const secretConstraints: Record<string, SecretStringConstraint> = {
+      ...respSecrets.secretConstraints,
+    };
+    const secretCycleRulesMap = new Map<string, SecretCycleRule>();
+    for (const rule of respSecrets.cycleRules) {
+      secretCycleRulesMap.set(`${rule.basePath}=>${rule.repeatPath}`, rule);
+    }
     let writableBodyProperties: string[] = [];
     let readOnlyBodyProperties: string[] = [];
     const opExternalDeps: ExternalDependencyHint[] = [];
@@ -951,6 +1051,13 @@ export async function discoverSpecInventory(
         SECRET_PROPERTY_NAME_RE.test(p.name);
       if (isSecretParam) {
         secretProperties.add(p.name);
+        if (minLength !== undefined || maxLength !== undefined || pattern !== undefined) {
+          secretConstraints[p.name.toLowerCase()] = {
+            ...(minLength !== undefined ? { minLength } : {}),
+            ...(maxLength !== undefined ? { maxLength } : {}),
+            ...(pattern !== undefined ? { pattern } : {}),
+          };
+        }
       }
 
       paramSpecs.push({
@@ -983,7 +1090,7 @@ export async function discoverSpecInventory(
         reqBody.type,
         "",
         0,
-        new Set<Type>(),
+        new Map<Type, string>(),
         undefined,
         bodyRequired,
       );
@@ -991,6 +1098,12 @@ export async function discoverSpecInventory(
       readOnlyBodyProperties = [...bodyMeta.readOnly].sort();
       for (const s of bodyMeta.secrets) {
         secretProperties.add(s);
+      }
+      for (const [cKey, cVal] of bodyMeta.secretConstraints.entries()) {
+        secretConstraints[cKey] = cVal;
+      }
+      for (const [rKey, rVal] of bodyMeta.cycleRules.entries()) {
+        secretCycleRulesMap.set(rKey, rVal);
       }
       for (const dep of bodyMeta.externalDeps.values()) {
         opExternalDeps.push(dep);
@@ -1102,6 +1215,10 @@ export async function discoverSpecInventory(
       writableBodyProperties,
       readOnlyBodyProperties,
       secretProperties: [...secretProperties].sort(),
+      ...(secretCycleRulesMap.size > 0
+        ? { secretCycleRules: [...secretCycleRulesMap.values()] }
+        : {}),
+      ...(Object.keys(secretConstraints).length > 0 ? { secretConstraints } : {}),
       ...(secretResponseHeaders.size > 0
         ? { secretResponseHeaders: [...secretResponseHeaders].sort() }
         : {}),

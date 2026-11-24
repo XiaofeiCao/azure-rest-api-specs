@@ -10,6 +10,7 @@ import {
 } from "./analyze-behavior.ts";
 import {
   getArmBearerToken,
+  parseRetryAfterMs,
   sendRawHttpExchange,
   type SafetyGuardContext,
 } from "./auth-and-http.ts";
@@ -395,23 +396,6 @@ function extractAsyncMonitorStatus(body: unknown): string | undefined {
   return extractProvisioningState(body);
 }
 
-function parseRetryAfterMs(headers: Record<string, string>, fallbackMs: number): number {
-  const raw = headers["retry-after"]?.trim();
-  if (!raw) {
-    return fallbackMs;
-  }
-  // Honor server-requested Retry-After (both delta-seconds and HTTP-date) without shortening (#4190)!
-  const seconds = Number(raw);
-  if (Number.isFinite(seconds) && seconds >= 0) {
-    return seconds === 0 ? Math.min(fallbackMs, 250) : Math.round(seconds * 1000);
-  }
-  const parsedDateMs = Date.parse(raw);
-  if (Number.isFinite(parsedDateMs)) {
-    return Math.max(0, parsedDateMs - Date.now());
-  }
-  return fallbackMs;
-}
-
 function extractTargetResourceIdentityFromUrl(
   urlStr: string,
   fallbackLocation?: string,
@@ -503,7 +487,8 @@ function detectInitialLroSignals(
   if (
     headers.location &&
     (status === 202 ||
-      (status === 201 && (contract.method === "POST" || contract.method === "DELETE")))
+      (status === 201 &&
+        (contract.isLroDeclared || contract.method === "POST" || contract.method === "DELETE")))
   ) {
     signals.push("header-location");
   }
@@ -1045,12 +1030,11 @@ export async function executeOperationProbe(
 
   const normalizedTargetPath = new URL(targetUrl).pathname.replace(/\/+$/, "").toLowerCase();
 
-  // Auto-attach saved priorPutBody on resource GET probes (exact resource path first, then resourceType fallback).
+  // Auto-attach saved priorPutBody strictly by exact resource path so GET of resource B never compares against resource A (#7963).
   const effectivePriorPutBody =
     input.priorPutBody ??
     (method === "GET" && !contract.pageable && !contract.inferredPagination
-      ? (runtimeState.putBodiesByResourceType[`path:${normalizedTargetPath}`] ??
-        runtimeState.putBodiesByResourceType[contract.resourceType])
+      ? runtimeState.putBodiesByResourceType[`path:${normalizedTargetPath}`]
       : undefined);
 
   const discrepancies = analyzeBehavioralDiscrepancies({

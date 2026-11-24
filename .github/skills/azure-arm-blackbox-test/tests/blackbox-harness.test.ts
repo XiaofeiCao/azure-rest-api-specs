@@ -242,7 +242,7 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       ),
     ).toThrow(/Blocked (?:mutating|soft-delete) POST/);
 
-    // Cross-scope RG moveResources and external body targetResourceGroup are blocked (#3904)!
+    // Cross-scope RG moveResources, external targetResourceGroup, and external privateLinkServiceId are blocked (#3904, #7656)!
     expect(() =>
       assertSafeArmTarget(
         "POST",
@@ -253,6 +253,25 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
         },
       ),
     ).toThrow(/Blocked cross-scope|outside disposable Resource Group/);
+
+    expect(() =>
+      assertSafeArmTarget(
+        "PUT",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.Network/privateEndpoints/pe1?api-version=2023-11-01`,
+        ctx,
+        {
+          properties: {
+            privateLinkServiceConnections: [
+              {
+                properties: {
+                  privateLinkServiceId: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-production/providers/Microsoft.AppConfiguration/configurationStores/prodStore`,
+                },
+              },
+            ],
+          },
+        },
+      ),
+    ).toThrow(/Blocked cross-scope/);
 
     // Mutations targeting another RG are blocked!
     expect(() =>
@@ -1360,7 +1379,8 @@ interface PrivateConns {
     expect(backupExText).not.toContain("TOP_SECRET_HEADER_MATERIAL");
     expect(backupExText).toContain("https://contoso.blob.core.windows.net/bk.zip");
 
-    // Verify nested 2D array secret paths (credentials[][].value) AND dotted/empty dictionary keys (#4080, #7984)!
+    // Verify nested 2D array secret paths, dotted/empty dictionary keys, @secret container descendants,
+    // recursive cycle folding, and @pattern-safe secret placeholders (#4080, #7732, #7801, #7984, #8063)!
     const dictSanitized = sanitizePayload(
       {
         credentials: {
@@ -1368,15 +1388,84 @@ interface PrivateConns {
           "": { value: "EMPTY_KEY_SECRET_456" },
         },
         matrix: [[{ secretTokenVal: "MATRIX_2D_SECRET_789" }]],
+        properties: {
+          configurationProtectedSettings: {
+            opaqueMaterial: "CONTAINER_CHILD_SECRET",
+            nested: { deepValue: "CONTAINER_DEEP_SECRET" },
+          },
+          alnumPassword: "SuperSecretAlnumPassword99",
+        },
+        tree: {
+          opaqueNodeSecret: "ROOT_NODE_SECRET",
+          children: [
+            {
+              opaqueNodeSecret: "CHILD_DEPTH1_SECRET",
+              children: [{ opaqueNodeSecret: "CHILD_DEPTH2_SECRET" }],
+            },
+          ],
+        },
       },
-      { extraSecretPropertyPaths: ["credentials.*.value", "matrix[][].secretTokenVal"] },
+      {
+        extraSecretPropertyPaths: [
+          "credentials.*.value",
+          "matrix[][].secretTokenVal",
+          "properties.configurationProtectedSettings",
+          "properties.alnumPassword",
+          "tree.opaqueNodeSecret",
+        ],
+        secretCycleRules: [{ basePath: "tree", repeatPath: "children[]" }],
+        secretConstraints: {
+          "properties.alnumpassword": {
+            minLength: 8,
+            maxLength: 80,
+            pattern: "^[a-zA-Z0-9]{0,80}$",
+          },
+        },
+      },
     ) as {
       credentials: Record<string, { value: string }>;
       matrix: Array<Array<{ secretTokenVal: string }>>;
+      properties: {
+        configurationProtectedSettings: { opaqueMaterial: string; nested: { deepValue: string } };
+        alnumPassword: string;
+      };
+      tree: {
+        opaqueNodeSecret: string;
+        children: Array<{
+          opaqueNodeSecret: string;
+          children?: Array<{ opaqueNodeSecret: string }>;
+        }>;
+      };
     };
     expect(dictSanitized.credentials["dotted.key.name"].value).toBe("<redacted>");
     expect(dictSanitized.credentials[""].value).toBe("<redacted>");
     expect(dictSanitized.matrix[0][0].secretTokenVal).toBe("<redacted>");
+    expect(dictSanitized.properties.configurationProtectedSettings.opaqueMaterial).toBe(
+      "<redacted>",
+    );
+    expect(dictSanitized.properties.configurationProtectedSettings.nested.deepValue).toBe(
+      "<redacted>",
+    );
+    expect(dictSanitized.properties.alnumPassword).toMatch(/^[a-zA-Z0-9]{8,80}$/);
+    expect(dictSanitized.properties.alnumPassword).not.toContain("SuperSecret");
+    expect(dictSanitized.tree.opaqueNodeSecret).toBe("<redacted>");
+    expect(dictSanitized.tree.children[0].opaqueNodeSecret).toBe("<redacted>");
+    expect(dictSanitized.tree.children[0].children![0].opaqueNodeSecret).toBe("<redacted>");
+
+    // Ambiguous multi-project root directory is rejected (#8112)!
+    const multiRoot = path.join(tempRoot, "multi-spec-root", "resource-manager");
+    fs.mkdirSync(path.join(multiRoot, "SubA"), { recursive: true });
+    fs.mkdirSync(path.join(multiRoot, "SubB"), { recursive: true });
+    fs.writeFileSync(path.join(multiRoot, "SubA", "tspconfig.yaml"), "{}\n", "utf8");
+    fs.writeFileSync(path.join(multiRoot, "SubA", "main.tsp"), "\n", "utf8");
+    fs.writeFileSync(path.join(multiRoot, "SubB", "tspconfig.yaml"), "{}\n", "utf8");
+    fs.writeFileSync(path.join(multiRoot, "SubB", "main.tsp"), "\n", "utf8");
+    await expect(
+      discoverSpecInventory({
+        specPath: multiRoot,
+        workDir: path.join(tempRoot, "work-ambig"),
+      }),
+    ).rejects.toThrow(/Ambiguous TypeSpec root/);
 
     // Re-running discover or switching RG while active disposable RG exists is blocked (#4360, #4409)!
     await expect(
