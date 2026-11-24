@@ -1,8 +1,9 @@
-import { getUnionAsEnum } from "@azure-tools/typespec-azure-core";
+import { getLroMetadata, getUnionAsEnum } from "@azure-tools/typespec-azure-core";
 import {
   getDiscriminatedUnion,
   getDiscriminatedUnionFromInheritance,
   getDiscriminator,
+  getEncode,
   getMaxItems,
   getMaxLength,
   getMaxValue,
@@ -15,12 +16,14 @@ import {
   isArrayModelType,
   isNullType,
   isRecordModelType,
+  isSecret,
   isUnknownType,
   isVoidType,
   resolveEncodedName,
   walkPropertiesInherited,
   type Enum,
   type Model,
+  type ModelProperty,
   type Program,
   type Scalar,
   type Tuple,
@@ -59,7 +62,7 @@ function getRootScalarName(scalar: Scalar): string {
 function findScalarConstraint<T>(
   program: Program,
   scalar: Scalar,
-  getter: (p: Program, t: Type) => T | undefined,
+  getter: (p: Program, t: Scalar) => T | undefined,
 ): T | undefined {
   let current: Scalar | undefined = scalar;
   while (current) {
@@ -104,12 +107,131 @@ const INTEGER_SCALARS = new Set([
   "uint64",
 ]);
 
+function hasScalarAncestorInSet(scalar: Scalar, names: Set<string>): boolean {
+  let current: Scalar | undefined = scalar;
+  while (current) {
+    if (names.has(current.name)) {
+      return true;
+    }
+    current = current.baseScalar;
+  }
+  return false;
+}
+
+function validatePropertyLevelConstraints(
+  propVal: unknown,
+  prop: ModelProperty,
+  wireName: string,
+  jsonPath: string,
+  ctx: ValidationContext,
+): void {
+  if (typeof propVal === "string") {
+    const pMinLen = getMinLength(ctx.program, prop);
+    if (pMinLen !== undefined && propVal.length < pMinLen) {
+      ctx.issues.push({
+        code: "MIN_LENGTH_VIOLATION",
+        message: `Property "${wireName}" length ${propVal.length} is less than @minLength(${pMinLen}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+    const pMaxLen = getMaxLength(ctx.program, prop);
+    if (pMaxLen !== undefined && propVal.length > pMaxLen) {
+      ctx.issues.push({
+        code: "MAX_LENGTH_VIOLATION",
+        message: `Property "${wireName}" length ${propVal.length} exceeds @maxLength(${pMaxLen}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+    const pPattern = getPattern(ctx.program, prop);
+    if (pPattern !== undefined) {
+      try {
+        if (!new RegExp(pPattern).test(propVal)) {
+          ctx.issues.push({
+            code: "PATTERN_VIOLATION",
+            message: `Property "${wireName}" value ${JSON.stringify(propVal)} does not match @pattern(${JSON.stringify(pPattern)}) at ${jsonPath}.`,
+            path: jsonPath,
+            severity: "error",
+          });
+        }
+      } catch {
+        // Ignore non-JS regex dialects in upstream specs.
+      }
+    }
+  } else if (typeof propVal === "number" && Number.isFinite(propVal)) {
+    const pMinVal = getMinValue(ctx.program, prop);
+    if (pMinVal !== undefined && propVal < pMinVal) {
+      ctx.issues.push({
+        code: "MIN_VALUE_VIOLATION",
+        message: `Property "${wireName}" value ${propVal} is less than @minValue(${pMinVal}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+    const pMaxVal = getMaxValue(ctx.program, prop);
+    if (pMaxVal !== undefined && propVal > pMaxVal) {
+      ctx.issues.push({
+        code: "MAX_VALUE_VIOLATION",
+        message: `Property "${wireName}" value ${propVal} exceeds @maxValue(${pMaxVal}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+    const pMinEx = getMinValueExclusive(ctx.program, prop);
+    if (pMinEx !== undefined && propVal <= pMinEx) {
+      ctx.issues.push({
+        code: "MIN_VALUE_EXCLUSIVE_VIOLATION",
+        message: `Property "${wireName}" value ${propVal} must be > @minValueExclusive(${pMinEx}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+    const pMaxEx = getMaxValueExclusive(ctx.program, prop);
+    if (pMaxEx !== undefined && propVal >= pMaxEx) {
+      ctx.issues.push({
+        code: "MAX_VALUE_EXCLUSIVE_VIOLATION",
+        message: `Property "${wireName}" value ${propVal} must be < @maxValueExclusive(${pMaxEx}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+  } else if (Array.isArray(propVal)) {
+    const pMinItems = getMinItems(ctx.program, prop);
+    if (pMinItems !== undefined && propVal.length < pMinItems) {
+      ctx.issues.push({
+        code: "MIN_ITEMS_VIOLATION",
+        message: `Property "${wireName}" length ${propVal.length} is less than @minItems(${pMinItems}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+    const pMaxItems = getMaxItems(ctx.program, prop);
+    if (pMaxItems !== undefined && propVal.length > pMaxItems) {
+      ctx.issues.push({
+        code: "MAX_ITEMS_VIOLATION",
+        message: `Property "${wireName}" length ${propVal.length} exceeds @maxItems(${pMaxItems}) at ${jsonPath}.`,
+        path: jsonPath,
+        severity: "error",
+      });
+    }
+  }
+}
+
 function validateScalarValue(
   value: unknown,
   scalar: Scalar,
   jsonPath: string,
   ctx: ValidationContext,
 ): void {
+  // Honor scalar-level @encode(encoding, wireType) overrides (#8261).
+  const scalarEncode =
+    getEncode(ctx.program, scalar) ?? findScalarConstraint(ctx.program, scalar, getEncode);
+  if (scalarEncode && scalarEncode.type !== scalar) {
+    validateScalarValue(value, scalarEncode.type, jsonPath, ctx);
+    return;
+  }
+
   const rootName = getRootScalarName(scalar);
 
   if (
@@ -161,7 +283,7 @@ function validateScalarValue(
             code: "PATTERN_VIOLATION",
             message: `Value "${value.slice(0, 60)}" does not match @pattern("${pattern}") at ${jsonPath}.`,
             path: jsonPath,
-            severity: "warning",
+            severity: "error",
           });
         }
       } catch {
@@ -171,7 +293,7 @@ function validateScalarValue(
     return;
   }
 
-  if (NUMERIC_SCALARS.has(rootName) || NUMERIC_SCALARS.has(scalar.name)) {
+  if (hasScalarAncestorInSet(scalar, NUMERIC_SCALARS)) {
     if (typeof value !== "number" || !Number.isFinite(value)) {
       ctx.issues.push({
         code: "INVALID_SCALAR_TYPE",
@@ -181,10 +303,8 @@ function validateScalarValue(
       });
       return;
     }
-    if (
-      (INTEGER_SCALARS.has(rootName) || INTEGER_SCALARS.has(scalar.name)) &&
-      !Number.isInteger(value)
-    ) {
+    // Walk full scalar ancestry so custom scalars like `scalar HourInDay extends int32` enforce integer bounds (#8279)!
+    if (hasScalarAncestorInSet(scalar, INTEGER_SCALARS) && !Number.isInteger(value)) {
       ctx.issues.push({
         code: "INVALID_INTEGER",
         message: `Expected integer (TypeSpec scalar "${scalar.name}") at ${jsonPath}, got ${value}.`,
@@ -501,100 +621,11 @@ function validateModelValue(
       continue;
     }
 
-    // Check property-level string/numeric/array constraints before recursing into prop.type (#28 / #29).
-    if (typeof propVal === "string") {
-      const pMinLen = getMinLength(ctx.program, prop);
-      if (pMinLen !== undefined && propVal.length < pMinLen) {
-        ctx.issues.push({
-          code: "MIN_LENGTH_VIOLATION",
-          message: `Property "${wireName}" length ${propVal.length} is less than @minLength(${pMinLen}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-      const pMaxLen = getMaxLength(ctx.program, prop);
-      if (pMaxLen !== undefined && propVal.length > pMaxLen) {
-        ctx.issues.push({
-          code: "MAX_LENGTH_VIOLATION",
-          message: `Property "${wireName}" length ${propVal.length} exceeds @maxLength(${pMaxLen}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-      const pPattern = getPattern(ctx.program, prop);
-      if (pPattern !== undefined) {
-        try {
-          if (!new RegExp(pPattern).test(propVal)) {
-            ctx.issues.push({
-              code: "PATTERN_VIOLATION",
-              message: `Property "${wireName}" value ${JSON.stringify(propVal)} does not match @pattern(${JSON.stringify(pPattern)}) at ${jsonPath}.${wireName}.`,
-              path: `${jsonPath}.${wireName}`,
-              severity: "error",
-            });
-          }
-        } catch {
-          // Ignore invalid regex patterns in upstream specs.
-        }
-      }
-    } else if (typeof propVal === "number" && Number.isFinite(propVal)) {
-      const pMinVal = getMinValue(ctx.program, prop);
-      if (pMinVal !== undefined && propVal < pMinVal) {
-        ctx.issues.push({
-          code: "MIN_VALUE_VIOLATION",
-          message: `Property "${wireName}" value ${propVal} is less than @minValue(${pMinVal}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-      const pMaxVal = getMaxValue(ctx.program, prop);
-      if (pMaxVal !== undefined && propVal > pMaxVal) {
-        ctx.issues.push({
-          code: "MAX_VALUE_VIOLATION",
-          message: `Property "${wireName}" value ${propVal} exceeds @maxValue(${pMaxVal}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-      const pMinEx = getMinValueExclusive(ctx.program, prop);
-      if (pMinEx !== undefined && propVal <= pMinEx) {
-        ctx.issues.push({
-          code: "MIN_VALUE_EXCLUSIVE_VIOLATION",
-          message: `Property "${wireName}" value ${propVal} must be > @minValueExclusive(${pMinEx}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-      const pMaxEx = getMaxValueExclusive(ctx.program, prop);
-      if (pMaxEx !== undefined && propVal >= pMaxEx) {
-        ctx.issues.push({
-          code: "MAX_VALUE_EXCLUSIVE_VIOLATION",
-          message: `Property "${wireName}" value ${propVal} must be < @maxValueExclusive(${pMaxEx}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-    } else if (Array.isArray(propVal)) {
-      const pMinItems = getMinItems(ctx.program, prop);
-      if (pMinItems !== undefined && propVal.length < pMinItems) {
-        ctx.issues.push({
-          code: "MIN_ITEMS_VIOLATION",
-          message: `Property "${wireName}" length ${propVal.length} is less than @minItems(${pMinItems}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-      const pMaxItems = getMaxItems(ctx.program, prop);
-      if (pMaxItems !== undefined && propVal.length > pMaxItems) {
-        ctx.issues.push({
-          code: "MAX_ITEMS_VIOLATION",
-          message: `Property "${wireName}" length ${propVal.length} exceeds @maxItems(${pMaxItems}) at ${jsonPath}.${wireName}.`,
-          path: `${jsonPath}.${wireName}`,
-          severity: "error",
-        });
-      }
-    }
-
-    validateValueAgainstType(propVal, prop.type, `${jsonPath}.${wireName}`, ctx);
+    // Honor property-level @encode(encoding, wireType) overrides (#8261) and validate property-level constraints (#28/#29).
+    validatePropertyLevelConstraints(propVal, prop, wireName, `${jsonPath}.${wireName}`, ctx);
+    const propEncode = getEncode(ctx.program, prop);
+    const effectivePropType = propEncode ? propEncode.type : prop.type;
+    validateValueAgainstType(propVal, effectivePropType, `${jsonPath}.${wireName}`, ctx);
   }
 
   if (effectiveModel.indexer) {
@@ -726,6 +757,170 @@ function hasWireJsonPayload(
   return false;
 }
 
+function extractPathParamsForValidation(
+  pathTemplate: string,
+  actualUrl: string,
+): Record<string, string> {
+  const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
+  const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  const templateSegs = cleanTemplate.split("/");
+  const actualSegs = actualPathname.split("/");
+  const extracted: Record<string, string> = {};
+
+  if (templateSegs.length === actualSegs.length) {
+    for (let i = 0; i < templateSegs.length; i++) {
+      const m = /^\{([^}]+)\}$/.exec(templateSegs[i]);
+      if (m) {
+        extracted[m[1]] = decodeURIComponent(actualSegs[i]);
+      }
+    }
+    return extracted;
+  }
+
+  const paramNames: string[] = [];
+  const regexStr = templateSegs
+    .map((seg) => {
+      const m = /^\{([^}]+)\}$/.exec(seg);
+      if (m) {
+        paramNames.push(m[1]);
+        return "(.+?)";
+      }
+      return seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    })
+    .join("\\/");
+  const match = new RegExp(`^${regexStr}$`, "i").exec(actualPathname);
+  if (match) {
+    paramNames.forEach((name, idx) => {
+      extracted[name] = decodeURIComponent(match[idx + 1]);
+    });
+  }
+  return extracted;
+}
+
+function coerceHttpWireScalarString(rawVal: unknown, effectiveType: Type): unknown {
+  if (typeof rawVal !== "string") {
+    return rawVal;
+  }
+  if (effectiveType.kind === "Scalar") {
+    if (hasScalarAncestorInSet(effectiveType, NUMERIC_SCALARS)) {
+      if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(rawVal.trim())) {
+        return Number(rawVal);
+      }
+      return rawVal;
+    }
+    if (getRootScalarName(effectiveType) === "boolean") {
+      if (rawVal === "true") return true;
+      if (rawVal === "false") return false;
+      return rawVal;
+    }
+  } else if (effectiveType.kind === "Number") {
+    if (/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(rawVal.trim())) {
+      return Number(rawVal);
+    }
+  } else if (effectiveType.kind === "Boolean") {
+    if (rawVal === "true") return true;
+    if (rawVal === "false") return false;
+  } else if (effectiveType.kind === "Enum") {
+    const members = [...effectiveType.members.values()];
+    if (
+      members.some((m) => typeof m.value === "number") &&
+      /^[+-]?\d+(\.\d+)?$/.test(rawVal.trim())
+    ) {
+      return Number(rawVal);
+    }
+  } else if (effectiveType.kind === "Union") {
+    for (const v of effectiveType.variants.values()) {
+      const coerced = coerceHttpWireScalarString(rawVal, v.type);
+      if (coerced !== rawVal) {
+        return coerced;
+      }
+    }
+  }
+  return rawVal;
+}
+
+function validateSuppliedHttpParameter(
+  rawVal: unknown,
+  paramProp: ModelProperty,
+  wireName: string,
+  jsonPath: string,
+  ctx: ValidationContext,
+  coerceFromWireString: boolean,
+): void {
+  // Redacted secret values in traces/examples (<redacted>) intentionally replace raw secret material.
+  if (
+    rawVal === "<redacted>" &&
+    (isSecret(ctx.program, paramProp) ||
+      isSecret(ctx.program, paramProp.type) ||
+      /(password|secret|key|token|credential)/i.test(wireName))
+  ) {
+    return;
+  }
+  const propEncode = getEncode(ctx.program, paramProp);
+  const effectiveType = propEncode ? propEncode.type : paramProp.type;
+  const coerced = coerceFromWireString ? coerceHttpWireScalarString(rawVal, effectiveType) : rawVal;
+
+  validatePropertyLevelConstraints(coerced, paramProp, wireName, jsonPath, ctx);
+  validateValueAgainstType(coerced, effectiveType, jsonPath, ctx);
+}
+
+export function validateStatusMonitorResultAgainstTypeSpec(
+  service: LoadedTypeSpecService,
+  operationId: string,
+  monitorBody: unknown,
+): TypeSpecSchemaIssue[] {
+  const httpOp = service.operationsById.get(operationId);
+  if (!httpOp) {
+    return [];
+  }
+
+  const metadataInfo = createMetadataInfo(service.program);
+  const respCtx: ValidationContext = {
+    program: service.program,
+    metadataInfo,
+    visibility: Visibility.Read,
+    isPatchImplicitOptional: false,
+    strictEnumCase: false,
+    issues: [],
+    activePairs: new Set(),
+  };
+
+  const lroMeta = getLroMetadata(service.program, httpOp.operation);
+  const okResp = matchHttpResponseForStatus(httpOp.responses, 200);
+  const declaredOkBodyType = okResp?.responses.find((c) => c.body !== undefined)?.body?.type;
+  const targetResultType = lroMeta?.logicalResult ?? declaredOkBodyType;
+
+  if (!targetResultType || isVoidType(targetResultType)) {
+    return [];
+  }
+
+  const monitorObj =
+    monitorBody && typeof monitorBody === "object" && !Array.isArray(monitorBody)
+      ? (monitorBody as Record<string, unknown>)
+      : undefined;
+  const logicalPath = lroMeta?.logicalPath;
+  const unwrapped = monitorObj
+    ? logicalPath && logicalPath in monitorObj
+      ? monitorObj[logicalPath]
+      : monitorObj.result !== undefined
+        ? monitorObj.result
+        : monitorObj.properties
+    : undefined;
+
+  if (unwrapped === undefined) {
+    respCtx.issues.push({
+      code: "MISSING_LRO_MONITOR_RESULT",
+      message: `LRO status monitor for "${operationId}" completed without delivering required result payload.`,
+      path: "$.monitor.result",
+      severity: "error",
+    });
+    return respCtx.issues;
+  }
+
+  validateValueAgainstType(unwrapped, targetResultType, "$.monitor.result", respCtx);
+  return respCtx.issues;
+}
+
 function matchHttpResponseForStatus(
   responses: HttpOperationResponse[],
   statusCode: number,
@@ -790,30 +985,57 @@ export function validateWireExchangeAgainstTypeSpec(
     activePairs: new Set(),
   };
 
-  // Validate query & header parameters on initial step only.
+  // Validate path, query & header parameters on initial step (#8300).
   if (exchange.step === "initial") {
     const parsedUrl = new URL(exchange.request.url);
+    const extractedPathParams = extractPathParamsForValidation(httpOp.path, exchange.request.url);
     for (const p of httpOp.parameters.parameters) {
-      if (p.type === "query") {
+      if (p.type === "path") {
+        const pathVal =
+          extractedPathParams[p.name] ??
+          Object.entries(extractedPathParams).find(
+            ([k]) => k.toLowerCase() === p.name.toLowerCase(),
+          )?.[1];
+        if (pathVal === undefined || pathVal === "") {
+          if (!p.param.optional) {
+            reqCtx.issues.push({
+              code: "MISSING_REQUIRED_PATH_PARAM",
+              message: `Missing required path parameter "${p.name}".`,
+              path: `$.path.${p.name}`,
+              severity: "error",
+            });
+          }
+        } else {
+          validateSuppliedHttpParameter(pathVal, p.param, p.name, `$.path.${p.name}`, reqCtx, true);
+        }
+      } else if (p.type === "query") {
         const val = parsedUrl.searchParams.get(p.name);
-        if (val === null && !p.param.optional) {
-          reqCtx.issues.push({
-            code: "MISSING_REQUIRED_QUERY_PARAM",
-            message: `Missing required query parameter "${p.name}".`,
-            path: `$.query.${p.name}`,
-            severity: "error",
-          });
+        if (val === null) {
+          if (!p.param.optional) {
+            reqCtx.issues.push({
+              code: "MISSING_REQUIRED_QUERY_PARAM",
+              message: `Missing required query parameter "${p.name}".`,
+              path: `$.query.${p.name}`,
+              severity: "error",
+            });
+          }
+        } else {
+          validateSuppliedHttpParameter(val, p.param, p.name, `$.query.${p.name}`, reqCtx, true);
         }
       } else if (p.type === "header" && p.name.toLowerCase() !== "content-type") {
         const val =
           exchange.request.headers[p.name] ?? exchange.request.headers[p.name.toLowerCase()];
-        if (val === undefined && !p.param.optional) {
-          reqCtx.issues.push({
-            code: "MISSING_REQUIRED_HEADER_PARAM",
-            message: `Missing required request header "${p.name}".`,
-            path: `$.headers.${p.name}`,
-            severity: "error",
-          });
+        if (val === undefined) {
+          if (!p.param.optional) {
+            reqCtx.issues.push({
+              code: "MISSING_REQUIRED_HEADER_PARAM",
+              message: `Missing required request header "${p.name}".`,
+              path: `$.headers.${p.name}`,
+              severity: "error",
+            });
+          }
+        } else {
+          validateSuppliedHttpParameter(val, p.param, p.name, `$.headers.${p.name}`, reqCtx, true);
         }
       }
     }
@@ -862,7 +1084,17 @@ export function validateWireExchangeAgainstTypeSpec(
   }
 
   const matchedResp = matchHttpResponseForStatus(targetRespOp.responses, exchange.response.status);
-  if (matchedResp) {
+  if (!matchedResp || (matchedResp.statusCodes === "*" && exchange.response.status < 400)) {
+    // Report undeclared response statuses on non-error responses or follow-up LRO/page exchanges (#8322).
+    if (exchange.response.status < 400 || exchange.step !== "initial") {
+      respCtx.issues.push({
+        code: "UNDECLARED_RESPONSE_STATUS",
+        message: `HTTP ${exchange.response.status} on "${operationId}" (${exchange.step}) is not declared in TypeSpec response contract.`,
+        path: "$.response.status",
+        severity: "error",
+      });
+    }
+  } else {
     const respBody = matchedResp.responses.find((c) => c.body !== undefined)?.body;
     const allowsEmptyBody =
       matchedResp.responses.length === 0 ||
@@ -944,19 +1176,40 @@ export function validateExampleAgainstTypeSpec(
 
   const params = exampleDoc.parameters ?? {};
 
+  const paramValidationCtx: ValidationContext = {
+    program: service.program,
+    metadataInfo,
+    visibility: reqVisibility,
+    isPatchImplicitOptional,
+    strictEnumCase: true,
+    issues,
+    activePairs: new Set(),
+  };
+
   for (const p of httpOp.parameters.parameters) {
     if (p.type === "header" && p.name.toLowerCase() === "content-type") {
       continue;
     }
     const wireParamName = p.name;
     const val = params[wireParamName] ?? params[p.param.name];
-    if (val === undefined && !p.param.optional) {
-      issues.push({
-        code: "MISSING_EXAMPLE_PARAMETER",
-        message: `Example omits required ${p.type} parameter "${wireParamName}".`,
-        path: `$.parameters.${wireParamName}`,
-        severity: "error",
-      });
+    if (val === undefined) {
+      if (!p.param.optional) {
+        issues.push({
+          code: "MISSING_EXAMPLE_PARAMETER",
+          message: `Example omits required ${p.type} parameter "${wireParamName}".`,
+          path: `$.parameters.${wireParamName}`,
+          severity: "error",
+        });
+      }
+    } else {
+      validateSuppliedHttpParameter(
+        val,
+        p.param,
+        wireParamName,
+        `$.parameters.${wireParamName}`,
+        paramValidationCtx,
+        true,
+      );
     }
   }
 

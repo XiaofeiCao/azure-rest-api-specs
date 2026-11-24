@@ -5,6 +5,7 @@ import {
   extractProvisioningState,
   isNonTerminalProvisioningState,
   runTypeSpecLiveValidation,
+  runTypeSpecMonitorResultValidation,
 } from "./analyze-behavior.ts";
 import {
   getArmBearerToken,
@@ -18,6 +19,7 @@ import type {
   ObservedLroBehavior,
   OperationContract,
   OperationParameterSpec,
+  OwnedTargetResource,
   ProbeRequestInput,
   ProbeTrace,
   WireHttpExchange,
@@ -40,36 +42,143 @@ function ensureRuntimeState(ledger: CoverageLedger): LedgerRuntimeState {
   return ledger.runtimeState;
 }
 
+function applyBoundsPreservingSuffix(
+  prefix: string,
+  suffix: string,
+  separator: string,
+  minLen: number | undefined,
+  maxLen: number | undefined,
+  padChar = "a",
+): string {
+  const effectiveMax = maxLen !== undefined && maxLen > 0 ? maxLen : undefined;
+  let candidate: string;
+  if (effectiveMax !== undefined) {
+    if (effectiveMax <= suffix.length) {
+      candidate = suffix.slice(-effectiveMax);
+    } else {
+      const budgetForPrefix = effectiveMax - suffix.length - separator.length;
+      if (budgetForPrefix <= 0) {
+        candidate = `${prefix.slice(0, effectiveMax - suffix.length)}${suffix}`;
+      } else {
+        const trimmedPrefix = prefix.slice(0, budgetForPrefix);
+        candidate = `${trimmedPrefix}${separator}${suffix}`;
+      }
+    }
+  } else {
+    candidate = `${prefix}${separator}${suffix}`;
+  }
+
+  if (minLen !== undefined && candidate.length < minLen) {
+    const padCount = minLen - candidate.length;
+    // Pad between prefix and suffix so the unique run suffix stays intact at the end (#8038)!
+    const idx = candidate.length - suffix.length;
+    candidate = `${candidate.slice(0, idx)}${padChar.repeat(padCount)}${suffix}`;
+  }
+  return candidate;
+}
+
 function synthesizeSlotName(
   slotName: string,
   paramSpec: OperationParameterSpec | undefined,
   serviceHint: string,
+  runId: string,
 ): string {
-  const suffix = crypto
+  // Seed with persisted per-run identifier so separate/concurrent runs never collide on global names (#8038)!
+  const hexSuffix = crypto
     .createHash("sha1")
-    .update(`${serviceHint}:${slotName}`)
+    .update(`${runId}:${serviceHint}:${slotName}`)
     .digest("hex")
     .slice(0, 6);
+  const alphaSuffix = [...hexSuffix]
+    .map((ch) => (ch >= "0" && ch <= "9" ? String.fromCharCode(97 + Number(ch)) : ch))
+    .join("");
   const cleanSlot = slotName
     .replace(/Name$/i, "")
     .replace(/[^a-zA-Z0-9]/g, "")
     .toLowerCase()
     .slice(0, 8);
+  const basePrefix = `bbx${cleanSlot || "res"}`;
 
-  const disallowHyphen = Boolean(paramSpec?.pattern && !paramSpec.pattern.includes("-"));
-  let candidate = disallowHyphen
-    ? `bbx${cleanSlot || "res"}${suffix}`
-    : `bbx-${cleanSlot || "res"}-${suffix}`;
+  const candidateTemplates = [
+    applyBoundsPreservingSuffix(
+      `bbx-${cleanSlot || "res"}`,
+      hexSuffix,
+      "-",
+      paramSpec?.minLength,
+      paramSpec?.maxLength,
+      "a",
+    ),
+    applyBoundsPreservingSuffix(
+      basePrefix,
+      hexSuffix,
+      "",
+      paramSpec?.minLength,
+      paramSpec?.maxLength,
+      "a",
+    ),
+    applyBoundsPreservingSuffix(
+      basePrefix,
+      alphaSuffix,
+      "",
+      paramSpec?.minLength,
+      paramSpec?.maxLength,
+      "a",
+    ),
+    applyBoundsPreservingSuffix(
+      `bbx_${cleanSlot || "res"}`,
+      hexSuffix,
+      "_",
+      paramSpec?.minLength,
+      paramSpec?.maxLength,
+      "a",
+    ),
+    applyBoundsPreservingSuffix(
+      `Bbx${(cleanSlot || "res").charAt(0).toUpperCase()}${(cleanSlot || "res").slice(1)}`,
+      hexSuffix,
+      "",
+      paramSpec?.minLength,
+      paramSpec?.maxLength,
+      "a",
+    ),
+  ];
 
-  const maxLen = paramSpec?.maxLength;
-  if (maxLen !== undefined && maxLen > 0 && candidate.length > maxLen) {
-    candidate = candidate.slice(0, maxLen).replace(/-+$/, "0");
+  if (!paramSpec?.pattern) {
+    return candidateTemplates[0];
   }
-  const minLen = paramSpec?.minLength;
-  if (minLen !== undefined && candidate.length < minLen) {
-    candidate = candidate.padEnd(minLen, "a");
+
+  let patternRegex: RegExp | undefined;
+  try {
+    patternRegex = new RegExp(paramSpec.pattern);
+  } catch {
+    return candidateTemplates[0];
   }
-  return candidate;
+
+  // Validate actual candidates against the parameter's @pattern (#8069)!
+  for (const cand of candidateTemplates) {
+    if (patternRegex.test(cand)) {
+      return cand;
+    }
+  }
+
+  throw new Error(
+    `Cannot deterministically synthesize path parameter "{${slotName}}" matching @pattern(${JSON.stringify(paramSpec.pattern)}); supply pathParams.${slotName} explicitly.`,
+  );
+}
+
+function doesUrlMatchPathTemplate(pathTemplate: string, actualUrl: string): boolean {
+  const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
+  const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  const templateSegs = cleanTemplate.split("/").filter(Boolean);
+  const regexStr = templateSegs
+    .map((seg) => {
+      const m = /^\{([^}]+)\}$/.exec(seg);
+      if (m) {
+        return m[1].toLowerCase() === "scope" ? "(.+)" : "([^/]+)";
+      }
+      return seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    })
+    .join("\\/");
+  return new RegExp(`^${regexStr}$`, "i").test(actualPathname);
 }
 
 function extractPathSlotsFromUrl(pathTemplate: string, actualUrl: string): Record<string, string> {
@@ -192,7 +301,12 @@ function interpolatePathTemplate(
       }
       rawValue = input.expectError
         ? `missing-${slotName.toLowerCase().slice(0, 12)}`
-        : synthesizeSlotName(slotName, paramSpec, ledger.serviceName);
+        : synthesizeSlotName(
+            slotName,
+            paramSpec,
+            ledger.serviceName,
+            ledger.runId ?? ledger.disposableResourceGroup?.name ?? "default-run",
+          );
     }
 
     const preserveSlashes = Boolean(paramSpec?.allowReserved) || lowerSlot === "scope";
@@ -285,25 +399,70 @@ function parseRetryAfterMs(
   return fallbackMs;
 }
 
-function extractResourceNameFromPath(urlStr: string): string | undefined {
+function extractTargetResourceIdentityFromUrl(
+  urlStr: string,
+  fallbackLocation?: string,
+  responseBody?: unknown,
+): OwnedTargetResource | undefined {
   try {
     const pathname = decodeURIComponent(new URL(urlStr).pathname).replace(/\/+$/, "");
-    const providerIdx = pathname.toLowerCase().lastIndexOf("/providers/");
-    if (providerIdx === -1) {
+    const rgMatch =
+      /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/([^/]+)\/([^/]+)\/([^/]+)$/i.exec(
+        pathname,
+      );
+    if (!rgMatch) {
       return undefined;
     }
-    const after = pathname
-      .slice(providerIdx + "/providers/".length)
-      .split("/")
-      .filter(Boolean);
-    // [namespace, type, name, ...]
-    if (after.length >= 3) {
-      return after[2];
-    }
-    return undefined;
+    const [, rgName, providerNamespace, collectionSegment, resourceName] = rgMatch;
+    const bodyLocation =
+      responseBody &&
+      typeof responseBody === "object" &&
+      typeof (responseBody as Record<string, unknown>).location === "string"
+        ? String((responseBody as Record<string, unknown>).location)
+        : fallbackLocation;
+    return {
+      providerNamespace,
+      collectionSegment,
+      name: resourceName,
+      location: bodyLocation,
+      resourceGroupName: rgName,
+      resourceId: pathname,
+    };
   } catch {
     return undefined;
   }
+}
+
+function getOwnedTargetResourcesFromLedger(ledger: CoverageLedger): OwnedTargetResource[] {
+  const owned: OwnedTargetResource[] = [];
+  for (const f of ledger.provisionedFixtures) {
+    if (f.kind !== "target-rp-resource") {
+      continue;
+    }
+    const meta = f.metadata ?? {};
+    if (typeof meta.providerNamespace === "string" && typeof meta.collectionSegment === "string") {
+      owned.push({
+        providerNamespace: meta.providerNamespace,
+        collectionSegment: meta.collectionSegment,
+        name: f.name,
+        location: typeof meta.location === "string" ? meta.location : ledger.location,
+        resourceGroupName:
+          typeof meta.resourceGroupName === "string"
+            ? meta.resourceGroupName
+            : ledger.disposableResourceGroup?.name,
+        resourceId: f.resourceId,
+      });
+    } else {
+      const parsed = extractTargetResourceIdentityFromUrl(
+        `https://management.azure.com${f.resourceId.startsWith("/") ? "" : "/"}${f.resourceId}`,
+        ledger.location,
+      );
+      if (parsed) {
+        owned.push(parsed);
+      }
+    }
+  }
+  return owned;
 }
 
 function detectInitialLroSignals(
@@ -395,17 +554,27 @@ export async function executeOperationProbe(
     subscriptionId: ledger.subscriptionId,
   });
 
+  if (!ledger.runId) {
+    ledger.runId = crypto.randomBytes(4).toString("hex");
+  }
   const runtimeState = ensureRuntimeState(ledger);
-  const ownedResourceNames = ledger.provisionedFixtures.map((f) => f.name);
+  const ownedTargetResources = getOwnedTargetResourcesFromLedger(ledger);
   const safetyContext: SafetyGuardContext = {
     trustedArmBaseUrl: ledger.armBaseUrl,
     subscriptionId: ledger.subscriptionId,
     disposableRgName: ledger.disposableResourceGroup?.name,
-    ownedResourceNames,
+    ownedTargetResources,
     allowDisposableRgLifecycle: false,
   };
 
+  const expectError = Boolean(input.expectError);
   const method = input.method ?? contract.method;
+  if (!expectError && method.toUpperCase() !== contract.method.toUpperCase()) {
+    throw new Error(
+      `Positive probe for "${contract.operationId}" must use declared HTTP method "${contract.method}" (got "${method}"). Set expectError: true for deliberate off-contract negative probes.`,
+    );
+  }
+
   const resolvedPathOrUrl = interpolatePathTemplate(ledger, contract, input);
   const targetUrl = buildTargetUrl(
     ledger.armBaseUrl,
@@ -413,10 +582,20 @@ export async function executeOperationProbe(
     contract.apiVersion,
     input.query,
   );
+  if (!expectError && !doesUrlMatchPathTemplate(contract.pathTemplate, targetUrl)) {
+    throw new Error(
+      `Positive probe URL "${new URL(targetUrl).pathname}" does not match declared route template "${contract.pathTemplate}" for "${contract.operationId}".`,
+    );
+  }
 
-  const secretHeaderNames = contract.parameters
-    .filter((p) => p.in === "header" && p.secretCandidate)
-    .map((p) => p.name);
+  const secretHeaderNames = [
+    ...new Set([
+      ...contract.parameters
+        .filter((p) => p.in === "header" && p.secretCandidate)
+        .map((p) => p.name),
+      ...(contract.secretResponseHeaders ?? []),
+    ]),
+  ];
 
   const exchanges: WireHttpExchange[] = [];
   const initialExchange = await sendRawHttpExchange({
@@ -431,25 +610,46 @@ export async function executeOperationProbe(
   });
   exchanges.push(initialExchange);
 
-  // Track created target-RP resource names inside our disposable RG so soft-delete purge is permitted for them.
+  // Track created top-level target-RP resource identities inside our disposable RG so soft-delete purge
+  // is permitted ONLY for matching (providerNamespace, collectionSegment, location, name) (#7821).
   if (
     method === "PUT" &&
     initialExchange.response.status >= 200 &&
     initialExchange.response.status < 300
   ) {
-    const resName = extractResourceNameFromPath(targetUrl);
-    if (resName && !ledger.provisionedFixtures.some((f) => f.name === resName)) {
+    const reqLocation =
+      input.body &&
+      typeof input.body === "object" &&
+      typeof (input.body as Record<string, unknown>).location === "string"
+        ? String((input.body as Record<string, unknown>).location)
+        : ledger.location;
+    const identity = extractTargetResourceIdentityFromUrl(
+      targetUrl,
+      reqLocation,
+      initialExchange.response.body,
+    );
+    if (
+      identity &&
+      !ledger.provisionedFixtures.some(
+        (f) => f.resourceId.toLowerCase() === identity.resourceId.toLowerCase(),
+      )
+    ) {
       ledger.provisionedFixtures.push({
         kind: "target-rp-resource",
-        name: resName,
-        resourceId: new URL(targetUrl).pathname,
+        name: identity.name,
+        resourceId: identity.resourceId,
         provisionedAt: new Date().toISOString(),
+        metadata: {
+          providerNamespace: identity.providerNamespace,
+          collectionSegment: identity.collectionSegment,
+          location: identity.location,
+          resourceGroupName: identity.resourceGroupName,
+        },
       });
-      ownedResourceNames.push(resName);
+      ownedTargetResources.push(identity);
     }
   }
 
-  const expectError = Boolean(input.expectError);
   const shouldPoll = input.pollLro !== false && !expectError && method !== "GET";
   const maxPollAttempts = input.maxPollAttempts ?? 45;
   const defaultPollIntervalMs = input.pollIntervalMs ?? 2000;
@@ -500,6 +700,7 @@ export async function executeOperationProbe(
           method: "GET",
           url: currentPollUrl,
           bearerToken: token,
+          extraSensitiveHeaders: secretHeaderNames,
           safetyContext,
         });
         exchanges.push(pollExchange);
@@ -547,11 +748,18 @@ export async function executeOperationProbe(
               pollExchange.response.headers.location,
             );
           }
-          if (pollExchange.response.status !== 202) {
+          const pollProvState = extractProvisioningState(pollExchange.response.body);
+          if (pollProvState) {
+            observedLro.terminalProvisioningState = pollProvState;
+          }
+          // Continue polling when Location returns 202 OR returns 200 with a non-terminal provisioningState (#8098)!
+          if (
+            pollExchange.response.status !== 202 &&
+            !isNonTerminalProvisioningState(pollProvState)
+          ) {
             pollFinished = true;
             const termState =
-              extractProvisioningState(pollExchange.response.body) ??
-              (pollExchange.response.status < 300 ? "Succeeded" : "Failed");
+              pollProvState ?? (pollExchange.response.status < 300 ? "Succeeded" : "Failed");
             observedLro.terminalProvisioningState = termState;
             const lowerTerm = termState.toLowerCase();
             if (
@@ -603,6 +811,7 @@ export async function executeOperationProbe(
             method: "GET",
             url: targetUrl,
             bearerToken: token,
+            extraSensitiveHeaders: secretHeaderNames,
             safetyContext,
           });
           exchanges.push(finalGet);
@@ -635,6 +844,7 @@ export async function executeOperationProbe(
               method: "GET",
               url: locUrl,
               bearerToken: token,
+              extraSensitiveHeaders: secretHeaderNames,
               safetyContext,
             });
             exchanges.push(locGet);
@@ -653,6 +863,7 @@ export async function executeOperationProbe(
               method: "GET",
               url: locUrl,
               bearerToken: token,
+              extraSensitiveHeaders: secretHeaderNames,
               safetyContext,
             });
             exchanges.push(locGet);
@@ -680,6 +891,8 @@ export async function executeOperationProbe(
   let paginationCompletedCleanly = true;
   let paginationFailureReason: string | undefined;
 
+  const pagingHint = contract.pageable ?? contract.inferredPagination;
+
   while (
     input.followNextLink !== false &&
     !expectError &&
@@ -688,7 +901,7 @@ export async function executeOperationProbe(
     currentPageExchange.response.body &&
     typeof currentPageExchange.response.body === "object"
   ) {
-    const nextLinkField = contract.pageable?.nextLinkName ?? "nextLink";
+    const nextLinkField = pagingHint?.nextLinkName ?? "nextLink";
     const nextLinkVal = nextLinkField
       ? (currentPageExchange.response.body as Record<string, unknown>)[nextLinkField]
       : undefined;
@@ -712,6 +925,7 @@ export async function executeOperationProbe(
       method: "GET",
       url: resolvedNext,
       bearerToken: token,
+      extraSensitiveHeaders: secretHeaderNames,
       safetyContext,
     });
     exchanges.push(nextPageExchange);
@@ -774,12 +988,28 @@ export async function executeOperationProbe(
     }
   }
 
+  // Also validate LRO results delivered inside an Azure-AsyncOperation / Operation-Location status monitor (#8127).
+  if (
+    !hasSeparateFinalGet &&
+    lastPollExchange &&
+    observedLro.completionStatus === "succeeded" &&
+    observedLro.finalResultSource === "status-monitor-body"
+  ) {
+    const monitorIssues = await runTypeSpecMonitorResultValidation(
+      contract.typespecProjectDir,
+      contract.apiVersion,
+      contract.operationId,
+      lastPollExchange.response.body,
+    );
+    appendUniqueResponseErrors(monitorIssues);
+  }
+
   const normalizedTargetPath = new URL(targetUrl).pathname.replace(/\/+$/, "").toLowerCase();
 
   // Auto-attach saved priorPutBody on resource GET probes (exact resource path first, then resourceType fallback).
   const effectivePriorPutBody =
     input.priorPutBody ??
-    (method === "GET" && !contract.pageable
+    (method === "GET" && !contract.pageable && !contract.inferredPagination
       ? (runtimeState.putBodiesByResourceType[`path:${normalizedTargetPath}`] ??
         runtimeState.putBodiesByResourceType[contract.resourceType])
       : undefined);
@@ -796,13 +1026,25 @@ export async function executeOperationProbe(
 
   const isInitial2xx =
     initialExchange.response.status >= 200 && initialExchange.response.status < 300;
+  const initialWriteTerminalState =
+    method !== "GET"
+      ? extractProvisioningState(initialExchange.response.body)?.toLowerCase()
+      : undefined;
+  const isImmediateFailedWrite =
+    initialWriteTerminalState === "failed" ||
+    initialWriteTerminalState === "canceled" ||
+    initialWriteTerminalState === "cancelled";
+
   const lroCompletedOk = !observedLro.detected || observedLro.completionStatus === "succeeded";
   const probeSucceeded = expectError
     ? initialExchange.response.status >= 400 && initialExchange.response.status < 500
-    : isInitial2xx && lroCompletedOk && paginationCompletedCleanly;
+    : isInitial2xx && !isImmediateFailedWrite && lroCompletedOk && paginationCompletedCleanly;
 
   const failureReason = !probeSucceeded
-    ? (lroFailureReason ??
+    ? ((isImmediateFailedWrite
+        ? `Operation returned HTTP ${initialExchange.response.status} with terminal provisioningState "${initialWriteTerminalState}".`
+        : undefined) ??
+      lroFailureReason ??
       paginationFailureReason ??
       `HTTP ${initialExchange.response.status}: ${JSON.stringify(initialExchange.response.body ?? initialExchange.response.rawTextSnippet ?? "").slice(0, 240)}`)
     : undefined;
@@ -834,7 +1076,7 @@ export async function executeOperationProbe(
     }
 
     if (method === "GET") {
-      const itemField = contract.pageable?.itemName || "value";
+      const itemField = pagingHint?.itemName || "value";
       const discoveredNames: string[] = [];
       for (const ex of exchanges) {
         if (

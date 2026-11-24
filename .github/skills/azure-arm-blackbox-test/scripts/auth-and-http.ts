@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import type { ExchangeStep, WireHttpExchange } from "./types.ts";
+import type { ExchangeStep, OwnedTargetResource, WireHttpExchange } from "./types.ts";
 
 export const DISPOSABLE_RG_PREFIX = "rg-arm-blackbox-";
 
@@ -116,7 +116,7 @@ export interface SafetyGuardContext {
   trustedArmBaseUrl?: string;
   subscriptionId?: string;
   disposableRgName?: string;
-  ownedResourceNames?: string[];
+  ownedTargetResources?: OwnedTargetResource[];
   allowDisposableRgLifecycle?: boolean;
 }
 
@@ -235,19 +235,43 @@ export function assertSafeArmTarget(
     );
   }
 
-  // Subscription/location-scoped soft-delete purge/recover ONLY for recorded ownedResourceNames created inside our disposable RG.
+  // Subscription/location-scoped soft-delete purge/recover ONLY for recorded target-RP resource identities
+  // matching providerNamespace, resource collection type, location, and name.
   const softDeleteMatch =
-    /^\/subscriptions\/[^/]+\/providers\/[^/]+\/locations\/[^/]+\/deleted[^/]+\/([^/]+)(?:\/purge)?$/i.exec(
+    /^\/subscriptions\/[^/]+\/providers\/([^/]+)\/locations\/([^/]+)\/deleted([^/]+)\/([^/]+)(?:\/purge)?$/i.exec(
       pathname,
     );
   if (softDeleteMatch && (upperMethod === "POST" || upperMethod === "DELETE")) {
-    const targetName = softDeleteMatch[1].toLowerCase();
-    const owned = new Set((ctx.ownedResourceNames ?? []).map((n) => n.toLowerCase()));
-    if (owned.has(targetName)) {
+    const [, urlProvider, urlLocation, deletedCollectionSuffix, targetName] = softDeleteMatch;
+    const normProvider = urlProvider.toLowerCase();
+    const normLoc = urlLocation.toLowerCase().replace(/\s+/g, "");
+    const normCollection = deletedCollectionSuffix.toLowerCase();
+    const normName = targetName.toLowerCase();
+
+    const matchedOwned = (ctx.ownedTargetResources ?? []).some((res) => {
+      if (res.providerNamespace.toLowerCase() !== normProvider) {
+        return false;
+      }
+      if (res.collectionSegment.toLowerCase() !== normCollection) {
+        return false;
+      }
+      if (res.name.toLowerCase() !== normName) {
+        return false;
+      }
+      if (res.location && res.location.toLowerCase().replace(/\s+/g, "") !== normLoc) {
+        return false;
+      }
+      if (res.resourceGroupName && res.resourceGroupName.toLowerCase() !== rgLower) {
+        return false;
+      }
+      return true;
+    });
+
+    if (matchedOwned) {
       return;
     }
     throw new Error(
-      `Blocked soft-delete ${upperMethod} on unowned resource "${softDeleteMatch[1]}": resource is not recorded in ownedResourceNames.`,
+      `Blocked soft-delete ${upperMethod} on unowned resource "${urlProvider}/${deletedCollectionSuffix}/${targetName}" in "${urlLocation}": no matching target-RP resource identity is recorded for disposable RG "${ctx.disposableRgName}".`,
     );
   }
 
@@ -301,10 +325,18 @@ export async function sendRawHttpExchange(
 
   let serializedBody: string | undefined;
   if (options.body !== undefined) {
-    serializedBody = typeof options.body === "string" ? options.body : JSON.stringify(options.body);
-    if (!Object.keys(requestHeaders).some((k) => k.toLowerCase() === "content-type")) {
-      requestHeaders["Content-Type"] = "application/json";
+    const existingContentTypeEntry = Object.entries(requestHeaders).find(
+      ([k]) => k.toLowerCase() === "content-type",
+    );
+    const effectiveContentType = existingContentTypeEntry?.[1] ?? "application/json";
+    if (!existingContentTypeEntry) {
+      requestHeaders["Content-Type"] = effectiveContentType;
     }
+    const isJsonMediaType = /\bjson\b/i.test(effectiveContentType);
+    serializedBody =
+      typeof options.body === "string" && !isJsonMediaType
+        ? options.body
+        : JSON.stringify(options.body);
   }
 
   const startedAt = new Date();

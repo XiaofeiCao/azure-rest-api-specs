@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
@@ -506,8 +507,12 @@ function collectTypeSpecBodyMetadata(
   return result;
 }
 
-function collectTypeSpecResponseSecrets(program: Program, httpOp: HttpOperation): string[] {
+function collectTypeSpecResponseSecrets(
+  program: Program,
+  httpOp: HttpOperation,
+): { bodySecrets: string[]; headerSecrets: string[] } {
   const secrets = new Set<string>();
+  const headerSecrets = new Set<string>();
 
   function walk(type: Type | undefined, prefix = "", depth = 0, ancestors = new Set<Type>()): void {
     if (!type || depth > 7 || ancestors.has(type)) {
@@ -554,18 +559,32 @@ function collectTypeSpecResponseSecrets(program: Program, httpOp: HttpOperation)
 
   for (const resp of httpOp.responses) {
     for (const content of resp.responses) {
+      for (const [hWireName, hProp] of Object.entries(content.headers ?? {})) {
+        if (
+          isSecret(program, hProp) ||
+          isSecret(program, hProp.type) ||
+          SECRET_PROPERTY_NAME_RE.test(hWireName) ||
+          SECRET_PROPERTY_NAME_RE.test(hProp.name)
+        ) {
+          headerSecrets.add(hWireName);
+          secrets.add(hWireName);
+        }
+      }
       if (content.body) {
         walk(content.body.type);
       }
     }
   }
-  return [...secrets];
+  return {
+    bodySecrets: [...secrets],
+    headerSecrets: [...headerSecrets],
+  };
 }
 
-function extractPageableFromTypeSpec(
+function extractPaginationContractsFromTypeSpec(
   program: Program,
   httpOp: HttpOperation,
-): PageableContract | undefined {
+): { declaredPageable?: PageableContract; inferredPagination?: PageableContract } {
   const [paging] = getPagingOperation(program, httpOp.operation);
   if (paging) {
     const itemName = resolveEncodedName(
@@ -576,10 +595,24 @@ function extractPageableFromTypeSpec(
     const nextLinkName = paging.output.nextLink
       ? resolveEncodedName(program, paging.output.nextLink.property, "application/json")
       : null;
-    return { itemName, nextLinkName };
+    return { declaredPageable: { itemName, nextLinkName } };
   }
 
-  // Fallback for ARM list models returning { value: T[], nextLink?: string } without @list.
+  const openApiExtensions = getExtensions(program, httpOp.operation);
+  const xMsPageable = openApiExtensions.get("x-ms-pageable") as
+    | { itemName?: string; nextLinkName?: string | null }
+    | undefined;
+  if (xMsPageable && typeof xMsPageable === "object") {
+    return {
+      declaredPageable: {
+        itemName: xMsPageable.itemName ?? "value",
+        nextLinkName: xMsPageable.nextLinkName ?? "nextLink",
+      },
+    };
+  }
+
+  // Keep undecorated { value: T[], nextLink?: string } traversal hints separate from declared `pageable`
+  // so missing @list / x-ms-pageable metadata still triggers PAGEABLE-CONTRACT-DRIFT (#8233)!
   if (httpOp.verb === "get") {
     const okResp = httpOp.responses.find((r) => r.statusCodes === 200);
     const bodyType = okResp?.responses.find((c) => c.body !== undefined)?.body?.type;
@@ -600,12 +633,12 @@ function extractPageableFromTypeSpec(
         }
       }
       if (hasValueArray && hasNextLink) {
-        return { itemName: "value", nextLinkName: "nextLink" };
+        return { inferredPagination: { itemName: "value", nextLinkName: "nextLink" } };
       }
     }
   }
 
-  return undefined;
+  return {};
 }
 
 function scanExistingTypeSpecExamples(
@@ -815,7 +848,8 @@ export async function discoverSpecInventory(
       detectedNamespace = providerNamespace;
     }
 
-    const pageable = extractPageableFromTypeSpec(program, httpOp);
+    const { declaredPageable: pageable, inferredPagination } =
+      extractPaginationContractsFromTypeSpec(program, httpOp);
     const lroMeta = getLroMetadata(program, httpOp.operation);
     const openApiExtensions = getExtensions(program, httpOp.operation);
     const isLroDeclared =
@@ -823,7 +857,9 @@ export async function discoverSpecInventory(
     const lroFinalStateVia = lroMeta?.finalStateVia;
 
     const reqVisibility = resolveRequestVisibility(program, httpOp.operation, httpOp.verb);
-    const secretProperties = new Set<string>(collectTypeSpecResponseSecrets(program, httpOp));
+    const respSecrets = collectTypeSpecResponseSecrets(program, httpOp);
+    const secretProperties = new Set<string>(respSecrets.bodySecrets);
+    const secretResponseHeaders = new Set<string>(respSecrets.headerSecrets);
     let writableBodyProperties: string[] = [];
     let readOnlyBodyProperties: string[] = [];
     const opExternalDeps: ExternalDependencyHint[] = [];
@@ -967,18 +1003,22 @@ export async function discoverSpecInventory(
       scope: inferScope(pathTemplate),
       resourceType,
       depth,
-      phase: classifyPhase(method, pathTemplate, operationId, pageable),
+      phase: classifyPhase(method, pathTemplate, operationId, pageable ?? inferredPagination),
       declaredStatusCodes: [...declaredStatusCodesSet].sort(),
       declaredResponseHeaders,
       declaredResponseHasSchema,
       isLroDeclared,
       lroFinalStateVia,
       pageable,
+      ...(inferredPagination ? { inferredPagination } : {}),
       hasDefaultErrorResponse,
       parameters: paramSpecs,
       writableBodyProperties,
       readOnlyBodyProperties,
       secretProperties: [...secretProperties].sort(),
+      ...(secretResponseHeaders.size > 0
+        ? { secretResponseHeaders: [...secretResponseHeaders].sort() }
+        : {}),
       externalDependencies: opExternalDeps,
       existingExampleNames: matchedExamples.map((e) => e.title),
       existingExamplePaths: matchedExamples.map((e) => e.filePath),
@@ -1059,6 +1099,7 @@ export async function discoverSpecInventory(
   const now = new Date().toISOString();
   const ledger: CoverageLedger = {
     schemaVersion: "2.0-typespec",
+    runId: crypto.randomBytes(4).toString("hex"),
     createdAt: now,
     updatedAt: now,
     serviceName,

@@ -25,29 +25,70 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function parseSecretPatternSegments(pattern: string): string[] {
+  const segments: string[] = [];
+  for (const part of pattern.split(".")) {
+    if (part.endsWith("[]")) {
+      const base = part.slice(0, -2);
+      if (base) {
+        segments.push(base);
+      }
+      segments.push("[]");
+    } else if (part.length > 0) {
+      segments.push(part);
+    }
+  }
+  return segments;
+}
+
+function matchesSecretSegments(patternSegs: string[], actualSegs: string[]): boolean {
+  if (patternSegs.length !== actualSegs.length) {
+    return false;
+  }
+  for (let i = 0; i < patternSegs.length; i++) {
+    const pat = patternSegs[i];
+    if (pat === "*") {
+      // Matches ANY single dictionary key (including empty string "" or keys containing dots!)
+      continue;
+    }
+    if (pat.toLowerCase() !== actualSegs[i].toLowerCase()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function sanitizeStringValue(
   raw: string,
   ctx: SanitizeContext,
   propertyName?: string,
   dotPath?: string,
   parentObject?: Record<string, unknown>,
+  pathSegments?: string[],
 ): string {
-  // Check explicit secret property paths (falling back to standalone parameter name for path/query/header scalars: #10 / #11)
-  // as well as wildcard dictionary paths (e.g., "credentials.*.value") and secret key-name heuristics.
-  const secretPaths = new Set((ctx.extraSecretPropertyPaths ?? []).map((p) => p.toLowerCase()));
+  // Check explicit secret property paths using structured path segments (handling dictionary keys with dots or empty keys!)
+  // as well as standalone scalar parameter names (#10 / #11) and secret key-name heuristics.
+  const rawSecretPaths = ctx.extraSecretPropertyPaths ?? [];
+  const secretPathsLower = new Set(rawSecretPaths.map((p) => p.toLowerCase()));
+  const effectiveSegments =
+    pathSegments && pathSegments.length > 0
+      ? pathSegments
+      : dotPath
+        ? parseSecretPatternSegments(dotPath)
+        : propertyName !== undefined
+          ? [propertyName]
+          : [];
   const candidatePath = (dotPath || propertyName || "").toLowerCase();
+
   const matchesExplicitSecret =
-    Boolean(candidatePath) &&
-    (secretPaths.has(candidatePath) ||
-      (dotPath ? secretPaths.has(dotPath.toLowerCase()) : false) ||
-      (propertyName && !dotPath ? secretPaths.has(propertyName.toLowerCase()) : false) ||
-      [...secretPaths].some((sp) => {
-        if (!sp.includes("*")) {
-          return false;
-        }
-        const wildcardRe = new RegExp(`^${sp.split("*").map(escapeRegExp).join("[^.]+")}$`, "i");
-        return wildcardRe.test(candidatePath);
-      }));
+    (!pathSegments?.length && Boolean(candidatePath) && secretPathsLower.has(candidatePath)) ||
+    (propertyName && !dotPath && (!pathSegments || pathSegments.length === 0)
+      ? secretPathsLower.has(propertyName.toLowerCase())
+      : false) ||
+    (effectiveSegments.length > 0 &&
+      rawSecretPaths.some((sp) =>
+        matchesSecretSegments(parseSecretPatternSegments(sp), effectiveSegments),
+      ));
 
   if (
     matchesExplicitSecret ||
@@ -129,12 +170,15 @@ export function sanitizePayload(
   propertyName?: string,
   dotPath = "",
   parentObject?: Record<string, unknown>,
+  pathSegments: string[] = [],
 ): unknown {
   if (typeof value === "string") {
-    return sanitizeStringValue(value, ctx, propertyName, dotPath, parentObject);
+    return sanitizeStringValue(value, ctx, propertyName, dotPath, parentObject, pathSegments);
   }
   if (Array.isArray(value)) {
-    return value.map((item) => sanitizePayload(item, ctx, propertyName, `${dotPath}[]`));
+    return value.map((item) =>
+      sanitizePayload(item, ctx, propertyName, `${dotPath}[]`, undefined, [...pathSegments, "[]"]),
+    );
   }
   if (value && typeof value === "object") {
     const rec = value as Record<string, unknown>;
@@ -142,7 +186,7 @@ export function sanitizePayload(
     for (const [k, v] of Object.entries(rec)) {
       const nextPath = dotPath ? `${dotPath}.${k}` : k;
       const sanitizedKey = sanitizeStringValue(k, ctx);
-      sanitizedObj[sanitizedKey] = sanitizePayload(v, ctx, k, nextPath, rec);
+      sanitizedObj[sanitizedKey] = sanitizePayload(v, ctx, k, nextPath, rec, [...pathSegments, k]);
     }
     return sanitizedObj;
   }

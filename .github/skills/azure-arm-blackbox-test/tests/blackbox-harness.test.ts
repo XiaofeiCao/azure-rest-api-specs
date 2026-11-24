@@ -140,7 +140,16 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       trustedArmBaseUrl: "https://management.azure.com",
       subscriptionId: REAL_SUB_ID,
       disposableRgName: "rg-arm-blackbox-appconfig-abc123",
-      ownedResourceNames: ["bbx-store-01"],
+      ownedTargetResources: [
+        {
+          providerNamespace: "Microsoft.AppConfiguration",
+          collectionSegment: "configurationStores",
+          name: "bbx-store-01",
+          location: "eastus",
+          resourceGroupName: "rg-arm-blackbox-appconfig-abc123",
+          resourceId: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.AppConfiguration/configurationStores/bbx-store-01`,
+        },
+      ],
       allowDisposableRgLifecycle: false,
     };
 
@@ -207,7 +216,23 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
         `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.AppConfiguration/locations/eastus/deletedConfigurationStores/bbx-production/purge?api-version=2024-06-01`,
         ctx,
       ),
-    ).toThrow(/not recorded in ownedResourceNames/);
+    ).toThrow(/no matching target-RP resource identity/);
+
+    // Same resource name under a different RP or location is ALSO blocked (#7821)!
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.KeyVault/locations/eastus/deletedVaults/bbx-store-01/purge?api-version=2024-06-01`,
+        ctx,
+      ),
+    ).toThrow(/no matching target-RP resource identity/);
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.AppConfiguration/locations/westus2/deletedConfigurationStores/bbx-store-01/purge?api-version=2024-06-01`,
+        ctx,
+      ),
+    ).toThrow(/no matching target-RP resource identity/);
 
     expect(() =>
       assertSafeArmTarget(
@@ -227,10 +252,11 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     ).toThrow(/strictly confined/);
   });
 
-  it("compiles real Microsoft.AppConfiguration TypeSpec in-memory and builds a parent-child-delete-purge DAG with .tsp:line provenance", async () => {
-    const workDir = makeTempDir();
+  it("compiles multi-resource ARM TypeSpec in-memory and builds a parent-child-delete-purge DAG with .tsp:line provenance", async () => {
+    const tempRoot = makeTempDir();
+    const workDir = path.join(tempRoot, "work-dag");
     const repoRoot = path.resolve(import.meta.dirname, "../../../..");
-    const appConfigSpec = path.join(
+    const realAppConfigSpec = path.join(
       repoRoot,
       "specification",
       "appconfiguration",
@@ -239,8 +265,112 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       "AppConfiguration",
     );
 
+    // Support both full checkouts and CI sparse checkouts where `specification/` is excluded!
+    let specPathToTest = realAppConfigSpec;
+    const isUsingRealSpec = fs.existsSync(realAppConfigSpec);
+    if (!isUsingRealSpec) {
+      const synthDir = path.join(tempRoot, "SynthAppConfig");
+      fs.mkdirSync(synthDir, { recursive: true });
+      fs.writeFileSync(path.join(synthDir, "tspconfig.yaml"), "{}\n", "utf8");
+      fs.writeFileSync(
+        path.join(synthDir, "ConfigurationStore.tsp"),
+        `
+import "@typespec/http";
+import "@typespec/rest";
+import "@typespec/versioning";
+import "@typespec/openapi";
+import "@azure-tools/typespec-azure-core";
+import "@azure-tools/typespec-azure-resource-manager";
+
+using TypeSpec.Http;
+using TypeSpec.Rest;
+using TypeSpec.Versioning;
+using TypeSpec.OpenAPI;
+using Azure.Core;
+using Azure.ResourceManager;
+
+@armProviderNamespace
+@service(#{ title: "AppConfigurationManagementClient" })
+@versioned(Versions)
+@armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v5)
+namespace Microsoft.AppConfiguration;
+
+enum Versions {
+  v2025_06_01_preview: "2025-06-01-preview",
+}
+
+model ConfigurationStoreProperties {
+  disableLocalAuth?: boolean;
+  @visibility(Lifecycle.Read)
+  provisioningState?: ResourceProvisioningState;
+}
+
+model ConfigurationStore is TrackedResource<ConfigurationStoreProperties> {
+  ...ResourceNameParameter<ConfigurationStore, "configStoreName", "configurationStores">;
+}
+
+@parentResource(ConfigurationStore)
+model KeyValue is ProxyResource<{ value?: string }> {
+  ...ResourceNameParameter<KeyValue, "keyValueName", "keyValues">;
+}
+
+@parentResource(ConfigurationStore)
+model Replica is ProxyResource<{ provisioningState?: ResourceProvisioningState }> {
+  ...ResourceNameParameter<Replica, "replicaName", "replicas">;
+}
+
+@subscriptionResource
+@parentResource(SubscriptionLocationResource)
+model DeletedConfigurationStore is ProxyResource<{ storeId?: string }> {
+  ...ResourceNameParameter<DeletedConfigurationStore, "configStoreName", "deletedConfigurationStores">;
+}
+
+interface Operations extends Azure.ResourceManager.Operations {}
+
+@armResourceOperations
+interface ConfigurationStores {
+  @operationId("ConfigurationStores_Get")
+  get is ArmResourceRead<ConfigurationStore>;
+  @operationId("ConfigurationStores_Create")
+  create is ArmResourceCreateOrReplaceAsync<ConfigurationStore>;
+  @operationId("ConfigurationStores_Delete")
+  delete is ArmResourceDeleteWithoutOkAsync<ConfigurationStore>;
+}
+
+@armResourceOperations
+interface KeyValues {
+  @operationId("KeyValues_CreateOrUpdate")
+  createOrUpdate is ArmResourceCreateOrReplaceSync<KeyValue>;
+  @operationId("KeyValues_Delete")
+  delete is ArmResourceDeleteSync<KeyValue>;
+}
+
+@armResourceOperations
+interface Replicas {
+  @operationId("Replicas_Create")
+  create is ArmResourceCreateOrReplaceAsync<Replica>;
+  @operationId("Replicas_ListByConfigurationStore")
+  listByConfigurationStore is ArmResourceListByParent<Replica>;
+}
+
+@armResourceOperations
+interface DeletedStores {
+  @operationId("ConfigurationStores_PurgeDeleted")
+  purgeDeleted is ArmResourceActionAsync<DeletedConfigurationStore, void, OkResponse>;
+}
+`.trim() + "\n",
+        "utf8",
+      );
+      fs.writeFileSync(
+        path.join(synthDir, "main.tsp"),
+        'import "./ConfigurationStore.tsp";\n',
+        "utf8",
+      );
+      specPathToTest = synthDir;
+    }
+
     const ledger = await discoverSpecInventory({
-      specPath: appConfigSpec,
+      specPath: specPathToTest,
       apiVersion: "2025-06-01-preview",
       workDir,
     });
@@ -251,7 +381,9 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     expect(ledger.operations.ConfigurationStores_Create.sourceLocation?.file).toMatch(
       /ConfigurationStore\.tsp$/,
     );
-    expect(ledger.executionOrder.length).toBe(29);
+    if (isUsingRealSpec) {
+      expect(ledger.executionOrder.length).toBe(29);
+    }
 
     const idxOpsList = ledger.executionOrder.indexOf("Operations_List");
     const idxStoreCreate = ledger.executionOrder.indexOf("ConfigurationStores_Create");
@@ -287,20 +419,53 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     let putPollCounter = 0;
     let restartPollCounter = 0;
     let baseUrl = "";
+    const rgStore = new Map<string, Record<string, unknown>>();
 
     const server = http.createServer((req, res) => {
       const reqUrl = new URL(req.url ?? "/", baseUrl);
       const pathname = reqUrl.pathname;
       const method = req.method?.toUpperCase() ?? "GET";
 
-      // Disposable RG create / delete.
+      // Disposable RG GET / PUT / DELETE with per-run ownership tags (#7890).
       if (
         /^\/subscriptions\/[^/]+\/resourcegroups\/rg-arm-blackbox-/i.test(pathname) &&
         !pathname.includes("/providers/")
       ) {
-        res.writeHead(method === "DELETE" ? 200 : 201, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id: pathname, location: "eastus" }));
-        return;
+        const key = pathname.toLowerCase();
+        if (method === "GET") {
+          const existing = rgStore.get(key);
+          if (!existing) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: { code: "ResourceGroupNotFound", message: "Not found" } }),
+            );
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(existing));
+          }
+          return;
+        }
+        if (method === "PUT") {
+          const chunks: Buffer[] = [];
+          req.on("data", (c: Buffer) => chunks.push(c));
+          req.on("end", () => {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<
+              string,
+              unknown
+            >;
+            const record = { id: pathname, location: "eastus", ...parsed };
+            rgStore.set(key, record);
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(record));
+          });
+          return;
+        }
+        if (method === "DELETE") {
+          rgStore.delete(key);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ id: pathname }));
+          return;
+        }
       }
 
       // Async status monitor for Widget PUT.
@@ -761,20 +926,53 @@ interface PrivateConns {
     let emptyGetMode = false;
     const failDeleteLro = true;
     let slowFixtureMode = true;
+    const v2RgStore = new Map<string, Record<string, unknown>>();
 
     const server = http.createServer((req, res) => {
       const reqUrl = new URL(req.url ?? "/", baseUrl);
       const pathname = reqUrl.pathname;
       const method = req.method?.toUpperCase() ?? "GET";
 
-      // Disposable RG lifecycle
+      // Disposable RG lifecycle with per-run ownership tags (#7890)
       if (
         /^\/subscriptions\/[^/]+\/resourcegroups\/rg-arm-blackbox-/i.test(pathname) &&
         !pathname.includes("/providers/")
       ) {
-        res.writeHead(method === "DELETE" ? 200 : 201, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id: pathname, location: "eastus" }));
-        return;
+        const key = pathname.toLowerCase();
+        if (method === "GET") {
+          const existing = v2RgStore.get(key);
+          if (!existing) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({ error: { code: "ResourceGroupNotFound", message: "Not found" } }),
+            );
+          } else {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(existing));
+          }
+          return;
+        }
+        if (method === "PUT") {
+          const chunks: Buffer[] = [];
+          req.on("data", (c: Buffer) => chunks.push(c));
+          req.on("end", () => {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}") as Record<
+              string,
+              unknown
+            >;
+            const record = { id: pathname, location: "eastus", ...parsed };
+            v2RgStore.set(key, record);
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(record));
+          });
+          return;
+        }
+        if (method === "DELETE") {
+          v2RgStore.delete(key);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ id: pathname }));
+          return;
+        }
       }
 
       // External UAMI fixture to test LRO timeout detection (#23/#24)
@@ -1149,6 +1347,42 @@ interface PrivateConns {
     const backupExText = fs.readFileSync(backupExArtifact.scratchPath, "utf8");
     expect(backupExText).not.toContain("TOP_SECRET_HEADER_MATERIAL");
     expect(backupExText).toContain("https://contoso.blob.core.windows.net/bk.zip");
+
+    // Verify wildcard dictionary secrets redact keys containing dots OR empty keys (#7984)!
+    const dictSanitized = sanitizePayload(
+      {
+        credentials: {
+          "dotted.key.name": { value: "DOTTED_KEY_SECRET_123" },
+          "": { value: "EMPTY_KEY_SECRET_456" },
+        },
+      },
+      { extraSecretPropertyPaths: ["credentials.*.value"] },
+    ) as { credentials: Record<string, { value: string }> };
+    expect(dictSanitized.credentials["dotted.key.name"].value).toBe("<redacted>");
+    expect(dictSanitized.credentials[""].value).toBe("<redacted>");
+
+    // Positive probe with mismatched HTTP method or off-contract route is rejected (#7862)!
+    await expect(
+      executeOperationProbe({
+        workDir,
+        bearerToken: MOCK_TOKEN,
+        input: {
+          operationId: "Vaults_Delete",
+          method: "GET",
+        },
+      }),
+    ).rejects.toThrow(/must use declared HTTP method/);
+
+    // Private-endpoint fixture rejects unrecorded / external target-resource-id (#7920)!
+    await expect(
+      provisionExternalFixture({
+        workDir,
+        kind: "private-endpoint",
+        targetPrivateLinkResourceId: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-production/providers/Microsoft.V2Vault/vaults/prod-vault`,
+        groupIds: ["vaults"],
+        bearerToken: MOCK_TOKEN,
+      }),
+    ).rejects.toThrow(/Blocked private-endpoint fixture/);
 
     // Verify Markdown backslash + pipe escaping in report (CodeQL #1).
     const ledgerRaw = JSON.parse(

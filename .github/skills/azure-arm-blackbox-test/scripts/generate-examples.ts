@@ -168,20 +168,32 @@ export function buildXMsExampleFromTrace(
 
   // For LRO operations, include terminal response (EX-COVERAGE requires both initial and final responses on LROs).
   if (trace.observedLro.detected || contract.isLroDeclared) {
-    if (finalGet && finalGet.response.status >= 200 && finalGet.response.status < 300) {
-      const finalCode = String(finalGet.response.status);
+    const terminalResourceExchange =
+      finalGet && finalGet.response.status >= 200 && finalGet.response.status < 300
+        ? finalGet
+        : (contract.method === "PUT" || contract.method === "PATCH") &&
+            trace.observedLro.completionStatus === "succeeded" &&
+            (trace.observedLro.finalResultSource === "final-resource-get" ||
+              trace.observedLro.finalResultSource === "location-body") &&
+            lastPoll &&
+            lastPoll.response.status >= 200 &&
+            lastPoll.response.status < 300 &&
+            lastPoll.response.body !== undefined
+          ? lastPoll
+          : undefined;
+
+    if (terminalResourceExchange) {
+      const finalCode = String(terminalResourceExchange.response.status);
       const finalHeaders = pickDeclaredHeaders(
         contract,
         finalCode,
-        finalGet.response.headers,
+        terminalResourceExchange.response.headers,
         sanitizeCtx,
       );
-      // Overwrite if initialCode === finalCode (e.g., PUT returned 200 Creating, then final GET returned 200 Succeeded),
-      // or add alongside 201/202 when distinct!
       responses[finalCode] = {
         ...(finalHeaders ? { headers: finalHeaders } : {}),
-        ...(finalGet.response.body !== undefined
-          ? { body: sanitizePayload(finalGet.response.body, sanitizeCtx) }
+        ...(terminalResourceExchange.response.body !== undefined
+          ? { body: sanitizePayload(terminalResourceExchange.response.body, sanitizeCtx) }
           : {}),
       };
     } else if (

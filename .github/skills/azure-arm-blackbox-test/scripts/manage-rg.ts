@@ -12,6 +12,7 @@ import { loadLedger, saveLedger } from "./ledger-store.ts";
 import type { ExternalDependencyKind, ProvisionedFixture } from "./types.ts";
 
 const ARM_RESOURCES_API_VERSION = "2024-03-01";
+const RUN_OWNERSHIP_TAG = "arm-blackbox-run-id";
 
 export function generateDisposableRgName(serviceHint?: string): string {
   const cleanHint = (serviceHint ?? "svc")
@@ -50,8 +51,62 @@ export async function createDisposableResourceGroup(options: {
     subscriptionId,
   });
 
+  const runId = ledger.runId ?? crypto.randomBytes(4).toString("hex");
+  ledger.runId = runId;
+
   const base = ledger.armBaseUrl.replace(/\/+$/, "");
   const url = `${base}/subscriptions/${encodeURIComponent(subscriptionId)}/resourcegroups/${encodeURIComponent(rgName)}?api-version=${ARM_RESOURCES_API_VERSION}`;
+  const safetyContext = {
+    trustedArmBaseUrl: ledger.armBaseUrl,
+    subscriptionId,
+    disposableRgName: rgName,
+    allowDisposableRgLifecycle: true,
+  };
+
+  // Check whether a Resource Group with this name already exists; refuse reuse unless its per-run ownership tag matches!
+  const existingCheck = await sendRawHttpExchange({
+    step: "initial",
+    method: "GET",
+    url,
+    bearerToken: token,
+    safetyContext,
+  });
+  if (existingCheck.response.status >= 200 && existingCheck.response.status < 300) {
+    const existingBody =
+      existingCheck.response.body && typeof existingCheck.response.body === "object"
+        ? (existingCheck.response.body as Record<string, unknown>)
+        : undefined;
+    const existingTags =
+      existingBody?.tags && typeof existingBody.tags === "object"
+        ? (existingBody.tags as Record<string, unknown>)
+        : undefined;
+    const existingOwnerRunId =
+      typeof existingTags?.[RUN_OWNERSHIP_TAG] === "string"
+        ? existingTags[RUN_OWNERSHIP_TAG]
+        : undefined;
+    if (existingOwnerRunId !== runId) {
+      throw new Error(
+        `Refusing to reuse existing Resource Group "${rgName}": ${RUN_OWNERSHIP_TAG} tag is "${existingOwnerRunId ?? "<missing>"}", expected "${runId}".`,
+      );
+    }
+  } else if (existingCheck.response.status !== 404) {
+    throw new Error(
+      `Failed to verify Resource Group "${rgName}" ownership before creation: HTTP ${existingCheck.response.status}`,
+    );
+  }
+
+  // Persist cleanup target BEFORE sending the mutating PUT so interrupted runs can still tear down safely.
+  const createdAt = ledger.disposableResourceGroup?.createdAt ?? new Date().toISOString();
+  ledger.subscriptionId = subscriptionId;
+  ledger.location = location;
+  ledger.disposableResourceGroup = {
+    name: rgName,
+    location,
+    runId,
+    createdAt,
+    cleanupStatus: "creating",
+  };
+  saveLedger(options.workDir, ledger);
 
   const exchange = await sendRawHttpExchange({
     step: "initial",
@@ -62,33 +117,24 @@ export async function createDisposableResourceGroup(options: {
       location,
       tags: {
         purpose: "arm-spec-blackbox-test",
+        [RUN_OWNERSHIP_TAG]: runId,
         service: ledger.providerNamespace,
         apiVersion: ledger.apiVersion,
-        createdAt: new Date().toISOString(),
+        createdAt,
       },
     },
-    safetyContext: {
-      trustedArmBaseUrl: ledger.armBaseUrl,
-      subscriptionId,
-      disposableRgName: rgName,
-      allowDisposableRgLifecycle: true,
-    },
+    safetyContext,
   });
 
   if (exchange.response.status < 200 || exchange.response.status >= 300) {
+    ledger.disposableResourceGroup.cleanupStatus = "cleanup_failed";
+    saveLedger(options.workDir, ledger);
     throw new Error(
       `Failed to create disposable Resource Group "${rgName}": HTTP ${exchange.response.status} ${JSON.stringify(exchange.response.body ?? "")}`,
     );
   }
 
-  ledger.subscriptionId = subscriptionId;
-  ledger.location = location;
-  ledger.disposableResourceGroup = {
-    name: rgName,
-    location,
-    createdAt: new Date().toISOString(),
-    cleanupStatus: "active",
-  };
+  ledger.disposableResourceGroup.cleanupStatus = "active";
   saveLedger(options.workDir, ledger);
 
   return { rgName, location, subscriptionId };
@@ -113,18 +159,57 @@ export async function deleteDisposableResourceGroup(options: {
   });
   const base = ledger.armBaseUrl.replace(/\/+$/, "");
   const url = `${base}/subscriptions/${encodeURIComponent(ledger.subscriptionId)}/resourcegroups/${encodeURIComponent(rg.name)}?api-version=${ARM_RESOURCES_API_VERSION}`;
+  const safetyContext = {
+    trustedArmBaseUrl: ledger.armBaseUrl,
+    subscriptionId: ledger.subscriptionId,
+    disposableRgName: rg.name,
+    allowDisposableRgLifecycle: true,
+  };
+
+  const expectedRunId = rg.runId ?? ledger.runId;
+  const preDeleteGet = await sendRawHttpExchange({
+    step: "initial",
+    method: "GET",
+    url,
+    bearerToken: token,
+    safetyContext,
+  });
+  if (preDeleteGet.response.status === 404) {
+    rg.cleanupStatus = "deleted";
+    rg.deletedAt = new Date().toISOString();
+    saveLedger(options.workDir, ledger);
+    return { rgName: rg.name, cleanupStatus: "deleted" };
+  }
+  if (preDeleteGet.response.status >= 200 && preDeleteGet.response.status < 300) {
+    const existingBody =
+      preDeleteGet.response.body && typeof preDeleteGet.response.body === "object"
+        ? (preDeleteGet.response.body as Record<string, unknown>)
+        : undefined;
+    const existingTags =
+      existingBody?.tags && typeof existingBody.tags === "object"
+        ? (existingBody.tags as Record<string, unknown>)
+        : undefined;
+    const actualRunId =
+      typeof existingTags?.[RUN_OWNERSHIP_TAG] === "string"
+        ? existingTags[RUN_OWNERSHIP_TAG]
+        : undefined;
+    if (!expectedRunId || actualRunId !== expectedRunId) {
+      throw new Error(
+        `Blocked deletion of Resource Group "${rg.name}": ${RUN_OWNERSHIP_TAG} tag is "${actualRunId ?? "<missing>"}", expected "${expectedRunId ?? "<unrecorded>"}".`,
+      );
+    }
+  } else {
+    throw new Error(
+      `Failed to verify Resource Group "${rg.name}" ownership before deletion: HTTP ${preDeleteGet.response.status}`,
+    );
+  }
 
   const delExchange = await sendRawHttpExchange({
     step: "initial",
     method: "DELETE",
     url,
     bearerToken: token,
-    safetyContext: {
-      trustedArmBaseUrl: ledger.armBaseUrl,
-      subscriptionId: ledger.subscriptionId,
-      disposableRgName: rg.name,
-      allowDisposableRgLifecycle: true,
-    },
+    safetyContext,
   });
 
   if (
@@ -410,6 +495,26 @@ export async function provisionExternalFixture(options: {
     if (!options.targetPrivateLinkResourceId || !options.groupIds?.length) {
       throw new Error(
         "private-endpoint fixture requires --target-resource-id and --group-ids (e.g. configurationStores).",
+      );
+    }
+    const cleanTargetId = options.targetPrivateLinkResourceId.trim().replace(/\/+$/, "");
+    const targetIdMatch =
+      /^\/subscriptions\/([^/]+)\/resourcegroups\/([^/]+)\/providers\/.+$/i.exec(cleanTargetId);
+    if (
+      !targetIdMatch ||
+      targetIdMatch[1].toLowerCase() !== sub.toLowerCase() ||
+      targetIdMatch[2].toLowerCase() !== rg.toLowerCase()
+    ) {
+      throw new Error(
+        `Blocked private-endpoint fixture targeting "${options.targetPrivateLinkResourceId}": target resource must reside inside subscription "${sub}" and disposable Resource Group "${rg}".`,
+      );
+    }
+    const isRecordedTarget = ledger.provisionedFixtures.some(
+      (f) => f.resourceId.replace(/\/+$/, "").toLowerCase() === cleanTargetId.toLowerCase(),
+    );
+    if (!isRecordedTarget) {
+      throw new Error(
+        `Blocked private-endpoint fixture targeting "${options.targetPrivateLinkResourceId}": target resource is not recorded in provisionedFixtures for this run.`,
       );
     }
     let vnetFixture = ledger.provisionedFixtures.find((f) => f.kind === "vnet-subnet");

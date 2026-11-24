@@ -1,5 +1,8 @@
 import { loadProjectedTypeSpecService } from "./typespec-loader.ts";
-import { validateWireExchangeAgainstTypeSpec } from "./typespec-validator.ts";
+import {
+  validateStatusMonitorResultAgainstTypeSpec,
+  validateWireExchangeAgainstTypeSpec,
+} from "./typespec-validator.ts";
 import {
   DISCREPANCY_RULES,
   type BehavioralDiscrepancy,
@@ -57,6 +60,27 @@ export async function runTypeSpecLiveValidation(
         },
       ],
     };
+  }
+}
+
+export async function runTypeSpecMonitorResultValidation(
+  typespecProjectDir: string,
+  apiVersion: string,
+  operationId: string,
+  monitorBody: unknown,
+): Promise<TypeSpecSchemaIssue[]> {
+  try {
+    const service = await loadProjectedTypeSpecService(typespecProjectDir, apiVersion);
+    return validateStatusMonitorResultAgainstTypeSpec(service, operationId, monitorBody);
+  } catch (err) {
+    return [
+      {
+        code: "TYPESPEC_VALIDATION_ERROR",
+        message: err instanceof Error ? err.message : String(err),
+        path: "$.monitor.result",
+        severity: "error",
+      },
+    ];
   }
 }
 

@@ -77,11 +77,13 @@ export interface OperationContract {
   isLroDeclared: boolean;
   lroFinalStateVia?: string;
   pageable?: PageableContract;
+  inferredPagination?: PageableContract;
   hasDefaultErrorResponse: boolean;
   parameters: OperationParameterSpec[];
   writableBodyProperties: string[];
   readOnlyBodyProperties: string[];
   secretProperties: string[];
+  secretResponseHeaders?: string[];
   externalDependencies: ExternalDependencyHint[];
   existingExampleNames: string[];
   existingExamplePaths: string[];
@@ -129,9 +131,19 @@ export interface OperationCoverageEntry {
 export interface DisposableResourceGroupState {
   name: string;
   location: string;
+  runId?: string;
   createdAt?: string;
   deletedAt?: string;
-  cleanupStatus: "not_created" | "active" | "deleting" | "deleted" | "cleanup_failed";
+  cleanupStatus: "not_created" | "creating" | "active" | "deleting" | "deleted" | "cleanup_failed";
+}
+
+export interface OwnedTargetResource {
+  providerNamespace: string;
+  collectionSegment: string;
+  name: string;
+  location?: string;
+  resourceGroupName?: string;
+  resourceId: string;
 }
 
 export interface ProvisionedFixture {
@@ -150,6 +162,7 @@ export interface LedgerRuntimeState {
 
 export interface CoverageLedger {
   schemaVersion: "2.0-typespec";
+  runId?: string;
   createdAt: string;
   updatedAt: string;
   serviceName: string;
