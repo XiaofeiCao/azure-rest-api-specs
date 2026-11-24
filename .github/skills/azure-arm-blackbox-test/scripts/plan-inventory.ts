@@ -8,7 +8,10 @@ import {
 import {
   getDoc,
   getFormat,
+  getMaxLength,
+  getMinLength,
   getPagingOperation,
+  getPattern,
   isArrayModelType,
   isErrorModel,
   isRecordModelType,
@@ -27,7 +30,7 @@ import {
   type MetadataInfo,
 } from "@typespec/http";
 import { getExtensions, isReadonlyProperty } from "@typespec/openapi";
-import { getArmBearerToken } from "./auth-and-http.ts";
+import { assertTrustedArmOrigin, getArmBearerToken } from "./auth-and-http.ts";
 import { saveLedger } from "./ledger-store.ts";
 import {
   extractOperationSourceLocation,
@@ -77,7 +80,10 @@ function inferScope(pathTemplate: string): ArmOperationScope {
   return "tenant";
 }
 
-function extractProviderAndResource(pathTemplate: string): {
+function extractProviderAndResource(
+  pathTemplate: string,
+  method: HttpMethod,
+): {
   providerNamespace: string;
   resourceType: string;
   depth: number;
@@ -125,6 +131,14 @@ function extractProviderAndResource(pathTemplate: string): {
         idx += 2;
         continue;
       }
+      // Singleton literal resource names (e.g., ".../identities/default") follow a static collection segment.
+      if (
+        idx + 1 < normalizedRest.length &&
+        /^(default|current|latest)$/i.test(normalizedRest[idx + 1])
+      ) {
+        idx += 2;
+        continue;
+      }
     }
     idx++;
   }
@@ -132,7 +146,9 @@ function extractProviderAndResource(pathTemplate: string): {
   const endsWithParam =
     normalizedRest.length > 0 && normalizedRest[normalizedRest.length - 1].startsWith("{");
   const lastSegment = normalizedRest[normalizedRest.length - 1] ?? "";
-  const isActionSegment = !endsWithParam && normalizedRest.length >= 2;
+  // Only POST routes ending in a static verb segment after a resource path are ARM actions;
+  // GET/PUT/PATCH/DELETE ending in a static segment are child collections or singleton resources!
+  const isActionSegment = method === "POST" && !endsWithParam && normalizedRest.length >= 2;
 
   const resourceTypeSegments =
     isActionSegment && typeSegments.length > 1 ? typeSegments.slice(0, -1) : typeSegments;
@@ -325,6 +341,33 @@ function detectExternalDependencyFromTypeSpec(
   return undefined;
 }
 
+function hasWireJsonBody(
+  program: Program,
+  metadataInfo: MetadataInfo,
+  type: Type | undefined,
+  visibility: Visibility,
+): boolean {
+  if (!type || isVoidType(type)) {
+    return false;
+  }
+  if (type.kind !== "Model") {
+    return true;
+  }
+  if (
+    isArrayModelType(program, type) ||
+    isRecordModelType(program, type) ||
+    Boolean(type.indexer)
+  ) {
+    return true;
+  }
+  for (const prop of walkPropertiesInherited(type)) {
+    if (metadataInfo.isPayloadProperty(prop, visibility)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function collectTypeSpecBodyMetadata(
   program: Program,
   metadataInfo: MetadataInfo,
@@ -332,7 +375,7 @@ function collectTypeSpecBodyMetadata(
   type: Type | undefined,
   prefix = "",
   depth = 0,
-  visited = new Set<Type>(),
+  ancestors = new Set<Type>(),
   result = {
     writable: new Set<string>(),
     readOnly: new Set<string>(),
@@ -346,21 +389,44 @@ function collectTypeSpecBodyMetadata(
   secrets: Set<string>;
   externalDeps: Map<string, ExternalDependencyHint>;
 } {
-  if (!type || depth > 5 || visited.has(type)) {
+  if (!type || depth > 7 || ancestors.has(type)) {
     return result;
   }
-  visited.add(type);
+  const branchAncestors = new Set(ancestors);
+  branchAncestors.add(type);
 
   if (type.kind === "Model") {
-    if (isArrayModelType(program, type) || isRecordModelType(program, type)) {
+    if (isArrayModelType(program, type)) {
+      const arrayPrefix = prefix ? `${prefix}[]` : "[]";
+      if (isSecret(program, type.indexer.value)) {
+        result.secrets.add(arrayPrefix);
+      }
       collectTypeSpecBodyMetadata(
         program,
         metadataInfo,
         reqVisibility | Visibility.Item,
         type.indexer.value,
-        prefix,
+        arrayPrefix,
         depth + 1,
-        visited,
+        branchAncestors,
+        result,
+        false,
+      );
+      return result;
+    }
+    if (isRecordModelType(program, type)) {
+      const recordPrefix = prefix ? `${prefix}.*` : "*";
+      if (isSecret(program, type.indexer.value)) {
+        result.secrets.add(recordPrefix);
+      }
+      collectTypeSpecBodyMetadata(
+        program,
+        metadataInfo,
+        reqVisibility | Visibility.Item,
+        type.indexer.value,
+        recordPrefix,
+        depth + 1,
+        branchAncestors,
         result,
         false,
       );
@@ -379,6 +445,8 @@ function collectTypeSpecBodyMetadata(
       } else if (
         visibleInReq &&
         visibleInRead &&
+        !propPath.includes("[]") &&
+        !propPath.includes(".*") &&
         propPath !== "id" &&
         propPath !== "name" &&
         propPath !== "type" &&
@@ -413,7 +481,7 @@ function collectTypeSpecBodyMetadata(
           prop.type,
           propPath,
           depth + 1,
-          visited,
+          branchAncestors,
           result,
           requiredInParent ? isPropRequired : depth === 0 ? isPropRequired : false,
         );
@@ -428,7 +496,7 @@ function collectTypeSpecBodyMetadata(
         variant.type,
         prefix,
         depth,
-        visited,
+        branchAncestors,
         result,
         requiredInParent,
       );
@@ -440,16 +508,29 @@ function collectTypeSpecBodyMetadata(
 
 function collectTypeSpecResponseSecrets(program: Program, httpOp: HttpOperation): string[] {
   const secrets = new Set<string>();
-  const visited = new Set<Type>();
 
-  function walk(type: Type | undefined, prefix = "", depth = 0): void {
-    if (!type || depth > 5 || visited.has(type)) {
+  function walk(type: Type | undefined, prefix = "", depth = 0, ancestors = new Set<Type>()): void {
+    if (!type || depth > 7 || ancestors.has(type)) {
       return;
     }
-    visited.add(type);
+    const branchAncestors = new Set(ancestors);
+    branchAncestors.add(type);
+
     if (type.kind === "Model") {
       if (isArrayModelType(program, type)) {
-        walk(type.indexer.value, prefix ? `${prefix}[]` : "[]", depth + 1);
+        const arrayPrefix = prefix ? `${prefix}[]` : "[]";
+        if (isSecret(program, type.indexer.value)) {
+          secrets.add(arrayPrefix);
+        }
+        walk(type.indexer.value, arrayPrefix, depth + 1, branchAncestors);
+        return;
+      }
+      if (isRecordModelType(program, type)) {
+        const recordPrefix = prefix ? `${prefix}.*` : "*";
+        if (isSecret(program, type.indexer.value)) {
+          secrets.add(recordPrefix);
+        }
+        walk(type.indexer.value, recordPrefix, depth + 1, branchAncestors);
         return;
       }
       for (const prop of walkPropertiesInherited(type)) {
@@ -462,11 +543,11 @@ function collectTypeSpecResponseSecrets(program: Program, httpOp: HttpOperation)
         ) {
           secrets.add(propPath);
         }
-        walk(prop.type, propPath, depth + 1);
+        walk(prop.type, propPath, depth + 1, branchAncestors);
       }
     } else if (type.kind === "Union") {
       for (const variant of type.variants.values()) {
-        walk(variant.type, prefix, depth);
+        walk(variant.type, prefix, depth, branchAncestors);
       }
     }
   }
@@ -635,6 +716,7 @@ export async function fetchProviderLiveMetadata(options: {
   });
   const base = options.armBaseUrl.replace(/\/+$/, "");
   const url = `${base}/subscriptions/${encodeURIComponent(options.subscriptionId)}/providers/${encodeURIComponent(options.providerNamespace)}?api-version=2021-04-01`;
+  assertTrustedArmOrigin(url, options.armBaseUrl);
   const resp = await fetch(url, {
     headers: {
       Accept: "application/json",
@@ -725,7 +807,10 @@ export async function discoverSpecInventory(
     const operationId = resolveCanonicalOperationId(tcgcContext, program, httpOp.operation);
     const sourceLocation = extractOperationSourceLocation(httpOp.operation);
 
-    const { providerNamespace, resourceType, depth } = extractProviderAndResource(pathTemplate);
+    const { providerNamespace, resourceType, depth } = extractProviderAndResource(
+      pathTemplate,
+      method,
+    );
     if (providerNamespace !== "Microsoft.Resources" && providerNamespace !== "Unknown.Provider") {
       detectedNamespace = providerNamespace;
     }
@@ -750,6 +835,11 @@ export async function discoverSpecInventory(
       }
       const desc = describeTypeSpecType(p.param.type);
       const format = getFormat(program, p.param) ?? getFormat(program, p.param.type);
+      const pattern = getPattern(program, p.param) ?? getPattern(program, p.param.type);
+      const minLength = getMinLength(program, p.param) ?? getMinLength(program, p.param.type);
+      const maxLength = getMaxLength(program, p.param) ?? getMaxLength(program, p.param.type);
+      const allowReserved =
+        p.type === "path" && "allowReserved" in p ? Boolean(p.allowReserved) : undefined;
       const isSecretParam =
         isSecret(program, p.param) ||
         isSecret(program, p.param.type) ||
@@ -764,6 +854,10 @@ export async function discoverSpecInventory(
         required: !p.param.optional,
         type: desc.typeName,
         format,
+        pattern,
+        minLength,
+        maxLength,
+        ...(allowReserved !== undefined ? { allowReserved } : {}),
         enumValues: desc.enumValues,
         readOnly: isReadonlyProperty(program, p.param),
         secretCandidate: isSecretParam,
@@ -774,7 +868,7 @@ export async function discoverSpecInventory(
     }
 
     const reqBody = httpOp.parameters.body;
-    if (reqBody && !isVoidType(reqBody.type)) {
+    if (reqBody && hasWireJsonBody(program, metadataInfo, reqBody.type, reqVisibility)) {
       const bodyParamName = resolveBodyParameterName(tcgcContext, reqBody.property);
       const bodyRequired = reqBody.property ? !reqBody.property.optional : true;
       const bodyMeta = collectTypeSpecBodyMetadata(
@@ -802,14 +896,18 @@ export async function discoverSpecInventory(
       }
 
       const bodyDesc = describeTypeSpecType(reqBody.type);
+      const isSecretBody =
+        (reqBody.property ? isSecret(program, reqBody.property) : false) ||
+        isSecret(program, reqBody.type);
+      if (isSecretBody) {
+        secretProperties.add(bodyParamName);
+      }
       paramSpecs.push({
         name: bodyParamName,
         in: "body",
         required: bodyRequired,
         type: bodyDesc.typeName,
-        secretCandidate:
-          (reqBody.property ? isSecret(program, reqBody.property) : false) ||
-          isSecret(program, reqBody.type),
+        secretCandidate: isSecretBody,
       });
     }
 
@@ -888,6 +986,37 @@ export async function discoverSpecInventory(
   }
 
   const allOperations = Object.values(operationsMap);
+
+  // Pair resource GET operations with their sibling PUT contracts so post-create GET round-trip
+  // mutability validation knows which properties were writable vs. read-only on PUT (#26 / #27).
+  for (const op of allOperations) {
+    if (op.method === "GET" && !op.pageable && op.writableBodyProperties.length === 0) {
+      const normalizedGetPath = op.pathTemplate.split("?")[0].replace(/\/+$/, "").toLowerCase();
+      const pairedPut =
+        allOperations.find(
+          (candidate) =>
+            candidate.method === "PUT" &&
+            candidate.pathTemplate.split("?")[0].replace(/\/+$/, "").toLowerCase() ===
+              normalizedGetPath,
+        ) ??
+        allOperations.find(
+          (candidate) =>
+            candidate.method === "PUT" &&
+            candidate.resourceType === op.resourceType &&
+            candidate.depth === op.depth,
+        );
+      if (pairedPut) {
+        op.writableBodyProperties = [...pairedPut.writableBodyProperties];
+        if (op.readOnlyBodyProperties.length === 0) {
+          op.readOnlyBodyProperties = [...pairedPut.readOnlyBodyProperties];
+        }
+        op.secretProperties = [
+          ...new Set([...op.secretProperties, ...pairedPut.secretProperties]),
+        ].sort();
+      }
+    }
+  }
+
   const executionOrder = computeTopologicalExecutionOrder(allOperations);
 
   const coverage: Record<string, OperationCoverageEntry> = {};
@@ -944,6 +1073,11 @@ export async function discoverSpecInventory(
     providerLiveMetadata,
     externalDependencies: [...externalDepsMap.values()],
     provisionedFixtures: [],
+    runtimeState: {
+      pathSlotValues: {},
+      putBodiesByResourceType: {},
+      listItemNamesByResourceType: {},
+    },
     executionOrder,
     operations: operationsMap,
     coverage,

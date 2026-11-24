@@ -43,6 +43,10 @@ export interface OperationParameterSpec {
   required: boolean;
   type?: string;
   format?: string;
+  pattern?: string;
+  minLength?: number;
+  maxLength?: number;
+  allowReserved?: boolean;
   enumValues?: string[];
   mutability?: string[];
   readOnly?: boolean;
@@ -138,6 +142,12 @@ export interface ProvisionedFixture {
   metadata?: Record<string, unknown>;
 }
 
+export interface LedgerRuntimeState {
+  pathSlotValues: Record<string, string>;
+  putBodiesByResourceType: Record<string, Record<string, unknown>>;
+  listItemNamesByResourceType: Record<string, string[]>;
+}
+
 export interface CoverageLedger {
   schemaVersion: "2.0-typespec";
   createdAt: string;
@@ -155,6 +165,7 @@ export interface CoverageLedger {
   providerLiveMetadata?: ProviderLiveMetadata;
   externalDependencies: ExternalDependencyHint[];
   provisionedFixtures: ProvisionedFixture[];
+  runtimeState?: LedgerRuntimeState;
   executionOrder: string[];
   operations: Record<string, OperationContract>;
   coverage: Record<string, OperationCoverageEntry>;
@@ -219,6 +230,7 @@ export interface ObservedLroBehavior {
   detected: boolean;
   detectionSignals: string[];
   pollCount: number;
+  completionStatus?: "not-applicable" | "succeeded" | "failed" | "timed_out";
   terminalProvisioningState?: string;
   pollingHeaderUsed?: "azure-asyncoperation" | "location" | "operation-location" | "resource-get";
   finalResultSource?:
@@ -234,12 +246,14 @@ export interface ProbeRequestInput {
   scenario?: string;
   expectError?: boolean;
   method?: HttpMethod;
-  pathOrUrl: string;
+  pathOrUrl?: string;
+  pathParams?: Record<string, string>;
   query?: Record<string, string>;
   headers?: Record<string, string>;
   body?: unknown;
   priorPutBody?: unknown;
   followNextLink?: boolean;
+  maxPaginationPages?: number;
   pollLro?: boolean;
   maxPollAttempts?: number;
   pollIntervalMs?: number;
@@ -250,6 +264,8 @@ export interface ProbeTrace {
   operationId: string;
   scenario: string;
   expectError: boolean;
+  probeSucceeded?: boolean;
+  failureReason?: string;
   typespecProjectDir: string;
   sourceLocation?: TypeSpecSourceLocation;
   apiVersion: string;

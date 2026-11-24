@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { extractProvisioningState, isNonTerminalProvisioningState } from "./analyze-behavior.ts";
 import {
   DISPOSABLE_RG_PREFIX,
   getActiveAzSubscriptionId,
@@ -67,6 +68,8 @@ export async function createDisposableResourceGroup(options: {
       },
     },
     safetyContext: {
+      trustedArmBaseUrl: ledger.armBaseUrl,
+      subscriptionId,
       disposableRgName: rgName,
       allowDisposableRgLifecycle: true,
     },
@@ -117,6 +120,8 @@ export async function deleteDisposableResourceGroup(options: {
     url,
     bearerToken: token,
     safetyContext: {
+      trustedArmBaseUrl: ledger.armBaseUrl,
+      subscriptionId: ledger.subscriptionId,
       disposableRgName: rg.name,
       allowDisposableRgLifecycle: true,
     },
@@ -160,6 +165,8 @@ export async function deleteDisposableResourceGroup(options: {
         url,
         bearerToken: token,
         safetyContext: {
+          trustedArmBaseUrl: ledger.armBaseUrl,
+          subscriptionId: ledger.subscriptionId,
           disposableRgName: rg.name,
           allowDisposableRgLifecycle: true,
         },
@@ -178,6 +185,7 @@ export async function deleteDisposableResourceGroup(options: {
 
 async function putArmFixtureAndWait(options: {
   armBaseUrl: string;
+  subscriptionId: string;
   resourcePathWithQuery: string;
   body: unknown;
   bearerToken: string;
@@ -188,6 +196,8 @@ async function putArmFixtureAndWait(options: {
   const base = options.armBaseUrl.replace(/\/+$/, "");
   const url = `${base}${options.resourcePathWithQuery}`;
   const safetyContext = {
+    trustedArmBaseUrl: options.armBaseUrl,
+    subscriptionId: options.subscriptionId,
     disposableRgName: options.disposableRgName,
     allowDisposableRgLifecycle: false,
   };
@@ -208,16 +218,26 @@ async function putArmFixtureAndWait(options: {
   }
 
   const asyncHeader =
-    initial.response.headers["azure-asyncoperation"] ?? initial.response.headers.location;
+    initial.response.headers["azure-asyncoperation"] ??
+    initial.response.headers["operation-location"] ??
+    initial.response.headers.location;
+  const initialProvState = extractProvisioningState(initial.response.body);
+  const needsPoll =
+    Boolean(asyncHeader) ||
+    initial.response.status === 202 ||
+    isNonTerminalProvisioningState(initialProvState);
+
   const pollIntervalMs = options.pollIntervalMs ?? 3000;
   const maxAttempts = options.maxPollAttempts ?? 40;
 
-  if (asyncHeader || initial.response.status === 202) {
+  if (needsPoll) {
     const pollUrl = asyncHeader
       ? /^https?:\/\//i.test(asyncHeader)
         ? asyncHeader
-        : `${base}${asyncHeader}`
+        : `${base}${asyncHeader.startsWith("/") ? "" : "/"}${asyncHeader}`
       : url;
+    let pollCompleted = false;
+
     for (let i = 0; i < maxAttempts; i++) {
       await delay(pollIntervalMs);
       const poll = await sendRawHttpExchange({
@@ -227,22 +247,43 @@ async function putArmFixtureAndWait(options: {
         bearerToken: options.bearerToken,
         safetyContext,
       });
-      const rec = (poll.response.body ?? {}) as Record<string, unknown>;
+      if (poll.response.status < 200 || poll.response.status >= 300) {
+        throw new Error(
+          `Fixture LRO poll failed (${options.resourcePathWithQuery}): HTTP ${poll.response.status} ${JSON.stringify(poll.response.body ?? "")}`,
+        );
+      }
+
+      const rec =
+        poll.response.body && typeof poll.response.body === "object"
+          ? (poll.response.body as Record<string, unknown>)
+          : {};
       const status =
         typeof rec.status === "string"
-          ? rec.status.toLowerCase()
-          : typeof (rec.properties as Record<string, unknown> | undefined)?.provisioningState ===
-              "string"
-            ? String((rec.properties as Record<string, unknown>).provisioningState).toLowerCase()
-            : undefined;
-      if (status === "succeeded" || (!asyncHeader && poll.response.status === 200 && !status)) {
-        break;
-      }
+          ? rec.status.trim().toLowerCase()
+          : extractProvisioningState(poll.response.body)?.toLowerCase();
+
       if (status === "failed" || status === "canceled") {
         throw new Error(
           `Fixture LRO failed (${options.resourcePathWithQuery}): ${JSON.stringify(poll.response.body ?? "")}`,
         );
       }
+      if (
+        status === "succeeded" ||
+        (!asyncHeader && poll.response.status === 200 && !isNonTerminalProvisioningState(status)) ||
+        (Boolean(initial.response.headers.location) &&
+          !initial.response.headers["azure-asyncoperation"] &&
+          poll.response.status !== 202 &&
+          !isNonTerminalProvisioningState(status))
+      ) {
+        pollCompleted = true;
+        break;
+      }
+    }
+
+    if (!pollCompleted) {
+      throw new Error(
+        `Fixture LRO timed out after ${maxAttempts} poll attempts (${options.resourcePathWithQuery}).`,
+      );
     }
   }
 
@@ -253,7 +294,27 @@ async function putArmFixtureAndWait(options: {
     bearerToken: options.bearerToken,
     safetyContext,
   });
-  return (finalGet.response.body ?? initial.response.body ?? {}) as Record<string, unknown>;
+  if (finalGet.response.status < 200 || finalGet.response.status >= 300) {
+    throw new Error(
+      `Fixture final GET failed (${options.resourcePathWithQuery}): HTTP ${finalGet.response.status} ${JSON.stringify(finalGet.response.body ?? "")}`,
+    );
+  }
+  const finalProv = extractProvisioningState(finalGet.response.body);
+  if (
+    isNonTerminalProvisioningState(finalProv) ||
+    finalProv?.toLowerCase() === "failed" ||
+    finalProv?.toLowerCase() === "canceled"
+  ) {
+    throw new Error(
+      `Fixture final GET returned non-ready provisioningState "${finalProv}" (${options.resourcePathWithQuery}).`,
+    );
+  }
+  if (!finalGet.response.body || typeof finalGet.response.body !== "object") {
+    throw new Error(
+      `Fixture final GET returned an empty or non-JSON resource body (${options.resourcePathWithQuery}).`,
+    );
+  }
+  return finalGet.response.body as Record<string, unknown>;
 }
 
 /**
@@ -292,6 +353,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-01-31`,
       body: { location },
       bearerToken: token,
@@ -313,6 +375,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.Network/virtualNetworks/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-11-01`,
       body: {
         location,
@@ -368,6 +431,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.Network/privateEndpoints/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: freshLedger.armBaseUrl,
+      subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-11-01`,
       body: {
         location,
@@ -406,6 +470,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.Storage/storageAccounts/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-05-01`,
       body: {
         location,
@@ -431,6 +496,7 @@ export async function provisionExternalFixture(options: {
     const resourcePath = `${rgPrefix}/providers/Microsoft.OperationalInsights/workspaces/${encodeURIComponent(name)}`;
     const body = await putArmFixtureAndWait({
       armBaseUrl: ledger.armBaseUrl,
+      subscriptionId: sub,
       resourcePathWithQuery: `${resourcePath}?api-version=2023-09-01`,
       body: {
         location,

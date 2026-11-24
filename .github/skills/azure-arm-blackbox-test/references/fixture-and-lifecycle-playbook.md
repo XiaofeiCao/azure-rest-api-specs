@@ -45,15 +45,14 @@ Achieving 100% operation coverage on an ARM service requires executing operation
 8. **Disposable Resource Group Teardown**:
    - Always finish with `cli.ts rg delete --work-dir <work-dir>`.
 
-## 2.Probe Request JSON Format
+## 2. Probe Request JSON Format
 
-Pass `--request-file <file.json>` to `cli.ts probe` for complex bodies or round-trip tracking:
+Pass `--request-file <file.json>` to `cli.ts probe`. `pathOrUrl` is optional—when omitted, `probe` deterministically interpolates `contract.pathTemplate` from `coverage-ledger.json` (`{subscriptionId}`, `{resourceGroupName}`, `{location}`, saved resource names, and `*_List*` child item names) and auto-attaches saved `priorPutBody` on `GET` probes. Supply `pathParams` only for ~10% semantic overrides (`key$label`, `/{scope}`, or secondary regions):
 
 ```json
 {
   "operationId": "ConfigurationStores_Create",
   "scenario": "StandardStore",
-  "pathOrUrl": "/subscriptions/<subId>/resourceGroups/<rgName>/providers/Microsoft.AppConfiguration/configurationStores/<storeName>",
   "body": {
     "location": "eastus",
     "sku": { "name": "Standard" },

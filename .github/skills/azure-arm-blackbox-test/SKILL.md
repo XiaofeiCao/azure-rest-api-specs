@@ -81,9 +81,9 @@ Follow the [lifecycle playbook](references/fixture-and-lifecycle-playbook.md):
 1. **Preflight discovery ops**: Run `Operations_List`, `CheckNameAvailability`, SKU/quota list operations first.
 2. **Negative error-envelope probe**: Before creating the parent resource, send one `GET` for the non-existent resource with `"expectError": true` and `"scenario": "not-found"` to validate the `404` OData v4 `{ error: { code, message } }` contract (`ERROR-ENVELOPE-DRIFT`).
 3. **Parent resource lifecycle**:
-   - `PUT` (`scenario: "create"` or `"min"` / `"max"`): Let `probe` automatically detect and poll LRO headers (`Azure-AsyncOperation`, `Location`, `Operation-Location`) or headerless non-terminal `provisioningState` transitions!
-   - `GET`: Pass `"priorPutBody"` in the request JSON file so the analyzer checks `ROUNDTRIP-MUTABILITY-DRIFT` in addition to `PUT` terminal state.
-   - `LIST` (by Resource Group and by Subscription): Automatically follows `nextLink` when present and checks `PAGEABLE-CONTRACT-DRIFT`.
+   - `PUT` (`scenario: "create"` or `"min"` / `"max"`): Omit `pathOrUrl` to let `probe` deterministically interpolate `contract.pathTemplate` from ledger context (`{subscriptionId}`, `{resourceGroupName}`, `{location}`, and `@pattern`-valid resource names) and automatically poll LRO headers (`Azure-AsyncOperation`, `Location`, `Operation-Location`) or headerless non-terminal `provisioningState` transitions! Pass `pathParams` only when semantic overrides are needed (e.g., `key$label` or `/{scope}`).
+   - `GET`: `probe` automatically reuses the created resource name and auto-attaches the saved `priorPutBody` from `PUT` so `ROUNDTRIP-MUTABILITY-DRIFT` is checked automatically without manual copy-paste.
+   - `LIST` (by Resource Group and by Subscription): Automatically traverses all `nextLink` continuation pages, validates every page, and harvests child item names (such as server-assigned `privateEndpointConnectionName`) for subsequent child probes.
    - `PATCH`: Test mutable tags/properties update and LRO behavior.
    - `POST` actions (e.g., `listKeys`, `regenerateKey`, custom actions): Verifies sync vs LRO behavior and `final-state-via` payload delivery (`LRO-FINAL-STATE-DRIFT`).
 4. **Child & extension resources**: Provision any dependent fixtures (such as a `private-endpoint` targeting the live parent resource so `PrivateEndpointConnections_List/Get/Put/Delete` can be exercised with real service state!), then run child `PUT` -> `GET` -> `LIST` -> `PATCH` -> `POST` -> `DELETE`.

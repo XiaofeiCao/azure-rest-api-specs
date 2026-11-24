@@ -161,6 +161,7 @@ export async function runCli(argv: string[]): Promise<void> {
         "request-file": { type: "string" },
         "operation-id": { type: "string" },
         path: { type: "string" },
+        "path-params": { type: "string" },
         scenario: { type: "string" },
         body: { type: "string" },
         "expect-error": { type: "boolean", default: false },
@@ -175,14 +176,17 @@ export async function runCli(argv: string[]): Promise<void> {
     if (values["request-file"]) {
       probeInput = JSON.parse(fs.readFileSync(values["request-file"], "utf8")) as ProbeRequestInput;
     } else {
-      if (!values["operation-id"] || !values.path) {
+      if (!values["operation-id"]) {
         throw new Error(
-          "probe requires either --request-file <json> or both --operation-id <id> and --path <armPath>",
+          "probe requires either --request-file <json> or --operation-id <id> (with optional --path <armPath> or --path-params <json>)",
         );
       }
       probeInput = {
         operationId: values["operation-id"],
-        pathOrUrl: values.path,
+        ...(values.path ? { pathOrUrl: values.path } : {}),
+        ...(values["path-params"]
+          ? { pathParams: JSON.parse(values["path-params"]) as Record<string, string> }
+          : {}),
         scenario: values.scenario,
         expectError: values["expect-error"],
         pollLro: !values["no-poll"],
@@ -199,6 +203,8 @@ export async function runCli(argv: string[]): Promise<void> {
         {
           operationId: trace.operationId,
           scenario: trace.scenario,
+          probeSucceeded: trace.probeSucceeded,
+          failureReason: trace.failureReason,
           sourceLocation: trace.sourceLocation,
           initialStatus: trace.exchanges[0]?.response.status,
           exchangeCount: trace.exchanges.length,

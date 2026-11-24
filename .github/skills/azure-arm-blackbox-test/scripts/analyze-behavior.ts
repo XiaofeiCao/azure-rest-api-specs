@@ -321,48 +321,75 @@ export function analyzeBehavioralDiscrepancies(
     }
   }
 
-  // 8. Pagination contract drift (`x-ms-pageable` vs actual response).
+  // 8. Pagination contract drift (`x-ms-pageable` vs actual response across initial & continuation pages).
   if (!expectError && isInitial2xx && contract.method === "GET") {
-    const respBody = initial.response.body;
-    if (contract.pageable) {
-      const itemField = contract.pageable.itemName || "value";
-      const items =
-        respBody && typeof respBody === "object" && !Array.isArray(respBody)
-          ? (respBody as Record<string, unknown>)[itemField]
-          : undefined;
-      if (!Array.isArray(items)) {
+    const pageExchanges = [initial, ...exchanges.filter((ex) => ex.step === "next-page")];
+    for (let pageIdx = 0; pageIdx < pageExchanges.length; pageIdx++) {
+      const pageEx = pageExchanges[pageIdx];
+      if (pageIdx > 0 && (pageEx.response.status < 200 || pageEx.response.status >= 300)) {
         discrepancies.push({
-          ruleId: DISCREPANCY_RULES.PAGEABLE_CONTRACT_DRIFT,
+          ruleId: DISCREPANCY_RULES.STATUS_CODE_DRIFT,
           severity: "blocking",
           operationId: contract.operationId,
-          summary: `Operation ${contract.operationId} declares x-ms-pageable (itemName="${itemField}"), but live response did not contain an array at "${itemField}".`,
-          specExpectation: `JSON object containing array property "${itemField}"${contract.pageable.nextLinkName ? ` and optional "${contract.pageable.nextLinkName}"` : ""}.`,
-          actualWireBehavior: Array.isArray(respBody)
-            ? `Service returned a bare top-level JSON array instead of { ${itemField}: [...] }.`
-            : `Response top-level keys: [${respBody && typeof respBody === "object" ? Object.keys(respBody).join(", ") : typeof respBody}].`,
+          sourceLocation: contract.sourceLocation,
+          summary: `Continuation page ${pageIdx + 1} on ${contract.operationId} failed with HTTP ${pageEx.response.status}.`,
+          specExpectation: `Every nextLink continuation page must return HTTP 200 matching the paged list schema.`,
+          actualWireBehavior: `Page ${pageIdx + 1} (${pageEx.request.url}) returned HTTP ${pageEx.response.status}.`,
           evidence: {
-            declaredPageable: contract.pageable,
+            pageIndex: pageIdx + 1,
+            status: pageEx.response.status,
+            url: pageEx.request.url,
+          },
+        });
+        continue;
+      }
+
+      const respBody = pageEx.response.body;
+      if (contract.pageable) {
+        const itemField = contract.pageable.itemName || "value";
+        const items =
+          respBody && typeof respBody === "object" && !Array.isArray(respBody)
+            ? (respBody as Record<string, unknown>)[itemField]
+            : undefined;
+        if (!Array.isArray(items)) {
+          discrepancies.push({
+            ruleId: DISCREPANCY_RULES.PAGEABLE_CONTRACT_DRIFT,
+            severity: "blocking",
+            operationId: contract.operationId,
+            sourceLocation: contract.sourceLocation,
+            summary: `Operation ${contract.operationId} declares x-ms-pageable (itemName="${itemField}"), but page ${pageIdx + 1} did not contain an array at "${itemField}".`,
+            specExpectation: `JSON object containing array property "${itemField}"${contract.pageable.nextLinkName ? ` and optional "${contract.pageable.nextLinkName}"` : ""}.`,
+            actualWireBehavior: Array.isArray(respBody)
+              ? `Page ${pageIdx + 1} returned a bare top-level JSON array instead of { ${itemField}: [...] }.`
+              : `Page ${pageIdx + 1} response top-level keys: [${respBody && typeof respBody === "object" ? Object.keys(respBody).join(", ") : typeof respBody}].`,
+            evidence: {
+              pageIndex: pageIdx + 1,
+              declaredPageable: contract.pageable,
+            },
+          });
+          break;
+        }
+      } else if (
+        pageIdx === 0 &&
+        respBody &&
+        typeof respBody === "object" &&
+        !Array.isArray(respBody) &&
+        Array.isArray((respBody as Record<string, unknown>).value) &&
+        typeof (respBody as Record<string, unknown>).nextLink === "string"
+      ) {
+        discrepancies.push({
+          ruleId: DISCREPANCY_RULES.PAGEABLE_CONTRACT_DRIFT,
+          severity: "warning",
+          operationId: contract.operationId,
+          sourceLocation: contract.sourceLocation,
+          summary: `Live response on ${contract.operationId} returned { value, nextLink } pagination, but spec omits x-ms-pageable.`,
+          specExpectation: `Non-pageable GET operation.`,
+          actualWireBehavior: `Response included "value" array and continuation "nextLink".`,
+          evidence: {
+            hasNextLink: true,
           },
         });
       }
-    } else if (
-      respBody &&
-      typeof respBody === "object" &&
-      !Array.isArray(respBody) &&
-      Array.isArray((respBody as Record<string, unknown>).value) &&
-      typeof (respBody as Record<string, unknown>).nextLink === "string"
-    ) {
-      discrepancies.push({
-        ruleId: DISCREPANCY_RULES.PAGEABLE_CONTRACT_DRIFT,
-        severity: "warning",
-        operationId: contract.operationId,
-        summary: `Live response on ${contract.operationId} returned { value, nextLink } pagination, but spec omits x-ms-pageable.`,
-        specExpectation: `Non-pageable GET operation.`,
-        actualWireBehavior: `Response included "value" array and continuation "nextLink".`,
-        evidence: {
-          hasNextLink: true,
-        },
-      });
     }
   }
 

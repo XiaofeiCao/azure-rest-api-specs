@@ -32,10 +32,25 @@ export function sanitizeStringValue(
   dotPath?: string,
   parentObject?: Record<string, unknown>,
 ): string {
-  // Check explicit secret property paths or secret key names first.
+  // Check explicit secret property paths (falling back to standalone parameter name for path/query/header scalars: #10 / #11)
+  // as well as wildcard dictionary paths (e.g., "credentials.*.value") and secret key-name heuristics.
   const secretPaths = new Set((ctx.extraSecretPropertyPaths ?? []).map((p) => p.toLowerCase()));
+  const candidatePath = (dotPath || propertyName || "").toLowerCase();
+  const matchesExplicitSecret =
+    Boolean(candidatePath) &&
+    (secretPaths.has(candidatePath) ||
+      (dotPath ? secretPaths.has(dotPath.toLowerCase()) : false) ||
+      (propertyName && !dotPath ? secretPaths.has(propertyName.toLowerCase()) : false) ||
+      [...secretPaths].some((sp) => {
+        if (!sp.includes("*")) {
+          return false;
+        }
+        const wildcardRe = new RegExp(`^${sp.split("*").map(escapeRegExp).join("[^.]+")}$`, "i");
+        return wildcardRe.test(candidatePath);
+      }));
+
   if (
-    (dotPath && secretPaths.has(dotPath.toLowerCase())) ||
+    matchesExplicitSecret ||
     (propertyName &&
       (SECRET_KEY_NAME_RE.test(propertyName) || SECRET_SUBSTRING_KEY_RE.test(propertyName)))
   ) {

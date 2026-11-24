@@ -6,9 +6,11 @@ import {
   getMaxItems,
   getMaxLength,
   getMaxValue,
+  getMaxValueExclusive,
   getMinItems,
   getMinLength,
   getMinValue,
+  getMinValueExclusive,
   getPattern,
   isArrayModelType,
   isNullType,
@@ -499,7 +501,7 @@ function validateModelValue(
       continue;
     }
 
-    // Check property-level string/array constraints before recursing into prop.type.
+    // Check property-level string/numeric/array constraints before recursing into prop.type (#28 / #29).
     if (typeof propVal === "string") {
       const pMinLen = getMinLength(ctx.program, prop);
       if (pMinLen !== undefined && propVal.length < pMinLen) {
@@ -515,6 +517,58 @@ function validateModelValue(
         ctx.issues.push({
           code: "MAX_LENGTH_VIOLATION",
           message: `Property "${wireName}" length ${propVal.length} exceeds @maxLength(${pMaxLen}) at ${jsonPath}.${wireName}.`,
+          path: `${jsonPath}.${wireName}`,
+          severity: "error",
+        });
+      }
+      const pPattern = getPattern(ctx.program, prop);
+      if (pPattern !== undefined) {
+        try {
+          if (!new RegExp(pPattern).test(propVal)) {
+            ctx.issues.push({
+              code: "PATTERN_VIOLATION",
+              message: `Property "${wireName}" value ${JSON.stringify(propVal)} does not match @pattern(${JSON.stringify(pPattern)}) at ${jsonPath}.${wireName}.`,
+              path: `${jsonPath}.${wireName}`,
+              severity: "error",
+            });
+          }
+        } catch {
+          // Ignore invalid regex patterns in upstream specs.
+        }
+      }
+    } else if (typeof propVal === "number" && Number.isFinite(propVal)) {
+      const pMinVal = getMinValue(ctx.program, prop);
+      if (pMinVal !== undefined && propVal < pMinVal) {
+        ctx.issues.push({
+          code: "MIN_VALUE_VIOLATION",
+          message: `Property "${wireName}" value ${propVal} is less than @minValue(${pMinVal}) at ${jsonPath}.${wireName}.`,
+          path: `${jsonPath}.${wireName}`,
+          severity: "error",
+        });
+      }
+      const pMaxVal = getMaxValue(ctx.program, prop);
+      if (pMaxVal !== undefined && propVal > pMaxVal) {
+        ctx.issues.push({
+          code: "MAX_VALUE_VIOLATION",
+          message: `Property "${wireName}" value ${propVal} exceeds @maxValue(${pMaxVal}) at ${jsonPath}.${wireName}.`,
+          path: `${jsonPath}.${wireName}`,
+          severity: "error",
+        });
+      }
+      const pMinEx = getMinValueExclusive(ctx.program, prop);
+      if (pMinEx !== undefined && propVal <= pMinEx) {
+        ctx.issues.push({
+          code: "MIN_VALUE_EXCLUSIVE_VIOLATION",
+          message: `Property "${wireName}" value ${propVal} must be > @minValueExclusive(${pMinEx}) at ${jsonPath}.${wireName}.`,
+          path: `${jsonPath}.${wireName}`,
+          severity: "error",
+        });
+      }
+      const pMaxEx = getMaxValueExclusive(ctx.program, prop);
+      if (pMaxEx !== undefined && propVal >= pMaxEx) {
+        ctx.issues.push({
+          code: "MAX_VALUE_EXCLUSIVE_VIOLATION",
+          message: `Property "${wireName}" value ${propVal} must be < @maxValueExclusive(${pMaxEx}) at ${jsonPath}.${wireName}.`,
           path: `${jsonPath}.${wireName}`,
           severity: "error",
         });
@@ -645,6 +699,33 @@ export function validateValueAgainstType(
   }
 }
 
+function hasWireJsonPayload(
+  program: Program,
+  metadataInfo: MetadataInfo,
+  type: Type | undefined,
+  visibility: Visibility,
+): boolean {
+  if (!type || isVoidType(type)) {
+    return false;
+  }
+  if (type.kind !== "Model") {
+    return true;
+  }
+  if (
+    isArrayModelType(program, type) ||
+    isRecordModelType(program, type) ||
+    Boolean(type.indexer)
+  ) {
+    return true;
+  }
+  for (const prop of walkPropertiesInherited(type)) {
+    if (metadataInfo.isPayloadProperty(prop, visibility)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function matchHttpResponseForStatus(
   responses: HttpOperationResponse[],
   statusCode: number,
@@ -738,7 +819,7 @@ export function validateWireExchangeAgainstTypeSpec(
     }
 
     const reqBody = httpOp.parameters.body;
-    if (reqBody && !isVoidType(reqBody.type)) {
+    if (reqBody && hasWireJsonPayload(service.program, metadataInfo, reqBody.type, reqVisibility)) {
       const bodyOptional = reqBody.property ? reqBody.property.optional : false;
       if (exchange.request.body === undefined) {
         if (!bodyOptional) {
@@ -765,9 +846,13 @@ export function validateWireExchangeAgainstTypeSpec(
     activePairs: new Set(),
   };
 
-  // For final-get on PUT/PATCH, find the matching GET operation on the same route if available, else validate against 200 response of httpOp.
+  // For follow-up resource GETs on PUT/PATCH (final-get or resource-get poll), find the matching GET operation on the same route if available.
   let targetRespOp = httpOp;
-  if (exchange.step === "final-get" && exchange.request.method === "GET" && httpOp.verb !== "get") {
+  if (
+    (exchange.step === "final-get" || exchange.step === "poll") &&
+    exchange.request.method === "GET" &&
+    (httpOp.verb === "put" || httpOp.verb === "patch")
+  ) {
     const siblingGet = service.httpOperations.find(
       (candidate) => candidate.verb === "get" && candidate.path === httpOp.path,
     );
@@ -779,8 +864,38 @@ export function validateWireExchangeAgainstTypeSpec(
   const matchedResp = matchHttpResponseForStatus(targetRespOp.responses, exchange.response.status);
   if (matchedResp) {
     const respBody = matchedResp.responses.find((c) => c.body !== undefined)?.body;
-    if (respBody && !isVoidType(respBody.type) && exchange.response.body !== undefined) {
-      validateValueAgainstType(exchange.response.body, respBody.type, "$.response.body", respCtx);
+    const allowsEmptyBody =
+      matchedResp.responses.length === 0 ||
+      matchedResp.responses.some(
+        (c) =>
+          !c.body ||
+          isVoidType(c.body.type) ||
+          isNullType(c.body.type) ||
+          Boolean(c.body.property?.optional) ||
+          (c.body.type.kind === "Union" &&
+            [...c.body.type.variants.values()].some(
+              (v) => isVoidType(v.type) || isNullType(v.type),
+            )),
+      );
+
+    if (respBody && !isVoidType(respBody.type)) {
+      if (exchange.response.body !== undefined) {
+        validateValueAgainstType(exchange.response.body, respBody.type, "$.response.body", respCtx);
+      } else if (exchange.response.rawTextSnippet !== undefined) {
+        respCtx.issues.push({
+          code: "INVALID_JSON_RESPONSE_BODY",
+          message: `HTTP ${exchange.response.status} on "${operationId}" (${exchange.step}) returned non-JSON text when TypeSpec declares a JSON response model.`,
+          path: "$.response.body",
+          severity: "error",
+        });
+      } else if (!allowsEmptyBody) {
+        respCtx.issues.push({
+          code: "MISSING_REQUIRED_RESPONSE_BODY",
+          message: `HTTP ${exchange.response.status} on "${operationId}" (${exchange.step}) returned an empty body, but TypeSpec requires a response body.`,
+          path: "$.response.body",
+          severity: "error",
+        });
+      }
     }
   }
 
@@ -846,7 +961,7 @@ export function validateExampleAgainstTypeSpec(
   }
 
   const reqBody = httpOp.parameters.body;
-  if (reqBody && !isVoidType(reqBody.type)) {
+  if (reqBody && hasWireJsonPayload(service.program, metadataInfo, reqBody.type, reqVisibility)) {
     const bodyParamName = resolveBodyParameterName(service.tcgcContext, reqBody.property);
     const bodyVal = params[bodyParamName] ?? params.parameters ?? params.resource ?? params.body;
     const bodyOptional = reqBody.property ? reqBody.property.optional : false;
@@ -891,6 +1006,20 @@ export function validateExampleAgainstTypeSpec(
 
     const declaredBody = matchedResp.responses.find((c) => c.body !== undefined)?.body;
     const hasDeclaredBody = Boolean(declaredBody && !isVoidType(declaredBody.type));
+    const allowsEmptyBody =
+      matchedResp.responses.length === 0 ||
+      matchedResp.responses.some(
+        (c) =>
+          !c.body ||
+          isVoidType(c.body.type) ||
+          isNullType(c.body.type) ||
+          Boolean(c.body.property?.optional) ||
+          (c.body.type.kind === "Union" &&
+            [...c.body.type.variants.values()].some(
+              (v) => isVoidType(v.type) || isNullType(v.type),
+            )),
+      );
+
     if (!hasDeclaredBody && respEntry?.body !== undefined) {
       issues.push({
         code: "RESPONSE_SCHEMA_NOT_IN_TYPESPEC",
@@ -901,22 +1030,33 @@ export function validateExampleAgainstTypeSpec(
       continue;
     }
 
-    if (hasDeclaredBody && declaredBody && respEntry?.body !== undefined) {
-      const respCtx: ValidationContext = {
-        program: service.program,
-        metadataInfo,
-        visibility: Visibility.Read,
-        isPatchImplicitOptional: false,
-        strictEnumCase: true,
-        issues,
-        activePairs: new Set(),
-      };
-      validateValueAgainstType(
-        respEntry.body,
-        declaredBody.type,
-        `$.responses.${statusKey}.body`,
-        respCtx,
-      );
+    if (hasDeclaredBody && declaredBody) {
+      if (respEntry?.body === undefined) {
+        if (!allowsEmptyBody) {
+          issues.push({
+            code: "MISSING_EXAMPLE_RESPONSE_BODY",
+            message: `Example response status "${statusKey}" on "${operationId}" omits required response body.`,
+            path: `$.responses.${statusKey}.body`,
+            severity: "error",
+          });
+        }
+      } else {
+        const respCtx: ValidationContext = {
+          program: service.program,
+          metadataInfo,
+          visibility: Visibility.Read,
+          isPatchImplicitOptional: false,
+          strictEnumCase: true,
+          issues,
+          activePairs: new Set(),
+        };
+        validateValueAgainstType(
+          respEntry.body,
+          declaredBody.type,
+          `$.responses.${statusKey}.body`,
+          respCtx,
+        );
+      }
     }
   }
 

@@ -281,7 +281,13 @@ function renderMarkdownReport(report: BlackboxSummaryReport): string {
   );
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const op of report.operations) {
-    const note = op.blockerReason ? op.blockerReason.replace(/\|/g, "\\|").slice(0, 100) : "";
+    const note = op.blockerReason
+      ? op.blockerReason
+          .slice(0, 100)
+          .replace(/\\/g, "\\\\")
+          .replace(/\|/g, "\\|")
+          .replace(/\r?\n/g, " ")
+      : "";
     lines.push(
       `| \`${op.operationId}\` | ${op.sourceLocation ? `\`${op.sourceLocation}\`` : "-"} | \`${op.method}\` | ${op.phase} | \`${op.status}\` | ${op.lastHttpStatus ?? "-"} | ${op.discrepancyCount} | ${op.generatedExamplesCount} | ${note} |`,
     );

@@ -113,31 +113,90 @@ export function isValidDisposableRgName(rgName: string): boolean {
 }
 
 export interface SafetyGuardContext {
+  trustedArmBaseUrl?: string;
+  subscriptionId?: string;
   disposableRgName?: string;
   ownedResourceNames?: string[];
   allowDisposableRgLifecycle?: boolean;
 }
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
 /**
- * Enforces hard-coded write protection so mutating ARM requests can never alter
- * resources outside the session's disposable test Resource Group.
+ * Validates that a target URL matches the configured trusted ARM origin and uses HTTPS
+ * (allowing loopback HTTP only when trustedArmBaseUrl itself is explicitly configured to that loopback origin).
+ */
+export function assertTrustedArmOrigin(targetUrl: string, trustedArmBaseUrl?: string): URL {
+  const parsed = new URL(targetUrl);
+  if (parsed.username || parsed.password) {
+    throw new Error(`Blocked request with embedded URL credentials: ${parsed.origin}`);
+  }
+
+  const expectedBase = new URL(
+    (trustedArmBaseUrl ?? "https://management.azure.com").replace(/\/+$/, ""),
+  );
+  if (parsed.origin.toLowerCase() !== expectedBase.origin.toLowerCase()) {
+    throw new Error(
+      `Blocked request to untrusted origin "${parsed.origin}": requests carrying ARM Bearer tokens must match "${expectedBase.origin}".`,
+    );
+  }
+
+  const isExplicitLoopbackTest =
+    expectedBase.protocol === "http:" &&
+    LOOPBACK_HOSTS.has(expectedBase.hostname.toLowerCase()) &&
+    LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase());
+
+  if (parsed.protocol !== "https:" && !isExplicitLoopbackTest) {
+    throw new Error(
+      `Blocked insecure transport "${parsed.protocol}" for ARM target "${parsed.origin}": HTTPS is required.`,
+    );
+  }
+
+  return parsed;
+}
+
+/**
+ * Enforces hard-coded origin, subscription, and write protection so ARM requests
+ * never leak tokens off-origin or mutate resources outside the session's disposable test Resource Group.
  */
 export function assertSafeArmTarget(
   method: string,
   targetUrl: string,
   ctx: SafetyGuardContext,
 ): void {
+  const parsed = assertTrustedArmOrigin(targetUrl, ctx.trustedArmBaseUrl);
   const upperMethod = method.toUpperCase();
   if (upperMethod === "GET" || upperMethod === "HEAD" || upperMethod === "OPTIONS") {
     return;
   }
 
-  const parsed = new URL(targetUrl);
   const pathname = decodeURIComponent(parsed.pathname).replace(/\/+$/, "");
+  const subSegmentMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(pathname);
 
   // Non-destructive ARM name-availability checks are subscription/provider scoped POSTs.
   if (upperMethod === "POST" && /\/checknameavailability$/i.test(pathname)) {
+    if (
+      subSegmentMatch &&
+      ctx.subscriptionId &&
+      subSegmentMatch[1].toLowerCase() !== ctx.subscriptionId.toLowerCase()
+    ) {
+      throw new Error(
+        `Blocked ${upperMethod} targeting subscription "${subSegmentMatch[1]}": expected "${ctx.subscriptionId}".`,
+      );
+    }
     return;
+  }
+
+  if (!ctx.subscriptionId) {
+    throw new Error(
+      `Blocked mutating ${upperMethod} request to ${pathname}: expected subscriptionId is missing from SafetyGuardContext.`,
+    );
+  }
+
+  if (!subSegmentMatch || subSegmentMatch[1].toLowerCase() !== ctx.subscriptionId.toLowerCase()) {
+    throw new Error(
+      `Blocked mutating ${upperMethod} targeting subscription "${subSegmentMatch?.[1] ?? "<none>"}": mutations are strictly confined to subscription "${ctx.subscriptionId}".`,
+    );
   }
 
   if (!ctx.disposableRgName) {
@@ -176,7 +235,7 @@ export function assertSafeArmTarget(
     );
   }
 
-  // Subscription/location-scoped soft-delete purge/recover ONLY for resource names created inside our disposable RG.
+  // Subscription/location-scoped soft-delete purge/recover ONLY for recorded ownedResourceNames created inside our disposable RG.
   const softDeleteMatch =
     /^\/subscriptions\/[^/]+\/providers\/[^/]+\/locations\/[^/]+\/deleted[^/]+\/([^/]+)(?:\/purge)?$/i.exec(
       pathname,
@@ -184,9 +243,12 @@ export function assertSafeArmTarget(
   if (softDeleteMatch && (upperMethod === "POST" || upperMethod === "DELETE")) {
     const targetName = softDeleteMatch[1].toLowerCase();
     const owned = new Set((ctx.ownedResourceNames ?? []).map((n) => n.toLowerCase()));
-    if (owned.has(targetName) || targetName.startsWith("bbx")) {
+    if (owned.has(targetName)) {
       return;
     }
+    throw new Error(
+      `Blocked soft-delete ${upperMethod} on unowned resource "${softDeleteMatch[1]}": resource is not recorded in ownedResourceNames.`,
+    );
   }
 
   throw new Error(
@@ -194,10 +256,18 @@ export function assertSafeArmTarget(
   );
 }
 
-export function redactHeaders(headers: Record<string, string>): Record<string, string> {
+export function redactHeaders(
+  headers: Record<string, string>,
+  extraSensitiveNames?: Iterable<string>,
+): Record<string, string> {
+  const extraLower = new Set<string>();
+  for (const name of extraSensitiveNames ?? []) {
+    extraLower.add(name.toLowerCase());
+  }
   const sanitized: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
-    if (SENSITIVE_HEADER_NAMES.has(key.toLowerCase())) {
+    const lowerKey = key.toLowerCase();
+    if (SENSITIVE_HEADER_NAMES.has(lowerKey) || extraLower.has(lowerKey)) {
       sanitized[key] = "<redacted>";
     } else {
       sanitized[key] = value;
@@ -212,6 +282,7 @@ export interface SendRawRequestOptions {
   url: string;
   bearerToken: string;
   headers?: Record<string, string>;
+  extraSensitiveHeaders?: string[];
   body?: unknown;
   safetyContext: SafetyGuardContext;
   timeoutMs?: number;
@@ -270,12 +341,12 @@ export async function sendRawHttpExchange(
     request: {
       method: options.method.toUpperCase(),
       url: options.url,
-      headers: redactHeaders(requestHeaders),
+      headers: redactHeaders(requestHeaders, options.extraSensitiveHeaders),
       ...(options.body !== undefined ? { body: options.body } : {}),
     },
     response: {
       status: response.status,
-      headers: redactHeaders(responseHeaders),
+      headers: redactHeaders(responseHeaders, options.extraSensitiveHeaders),
       ...(parsedBody !== undefined ? { body: parsedBody } : {}),
       ...(rawTextSnippet !== undefined ? { rawTextSnippet } : {}),
     },

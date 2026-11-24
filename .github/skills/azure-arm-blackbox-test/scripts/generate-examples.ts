@@ -135,7 +135,11 @@ export function buildXMsExampleFromTrace(
         parameters[paramSpec.name] = sanitizePayload(headerVal, sanitizeCtx, paramSpec.name);
       }
     } else if (paramSpec.in === "body" && initial.request.body !== undefined) {
-      parameters[paramSpec.name] = sanitizePayload(initial.request.body, sanitizeCtx);
+      parameters[paramSpec.name] = sanitizePayload(
+        initial.request.body,
+        sanitizeCtx,
+        paramSpec.secretCandidate ? paramSpec.name : undefined,
+      );
     }
   }
 
@@ -183,19 +187,28 @@ export function buildXMsExampleFromTrace(
     } else if (
       contract.method === "DELETE" &&
       initialCode === "202" &&
+      trace.observedLro.completionStatus === "succeeded" &&
       (contract.declaredStatusCodes.includes("200") || contract.declaredStatusCodes.includes("204"))
     ) {
-      const terminalDeleteCode = contract.declaredStatusCodes.includes("200") ? "200" : "204";
-      responses[terminalDeleteCode] = {};
+      const terminalDeleteCode =
+        contract.declaredStatusCodes.includes("204") &&
+        contract.declaredResponseHasSchema?.["204"] === false
+          ? "204"
+          : contract.declaredStatusCodes.includes("200") &&
+              contract.declaredResponseHasSchema?.["200"] === false
+            ? "200"
+            : undefined;
+      if (terminalDeleteCode) {
+        responses[terminalDeleteCode] = {};
+      }
     } else if (
       contract.method === "POST" &&
       initialCode === "202" &&
+      trace.observedLro.completionStatus === "succeeded" &&
       lastPoll &&
       lastPoll.response.status === 200 &&
       contract.declaredStatusCodes.includes("200")
     ) {
-      // Only include status-monitor body as 200 if operation expects a 200 body matching the final output;
-      // for void POST LROs with 200/204 terminal status, omit monitor wrapper if finalResultSource === "none".
       if (
         trace.observedLro.finalResultSource === "location-body" &&
         lastPoll.response.body !== undefined
@@ -203,7 +216,22 @@ export function buildXMsExampleFromTrace(
         responses["200"] = {
           body: sanitizePayload(lastPoll.response.body, sanitizeCtx),
         };
-      } else if (trace.observedLro.finalResultSource === "none") {
+      } else if (
+        trace.observedLro.finalResultSource === "status-monitor-body" &&
+        lastPoll.response.body &&
+        typeof lastPoll.response.body === "object"
+      ) {
+        const monitorObj = lastPoll.response.body as Record<string, unknown>;
+        const extractedResult = monitorObj.result ?? monitorObj.properties;
+        if (extractedResult !== undefined) {
+          responses["200"] = {
+            body: sanitizePayload(extractedResult, sanitizeCtx),
+          };
+        }
+      } else if (
+        trace.observedLro.finalResultSource === "none" &&
+        contract.declaredResponseHasSchema?.["200"] === false
+      ) {
         responses["200"] = {};
       }
     }
@@ -244,10 +272,20 @@ export async function generateLiveExamples(
   const ledger = loadLedger(options.workDir);
   const allTraces = loadAllProbeTraces(options.workDir);
 
-  // Group successful positive traces by (operationId, scenario), keeping the latest successful trace.
+  // Group completed, successful positive traces by (operationId, scenario), keeping the latest successful trace (#19 / #20).
   const selectedTraces = new Map<string, ProbeTrace>();
   for (const trace of allTraces) {
     if (trace.expectError) {
+      continue;
+    }
+    if (trace.probeSucceeded === false) {
+      continue;
+    }
+    if (
+      trace.observedLro.detected &&
+      trace.observedLro.completionStatus !== undefined &&
+      trace.observedLro.completionStatus !== "succeeded"
+    ) {
       continue;
     }
     const initial = trace.exchanges[0];

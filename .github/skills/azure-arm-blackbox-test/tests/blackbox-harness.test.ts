@@ -9,11 +9,12 @@ import { generateLiveExamples } from "../scripts/generate-examples.ts";
 import {
   createDisposableResourceGroup,
   deleteDisposableResourceGroup,
+  provisionExternalFixture,
 } from "../scripts/manage-rg.ts";
 import { discoverSpecInventory } from "../scripts/plan-inventory.ts";
 import { buildSummaryReport } from "../scripts/render-report.ts";
 import { sanitizePayload } from "../scripts/sanitize-example.ts";
-import { DISCREPANCY_RULES } from "../scripts/types.ts";
+import { DISCREPANCY_RULES, type CoverageLedger } from "../scripts/types.ts";
 
 const REAL_SUB_ID = "87654321-4321-4321-4321-210987654321";
 const MOCK_TOKEN = "mock-bearer-token-value";
@@ -134,14 +135,16 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     }
   });
 
-  it("enforces disposable Resource Group write guardrails strictly", () => {
+  it("enforces origin, subscription, ownership, and disposable Resource Group guardrails strictly", () => {
     const ctx = {
+      trustedArmBaseUrl: "https://management.azure.com",
+      subscriptionId: REAL_SUB_ID,
       disposableRgName: "rg-arm-blackbox-appconfig-abc123",
       ownedResourceNames: ["bbx-store-01"],
       allowDisposableRgLifecycle: false,
     };
 
-    // Read-only calls anywhere are permitted.
+    // Read-only calls on the trusted ARM HTTPS origin are permitted.
     expect(() =>
       assertSafeArmTarget(
         "GET",
@@ -150,7 +153,19 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       ),
     ).not.toThrow();
 
-    // Non-destructive checkNameAvailability POST is permitted.
+    // Off-origin GETs (e.g. malicious Location / nextLink) and plaintext HTTP are blocked before attaching Bearer token (#4)!
+    expect(() =>
+      assertSafeArmTarget("GET", "https://attacker.example.com/nextLink?page=2", ctx),
+    ).toThrow(/untrusted origin/);
+    expect(() =>
+      assertSafeArmTarget(
+        "GET",
+        `http://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.AppConfiguration/operations`,
+        ctx,
+      ),
+    ).toThrow(/untrusted origin|HTTPS is required/);
+
+    // Non-destructive checkNameAvailability POST is permitted on matching subscription.
     expect(() =>
       assertSafeArmTarget(
         "POST",
@@ -159,7 +174,7 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       ),
     ).not.toThrow();
 
-    // Mutations inside the disposable RG are permitted.
+    // Mutations inside the disposable RG and matching subscription are permitted.
     expect(() =>
       assertSafeArmTarget(
         "PUT",
@@ -168,7 +183,16 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       ),
     ).not.toThrow();
 
-    // Soft-delete purge of an owned test resource is permitted, but blocked for non-owned resources!
+    // Cross-subscription DELETE with the same disposable RG name is blocked (#2)!
+    expect(() =>
+      assertSafeArmTarget(
+        "DELETE",
+        "https://management.azure.com/subscriptions/00000000-9999-9999-9999-999999999999/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.AppConfiguration/configurationStores/bbx-store-01?api-version=2024-06-01",
+        ctx,
+      ),
+    ).toThrow(/strictly confined to subscription/);
+
+    // Soft-delete purge of a recorded ownedResourceNames entry is permitted, while unrecorded "bbx-production" is blocked (#3)!
     expect(() =>
       assertSafeArmTarget(
         "POST",
@@ -180,10 +204,18 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     expect(() =>
       assertSafeArmTarget(
         "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.AppConfiguration/locations/eastus/deletedConfigurationStores/bbx-production/purge?api-version=2024-06-01`,
+        ctx,
+      ),
+    ).toThrow(/not recorded in ownedResourceNames/);
+
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
         `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.AppConfiguration/locations/eastus/deletedConfigurationStores/customer-prod-store/purge?api-version=2024-06-01`,
         ctx,
       ),
-    ).toThrow(/Blocked mutating POST/);
+    ).toThrow(/Blocked (?:mutating|soft-delete) POST/);
 
     // Mutations targeting another RG are blocked!
     expect(() =>
@@ -224,6 +256,8 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     const idxOpsList = ledger.executionOrder.indexOf("Operations_List");
     const idxStoreCreate = ledger.executionOrder.indexOf("ConfigurationStores_Create");
     const idxKeyValCreate = ledger.executionOrder.indexOf("KeyValues_CreateOrUpdate");
+    const idxReplicaCreate = ledger.executionOrder.indexOf("Replicas_Create");
+    const idxReplicaList = ledger.executionOrder.indexOf("Replicas_ListByConfigurationStore");
     const idxKeyValDelete = ledger.executionOrder.indexOf("KeyValues_Delete");
     const idxStoreDelete = ledger.executionOrder.indexOf("ConfigurationStores_Delete");
     const idxPurgeDeleted = ledger.executionOrder.indexOf("ConfigurationStores_PurgeDeleted");
@@ -232,6 +266,13 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
     expect(idxPurgeDeleted).toBeGreaterThanOrEqual(0);
     expect(idxOpsList).toBeLessThan(idxStoreCreate);
     expect(idxStoreCreate).toBeLessThan(idxKeyValCreate);
+    // Child GET collection retains depth=2 and sorts AFTER child creation (#25)!
+    expect(ledger.operations.Replicas_ListByConfigurationStore.depth).toBe(2);
+    expect(idxReplicaCreate).toBeLessThan(idxReplicaList);
+    // Resource GET inherits paired PUT writableBodyProperties for round-trip checks (#26/#27)!
+    expect(ledger.operations.ConfigurationStores_Get.writableBodyProperties.length).toBeGreaterThan(
+      0,
+    );
     // Child DELETE runs BEFORE parent DELETE!
     expect(idxKeyValDelete).toBeLessThan(idxStoreDelete);
     // Soft-deleted purge runs AFTER parent DELETE!
@@ -610,5 +651,519 @@ describe("azure-arm-blackbox-test TypeSpec-native harness", () => {
       true,
     );
     expect(fs.existsSync(markdownPath)).toBe(true);
+  });
+
+  it("auto-interpolates URL slots + priorPutBody and enforces all V2 security, LRO, multi-page, secret, and AST constraint rules", async () => {
+    const tempRoot = makeTempDir();
+    const projectDir = path.join(tempRoot, "V2Vault.Management");
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "tspconfig.yaml"), "{}\n", "utf8");
+
+    const v2Tsp = `
+import "@typespec/http";
+import "@typespec/rest";
+import "@typespec/versioning";
+import "@typespec/openapi";
+import "@azure-tools/typespec-azure-core";
+import "@azure-tools/typespec-azure-resource-manager";
+
+using TypeSpec.Http;
+using TypeSpec.Rest;
+using TypeSpec.Versioning;
+using TypeSpec.OpenAPI;
+using Azure.Core;
+using Azure.ResourceManager;
+
+@armProviderNamespace
+@service(#{ title: "V2VaultClient" })
+@versioned(Versions)
+@armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v5)
+namespace Microsoft.V2Vault;
+
+enum Versions {
+  v2025_03_01: "2025-03-01",
+}
+
+model CredentialItem {
+  @secret
+  opaqueMaterial: string;
+}
+
+model VaultProperties {
+  @minValue(3600)
+  @maxValue(86400)
+  retentionSeconds?: int32;
+  persistedFlag?: string;
+  primaryCred?: CredentialItem;
+  secondaryCred?: CredentialItem;
+  credList?: CredentialItem[];
+  @visibility(Lifecycle.Read)
+  provisioningState?: ResourceProvisioningState;
+}
+
+model Vault is TrackedResource<VaultProperties> {
+  ...ResourceNameParameter<Vault>;
+}
+
+model ConnectionProperties {
+  status?: string;
+  @visibility(Lifecycle.Read)
+  provisioningState?: ResourceProvisioningState;
+}
+
+@parentResource(Vault)
+model PrivateConn is ProxyResource<ConnectionProperties> {
+  ...ResourceNameParameter<PrivateConn>;
+}
+
+model BackupOutput {
+  archiveUri: string;
+}
+
+@armResourceOperations
+interface Vaults {
+  @operationId("Vaults_Get")
+  get is ArmResourceRead<Vault>;
+
+  @operationId("Vaults_CreateOrUpdate")
+  createOrUpdate is ArmResourceCreateOrReplaceAsync<Vault>;
+
+  @operationId("Vaults_ListByResourceGroup")
+  listByResourceGroup is ArmResourceListByParent<Vault>;
+
+  @operationId("Vaults_Delete")
+  delete is ArmResourceDeleteWithoutOkAsync<Vault>;
+
+  @operationId("Vaults_Backup")
+  backup is ArmResourceActionAsync<
+    Vault,
+    {
+      @header("x-custom-credential") @secret customCredential: string;
+    },
+    BackupOutput
+  >;
+}
+
+@armResourceOperations
+interface PrivateConns {
+  @operationId("PrivateConns_ListByVault")
+  listByVault is ArmResourceListByParent<PrivateConn>;
+
+  @operationId("PrivateConns_Get")
+  get is ArmResourceRead<PrivateConn>;
+}
+`;
+    fs.writeFileSync(path.join(projectDir, "main.tsp"), `${v2Tsp.trim()}\n`, "utf8");
+
+    const workDir = path.join(tempRoot, "work-v2");
+    let baseUrl = "";
+    let createdVaultName = "";
+    let emptyGetMode = false;
+    const failDeleteLro = true;
+    let slowFixtureMode = true;
+
+    const server = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url ?? "/", baseUrl);
+      const pathname = reqUrl.pathname;
+      const method = req.method?.toUpperCase() ?? "GET";
+
+      // Disposable RG lifecycle
+      if (
+        /^\/subscriptions\/[^/]+\/resourcegroups\/rg-arm-blackbox-/i.test(pathname) &&
+        !pathname.includes("/providers/")
+      ) {
+        res.writeHead(method === "DELETE" ? 200 : 201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id: pathname, location: "eastus" }));
+        return;
+      }
+
+      // External UAMI fixture to test LRO timeout detection (#23/#24)
+      if (pathname.includes("/providers/Microsoft.ManagedIdentity/userAssignedIdentities/")) {
+        if (method === "PUT") {
+          res.writeHead(201, {
+            "Content-Type": "application/json",
+            "Azure-AsyncOperation": `${baseUrl}/uami-op`,
+          });
+          res.end(JSON.stringify({ id: pathname, properties: { provisioningState: "Creating" } }));
+          return;
+        }
+      }
+      if (pathname === "/uami-op") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: slowFixtureMode ? "Creating" : "Succeeded" }));
+        return;
+      }
+
+      // Backup POST with BOTH Azure-AsyncOperation (containing monitor properties) AND Location (#14)
+      if (pathname.endsWith("/backup") && method === "POST") {
+        res.writeHead(202, {
+          "Content-Type": "application/json",
+          "Azure-AsyncOperation": `${baseUrl}/backup-monitor`,
+          Location: `${baseUrl}/backup-result`,
+          "Retry-After": "0",
+        });
+        res.end();
+        return;
+      }
+      if (pathname === "/backup-monitor") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        // Monitor includes non-result `properties` metadata; harness must still fetch Location (#14)!
+        res.end(JSON.stringify({ status: "Succeeded", properties: { stage: "completed" } }));
+        return;
+      }
+      if (pathname === "/backup-result") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ archiveUri: "https://contoso.blob.core.windows.net/bk.zip" }));
+        return;
+      }
+
+      // Delete LRO that fails asynchronously (#19/#20)
+      if (pathname.includes("/providers/Microsoft.V2Vault/vaults/") && method === "DELETE") {
+        res.writeHead(202, {
+          "Content-Type": "application/json",
+          "Azure-AsyncOperation": `${baseUrl}/delete-monitor`,
+          "Retry-After": "0",
+        });
+        res.end();
+        return;
+      }
+      if (pathname === "/delete-monitor") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: failDeleteLro ? "Failed" : "Succeeded" }));
+        return;
+      }
+
+      // Child PrivateConns list & get (tests List-discovered child name auto-binding!)
+      if (pathname.endsWith("/privateConns") && method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            value: [
+              {
+                id: `${pathname}/server-conn-42`,
+                name: "server-conn-42",
+                type: "Microsoft.V2Vault/vaults/privateConns",
+                properties: { status: "Approved", provisioningState: "Succeeded" },
+              },
+            ],
+          }),
+        );
+        return;
+      }
+      if (pathname.endsWith("/privateConns/server-conn-42") && method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: pathname,
+            name: "server-conn-42",
+            type: "Microsoft.V2Vault/vaults/privateConns",
+            properties: { status: "Approved", provisioningState: "Succeeded" },
+          }),
+        );
+        return;
+      }
+
+      // 3-page Vaults List (#15/#16/#17)
+      if (pathname.endsWith("/providers/Microsoft.V2Vault/vaults") && method === "GET") {
+        const page = reqUrl.searchParams.get("page") ?? "1";
+        if (page === "1") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              value: [
+                {
+                  id: `${pathname}/${createdVaultName}`,
+                  name: createdVaultName,
+                  type: "Microsoft.V2Vault/vaults",
+                  location: "eastus",
+                },
+              ],
+              nextLink: `${baseUrl}${pathname}?api-version=2025-03-01&page=2`,
+            }),
+          );
+          return;
+        }
+        if (page === "2") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              value: [],
+              nextLink: `${baseUrl}${pathname}?api-version=2025-03-01&page=3`,
+            }),
+          );
+          return;
+        }
+        // Page 3 has an invalid retentionSeconds = 5 (< @minValue(3600)) to prove page-3 schema validation runs (#15–#18, #28)!
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            value: [
+              {
+                id: `${pathname}/bad-page3`,
+                name: "bad-page3",
+                type: "Microsoft.V2Vault/vaults",
+                location: "eastus",
+                properties: { retentionSeconds: 5 },
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
+      // Vaults PUT & GET
+      const vaultMatch = /\/providers\/Microsoft\.V2Vault\/vaults\/([^/]+)$/.exec(pathname);
+      if (vaultMatch) {
+        const vName = vaultMatch[1];
+        if (vName.startsWith("missing-") && method === "GET") {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          // Malformed error envelope to test #21/#22 (status stays pending!)
+          res.end(JSON.stringify({ badError: "missing OData error wrapper" }));
+          return;
+        }
+        if (method === "PUT") {
+          createdVaultName = vName;
+          res.writeHead(200, { "Content-Type": "application/json" });
+          // PUT echoes persistedFlag, whereas subsequent GET drops it (#26/#27)!
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: vName,
+              type: "Microsoft.V2Vault/vaults",
+              location: "eastus",
+              properties: {
+                retentionSeconds: 3600,
+                persistedFlag: "present-on-put",
+                primaryCred: { opaqueMaterial: "RAW_PRIMARY_SECRET" },
+                secondaryCred: { opaqueMaterial: "RAW_SECONDARY_SECRET" },
+                credList: [{ opaqueMaterial: "RAW_ARRAY_SECRET" }],
+                provisioningState: "Succeeded",
+              },
+            }),
+          );
+          return;
+        }
+        if (method === "GET") {
+          if (emptyGetMode) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end("");
+            return;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: vName,
+              type: "Microsoft.V2Vault/vaults",
+              location: "eastus",
+              properties: {
+                retentionSeconds: 3600,
+                // persistedFlag intentionally omitted on GET!
+                primaryCred: { opaqueMaterial: "RAW_PRIMARY_SECRET" },
+                secondaryCred: { opaqueMaterial: "RAW_SECONDARY_SECRET" },
+                credList: [{ opaqueMaterial: "RAW_ARRAY_SECRET" }],
+                provisioningState: "Succeeded",
+              },
+            }),
+          );
+          return;
+        }
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "NotFound", message: "Not found" } }));
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    servers.push(server);
+    baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-03-01",
+      workDir,
+      armBaseUrl: baseUrl,
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus",
+    });
+
+    await createDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
+
+    // Fixture LRO timeout throws instead of returning an unready Creating fixture (#23/#24).
+    await expect(
+      provisionExternalFixture({
+        workDir,
+        kind: "managed-identity",
+        pollIntervalMs: 5,
+        bearerToken: MOCK_TOKEN,
+      }),
+    ).rejects.toThrow(/timed out|non-ready/);
+    slowFixtureMode = false;
+
+    // Conflicting api-version in query or URL is rejected (#12/#13).
+    await expect(
+      executeOperationProbe({
+        workDir,
+        bearerToken: MOCK_TOKEN,
+        input: {
+          operationId: "Vaults_ListByResourceGroup",
+          query: { "api-version": "1999-01-01" },
+        },
+      }),
+    ).rejects.toThrow(/Conflicting api-version/);
+
+    // Negative 404 with malformed error envelope records discrepancy while keeping coverage "pending" (#21/#22).
+    const negGet = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Vaults_Get",
+        expectError: true,
+      },
+    });
+    expect(
+      negGet.trace.discrepancies.some((d) => d.ruleId === DISCREPANCY_RULES.ERROR_ENVELOPE_DRIFT),
+    ).toBe(true);
+    const reportAfterNeg = await buildSummaryReport(workDir);
+    expect(reportAfterNeg.report.coverageSummary.testedOperations).toBe(0);
+
+    // PUT without pathOrUrl auto-interpolates pathTemplate; out-of-range @minValue(3600) on property is caught (#28/#29)!
+    const putProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Vaults_CreateOrUpdate",
+        body: {
+          location: "eastus",
+          properties: {
+            retentionSeconds: 10, // < @minValue(3600) on ModelProperty!
+            persistedFlag: "present-on-put",
+            primaryCred: { opaqueMaterial: "REQ_PRIMARY_SECRET" },
+            secondaryCred: { opaqueMaterial: "REQ_SECONDARY_SECRET" },
+            credList: [{ opaqueMaterial: "REQ_ARRAY_SECRET" }],
+          },
+        },
+      },
+    });
+    expect(createdVaultName).toMatch(/^bbx-/);
+    expect(putProbe.trace.requestSchemaErrors.some((e) => e.code === "MIN_VALUE_VIOLATION")).toBe(
+      true,
+    );
+
+    // Empty body on GET when TypeSpec requires Vault model triggers MISSING_REQUIRED_RESPONSE_BODY (#30/#31).
+    emptyGetMode = true;
+    const emptyGet = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "Vaults_Get", scenario: "empty-body" },
+    });
+    expect(
+      emptyGet.trace.responseSchemaErrors.some((e) => e.code === "MISSING_REQUIRED_RESPONSE_BODY"),
+    ).toBe(true);
+    emptyGetMode = false;
+
+    // Subsequent GET without pathOrUrl OR manual priorPutBody auto-reuses createdVaultName AND auto-attaches priorPutBody,
+    // catching persistedFlag dropped on GET (#26/#27)!
+    const okGet = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "Vaults_Get" },
+    });
+    expect(
+      okGet.trace.discrepancies.some(
+        (d) => d.ruleId === DISCREPANCY_RULES.ROUNDTRIP_MUTABILITY_DRIFT,
+      ),
+    ).toBe(true);
+
+    // 3-page List traverses all 3 pages AND validates page 3's @minValue violation (#15–#18, #28).
+    const listProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "Vaults_ListByResourceGroup" },
+    });
+    expect(listProbe.trace.exchanges.filter((e) => e.step === "next-page").length).toBe(2);
+    expect(listProbe.trace.responseSchemaErrors.some((e) => e.code === "MIN_VALUE_VIOLATION")).toBe(
+      true,
+    );
+
+    // Child List harvests "server-conn-42", and child GET without pathOrUrl auto-binds {privateConnName} = "server-conn-42"!
+    await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "PrivateConns_ListByVault" },
+    });
+    const childGet = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "PrivateConns_Get" },
+    });
+    expect(childGet.trace.probeSucceeded).toBe(true);
+    expect(childGet.trace.exchanges[0].request.url).toContain("/privateConns/server-conn-42");
+
+    // POST Backup with final-state-via="location" fetches Location GET despite monitor properties, and redacts @secret header (#10/#11, #14).
+    const backupProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Vaults_Backup",
+        headers: { "x-custom-credential": "TOP_SECRET_HEADER_MATERIAL" },
+        pollIntervalMs: 5,
+      },
+    });
+    expect(backupProbe.trace.observedLro.finalResultSource).toBe("location-body");
+    expect(backupProbe.trace.exchanges.some((e) => e.step === "final-get")).toBe(true);
+
+    // Failed LRO on DELETE marks probe failed_service_error and is excluded from examples & positive coverage (#19/#20).
+    const failedDel = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Vaults_Delete",
+        body: undefined,
+        pollIntervalMs: 5,
+      },
+    });
+    expect(failedDel.trace.probeSucceeded).toBe(false);
+    expect(failedDel.trace.observedLro.completionStatus).toBe("failed");
+
+    const generated = await generateLiveExamples({ workDir, validateWithTypeSpec: true });
+    // Failed DELETE must NOT produce a fabricated example (#19/#20)!
+    expect(generated.some((g) => g.operationId === "Vaults_Delete")).toBe(false);
+
+    // Verify reused @secret models (primaryCred + secondaryCred), array secrets (credList[]), and standalone @secret header are ALL redacted (#5–#11)!
+    const putExText = fs.readFileSync(
+      generated.find((g) => g.operationId === "Vaults_CreateOrUpdate")!.scratchPath,
+      "utf8",
+    );
+    expect(putExText).not.toContain("REQ_PRIMARY_SECRET");
+    expect(putExText).not.toContain("REQ_SECONDARY_SECRET");
+    expect(putExText).not.toContain("REQ_ARRAY_SECRET");
+    expect(putExText).not.toContain("RAW_PRIMARY_SECRET");
+    expect(putExText).not.toContain("RAW_SECONDARY_SECRET");
+    expect(putExText).not.toContain("RAW_ARRAY_SECRET");
+
+    const backupExArtifact = generated.find((g) => g.operationId === "Vaults_Backup")!;
+    expect(backupExArtifact.schemaValid).toBe(true);
+    const backupExText = fs.readFileSync(backupExArtifact.scratchPath, "utf8");
+    expect(backupExText).not.toContain("TOP_SECRET_HEADER_MATERIAL");
+    expect(backupExText).toContain("https://contoso.blob.core.windows.net/bk.zip");
+
+    // Verify Markdown backslash + pipe escaping in report (CodeQL #1).
+    const ledgerRaw = JSON.parse(
+      fs.readFileSync(path.join(workDir, "coverage-ledger.json"), "utf8"),
+    ) as CoverageLedger;
+    ledgerRaw.coverage.Vaults_Delete.blockerReason = "Path C:\\foo\\bar|injected";
+    fs.writeFileSync(
+      path.join(workDir, "coverage-ledger.json"),
+      JSON.stringify(ledgerRaw, null, 2),
+      "utf8",
+    );
+    const finalReport = await buildSummaryReport(workDir);
+    const mdText = fs.readFileSync(finalReport.markdownPath, "utf8");
+    expect(mdText).toContain("Path C:\\\\foo\\\\bar\\|injected");
+    // Vaults_Delete failed LRO -> only 6 of 7 operations positively covered!
+    expect(finalReport.report.coverageSummary.testedOperations).toBe(6);
   });
 });
