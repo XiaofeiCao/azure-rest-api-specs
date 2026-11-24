@@ -2030,5 +2030,28 @@ interface PrivateConns {
     });
     expect(rgFirstProbe.trace.probeSucceeded).toBe(true);
     await deleteDisposableResourceGroup({ workDir: workDirRgFirst, bearerToken: MOCK_TOKEN });
+
+    // 4. Verify `discover` -> `rg create` honors --arm-token-resource and --allowed-arm-origins without --arm-base-url (#920581)!
+    const workDirOverride = path.join(tempRoot, "work-discover-then-rg-overrides");
+    await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-01-01",
+      workDir: workDirOverride,
+      armBaseUrl: canaryBaseUrl,
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus",
+    });
+    await createDisposableResourceGroup({
+      workDir: workDirOverride,
+      armTokenResource: "api://custom-rg-stage-audience",
+      allowedArmOrigins: [pollServerUrl],
+      bearerToken: MOCK_TOKEN,
+    });
+    const overrideLedger = JSON.parse(
+      fs.readFileSync(path.join(workDirOverride, "coverage-ledger.json"), "utf8"),
+    ) as CoverageLedger;
+    expect(overrideLedger.armTokenResource).toBe("api://custom-rg-stage-audience");
+    expect(overrideLedger.allowedArmOrigins).toContain(pollServerUrl.toLowerCase());
+    await deleteDisposableResourceGroup({ workDir: workDirOverride, bearerToken: MOCK_TOKEN });
   });
 });

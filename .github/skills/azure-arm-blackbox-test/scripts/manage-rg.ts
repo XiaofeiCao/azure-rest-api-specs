@@ -116,14 +116,21 @@ export async function createDisposableResourceGroup(options: {
     }
   } else if (options.armBaseUrl) {
     ledger.armBaseUrl = validateAndNormalizeArmBaseUrl(options.armBaseUrl);
-    const isLoopback = new URL(ledger.armBaseUrl).protocol === "http:";
-    if (options.allowedArmOrigins) {
-      ledger.allowedArmOrigins = validateAndNormalizeAllowedArmOrigins(
-        options.allowedArmOrigins,
-        isLoopback,
-      );
+    if (!options.armTokenResource) {
+      ledger.armTokenResource = inferArmTokenResource(ledger.armBaseUrl, undefined);
     }
+  }
+
+  if (options.armTokenResource) {
     ledger.armTokenResource = inferArmTokenResource(ledger.armBaseUrl, options.armTokenResource);
+  }
+  if (options.allowedArmOrigins) {
+    const isLoopback = new URL(ledger.armBaseUrl).protocol === "http:";
+    const validatedOrigins = validateAndNormalizeAllowedArmOrigins(
+      options.allowedArmOrigins,
+      isLoopback,
+    );
+    ledger.allowedArmOrigins = validatedOrigins.length > 0 ? validatedOrigins : undefined;
   }
 
   const subscriptionId =
