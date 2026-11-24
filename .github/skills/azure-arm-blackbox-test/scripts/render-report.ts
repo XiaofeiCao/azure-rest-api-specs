@@ -135,12 +135,14 @@ export async function buildSummaryReport(
       }
     }
   }
-  for (const [opId, count] of perOpDiscrepancyCounts.entries()) {
-    const entry = ledger.coverage[opId];
-    if (entry) {
-      entry.discrepancyCount = Math.max(entry.discrepancyCount, count);
+  const tracedOperations = new Set(traces.map((t) => t.operationId));
+  for (const [opId, entry] of Object.entries(ledger.coverage)) {
+    if (tracedOperations.has(opId) || perOpDiscrepancyCounts.has(opId)) {
+      entry.discrepancyCount = perOpDiscrepancyCounts.get(opId) ?? 0;
       if (entry.status === "passed" && entry.discrepancyCount > 0) {
         entry.status = "passed_with_mismatch";
+      } else if (entry.status === "passed_with_mismatch" && entry.discrepancyCount === 0) {
+        entry.status = "passed";
       }
     }
   }

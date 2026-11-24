@@ -1,3 +1,4 @@
+import { isPathOrAncestorDeclaredSecret, splitEscapedDotPath } from "./sanitize-example.ts";
 import { loadProjectedTypeSpecService } from "./typespec-loader.ts";
 import {
   validateStatusMonitorResultAgainstTypeSpec,
@@ -96,7 +97,7 @@ function getNestedValue(obj: unknown, dotPath: string): unknown {
   if (!obj || typeof obj !== "object") {
     return undefined;
   }
-  const parts = dotPath.split(".");
+  const parts = splitEscapedDotPath(dotPath);
   let current: unknown = obj;
   for (const part of parts) {
     if (!current || typeof current !== "object" || Array.isArray(current)) {
@@ -480,11 +481,16 @@ export function analyzeBehavioralDiscrepancies(
     !Array.isArray(terminalBody) &&
     (contract.method === "PUT" || (contract.method === "GET" && priorPutBody !== undefined))
   ) {
-    const secretSet = new Set(contract.secretProperties.map((s) => s.toLowerCase()));
     const droppedProperties: string[] = [];
 
     for (const propPath of contract.writableBodyProperties) {
-      if (secretSet.has(propPath.toLowerCase())) {
+      if (
+        isPathOrAncestorDeclaredSecret(
+          propPath,
+          contract.secretProperties,
+          contract.secretCycleRules,
+        )
+      ) {
         continue;
       }
       // Only check leaf scalar/array values that were explicitly sent in the PUT request.

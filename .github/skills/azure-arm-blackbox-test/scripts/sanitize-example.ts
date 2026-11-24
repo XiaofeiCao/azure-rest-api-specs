@@ -37,9 +37,32 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+export function escapeSecretPropertySegment(segment: string): string {
+  return segment.replace(/\\/g, "\\\\").replace(/\./g, "\\.");
+}
+
+export function splitEscapedDotPath(dotPath: string): string[] {
+  const parts: string[] = [];
+  let cur = "";
+  for (let i = 0; i < dotPath.length; i++) {
+    const ch = dotPath[i];
+    if (ch === "\\" && i + 1 < dotPath.length) {
+      cur += dotPath[i + 1];
+      i++;
+    } else if (ch === ".") {
+      parts.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  parts.push(cur);
+  return parts;
+}
+
 function parseSecretPatternSegments(pattern: string): string[] {
   const segments: string[] = [];
-  for (const part of pattern.split(".")) {
+  for (const part of splitEscapedDotPath(pattern)) {
     let base = part;
     let arrayDepth = 0;
     // Expand EVERY trailing [] marker into a separate segment so nested arrays (e.g. credentials[][].opaqueMaterial) match (#4080)!
@@ -137,6 +160,30 @@ function matchesAnyDeclaredSecretPath(actualSegs: string[], ctx: SanitizeContext
   for (const sp of rawSecretPaths) {
     const patSegs = parseSecretPatternSegments(sp);
     if (variants.some((v) => matchesSecretSegments(patSegs, v))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isPathOrAncestorDeclaredSecret(
+  propPath: string,
+  secretProperties: string[],
+  secretCycleRules?: SecretCycleRule[],
+): boolean {
+  if (secretProperties.length === 0) {
+    return false;
+  }
+  const segs = parseSecretPatternSegments(propPath);
+  if (segs.length === 0) {
+    return false;
+  }
+  const ctx: SanitizeContext = {
+    extraSecretPropertyPaths: secretProperties,
+    secretCycleRules,
+  };
+  for (let len = 1; len <= segs.length; len++) {
+    if (matchesAnyDeclaredSecretPath(segs.slice(0, len), ctx)) {
       return true;
     }
   }

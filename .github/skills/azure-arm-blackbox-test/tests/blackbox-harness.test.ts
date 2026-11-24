@@ -1847,7 +1847,7 @@ interface PrivateConns {
       }),
     ).rejects.toThrow(/cleanupStatus "deleted"/);
 
-    // Delegating Microsoft.Resources/deployments inside RG is blocked (#60636)!
+    // Delegating Microsoft.Resources/deployments and RG-level tags/default inside RG are blocked (#60636, #51119)!
     expect(() =>
       assertSafeArmTarget(
         "PUT",
@@ -1861,7 +1861,78 @@ interface PrivateConns {
           verifiedRgRunIdTag: "run1",
         },
       ),
-    ).toThrow(/Blocked delegating Microsoft\.Resources/);
+    ).toThrow(/Blocked Microsoft\.Resources RG-level mutation/);
+
+    expect(() =>
+      assertSafeArmTarget(
+        "DELETE",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.Resources/tags/default?api-version=2024-03-01`,
+        {
+          trustedArmBaseUrl: "https://management.azure.com",
+          subscriptionId: REAL_SUB_ID,
+          disposableRgName: "rg-arm-blackbox-appconfig-abc123",
+          disposableRgCleanupStatus: "active",
+          expectedRunId: "run1",
+          verifiedRgRunIdTag: "run1",
+        },
+      ),
+    ).toThrow(/Blocked Microsoft\.Resources RG-level mutation/);
+
+    // Backup restore destinations targeting external RGs AND cross-subscription soft-delete purges are blocked (#51060, #51170)!
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.RecoveryServices/vaults/v1/backupFabrics/Azure/protectionContainers/c1/protectedItems/i1/recoveryPoints/rp1/restore?api-version=2024-04-01`,
+        {
+          trustedArmBaseUrl: "https://management.azure.com",
+          subscriptionId: REAL_SUB_ID,
+          disposableRgName: "rg-arm-blackbox-appconfig-abc123",
+          disposableRgCleanupStatus: "active",
+          expectedRunId: "run1",
+          verifiedRgRunIdTag: "run1",
+        },
+        {
+          properties: {
+            targetResourceGroupId: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-production`,
+          },
+        },
+      ),
+    ).toThrow(/Blocked cross-scope mutation field "targetResourceGroupId"/);
+
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.AppConfiguration/locations/eastus/deletedConfigurationStores/bbx-store-01/purge?api-version=2024-06-01`,
+        {
+          trustedArmBaseUrl: "https://management.azure.com",
+          subscriptionId: REAL_SUB_ID,
+          disposableRgName: "rg-arm-blackbox-appconfig-abc123",
+          disposableRgCleanupStatus: "active",
+          expectedRunId: "run1",
+          verifiedRgRunIdTag: "run1",
+          ownedTargetResources: [
+            {
+              subscriptionId: "11111111-1111-1111-1111-111111111111",
+              providerNamespace: "Microsoft.AppConfiguration",
+              collectionSegment: "configurationStores",
+              name: "bbx-store-01",
+              location: "eastus",
+              resourceGroupName: "rg-arm-blackbox-appconfig-abc123",
+              resourceId:
+                "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.AppConfiguration/configurationStores/bbx-store-01",
+            },
+          ],
+        },
+      ),
+    ).toThrow(/Blocked soft-delete POST on unowned resource/);
+
+    // Literal dots in encoded JSON @secret property names are preserved (#51232)!
+    const literalDotSanitized = sanitizePayload(
+      { properties: { "opaque.proof": "LITERAL_DOT_SECRET_999" } },
+      { extraSecretPropertyPaths: ["properties.opaque\\.proof"] },
+    );
+    expect(JSON.stringify(literalDotSanitized)).not.toContain("LITERAL_DOT_SECRET_999");
+    expect(JSON.stringify(literalDotSanitized)).toContain("<redacted>");
 
     // stripConfiguredArmBasePath preserves percent-encoded %25 and %2F for single-pass decoding (#60789)!
     expect(

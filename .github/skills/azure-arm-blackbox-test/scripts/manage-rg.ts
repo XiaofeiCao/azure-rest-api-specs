@@ -132,6 +132,13 @@ export async function createDisposableResourceGroup(options: {
   }
 
   // Persist cleanup target BEFORE sending the mutating PUT so interrupted runs can still tear down safely.
+  if (
+    ledger.subscriptionId &&
+    ledger.subscriptionId.toLowerCase() !== subscriptionId.toLowerCase()
+  ) {
+    ledger.provisionedFixtures = [];
+    ledger.runtimeState = undefined;
+  }
   const createdAt = ledger.disposableResourceGroup?.createdAt ?? new Date().toISOString();
   ledger.subscriptionId = subscriptionId;
   ledger.location = location;

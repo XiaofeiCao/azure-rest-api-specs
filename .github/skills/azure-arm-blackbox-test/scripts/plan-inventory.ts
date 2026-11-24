@@ -46,6 +46,7 @@ import {
   saveLedger,
   TRACES_DIRNAME,
 } from "./ledger-store.ts";
+import { escapeSecretPropertySegment } from "./sanitize-example.ts";
 import {
   extractOperationSourceLocation,
   loadProjectedTypeSpecService,
@@ -513,7 +514,8 @@ function collectTypeSpecBodyMetadata(
 
     for (const prop of walkPropertiesInherited(type)) {
       const wireName = resolveEncodedName(program, prop, "application/json");
-      const propPath = prefix ? `${prefix}.${wireName}` : wireName;
+      const escapedWireName = escapeSecretPropertySegment(wireName);
+      const propPath = prefix ? `${prefix}.${escapedWireName}` : escapedWireName;
       const readOnly = isReadonlyProperty(program, prop);
       const visibleInReq = metadataInfo.isPayloadProperty(prop, reqVisibility);
       const visibleInRead = metadataInfo.isPayloadProperty(prop, Visibility.Read);
@@ -656,7 +658,8 @@ function collectTypeSpecResponseSecrets(
       }
       for (const prop of walkPropertiesInherited(type)) {
         const wireName = resolveEncodedName(program, prop, "application/json");
-        const propPath = prefix ? `${prefix}.${wireName}` : wireName;
+        const escapedWireName = escapeSecretPropertySegment(wireName);
+        const propPath = prefix ? `${prefix}.${escapedWireName}` : escapedWireName;
         if (
           isSecret(program, prop) ||
           isSecret(program, prop.type) ||

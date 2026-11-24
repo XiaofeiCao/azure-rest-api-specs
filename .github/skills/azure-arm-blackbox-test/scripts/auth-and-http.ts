@@ -379,7 +379,7 @@ export function assertTrustedArmOrigin(
 }
 
 const CROSS_SCOPE_BODY_KEY_RE =
-  /^(targetresourcegroup|targetsubscriptionid|destinationresourceid|targetresourceid|destinationcontainer|targetid|movedresourceid|privatelinkserviceid|remoteprivatelinkserviceid)$/i;
+  /^(?:targetresourcegroup|targetresourcegroupid|targetsubscriptionid|targetvirtualmachineid|targetdiskid|targetstorageaccountid|targetnetworkid|targetsubnetid|targetvnetid|destinationresourceid|destinationresourcegroupid|targetresourceid|destinationcontainer|targetid|movedresourceid|privatelinkserviceid|remoteprivatelinkserviceid|recoveryresourcegroupid|restoreresourcegroupid|(?:target|destination|restore|recovery|moved|remote)[a-z0-9_]*(?:resourcegroup|resourcegroupid|subscriptionid|resourceid|virtualmachineid|storageaccountid|subnetid|diskid|vnetid|networkid))$/i;
 
 export function parseRetryAfterMs(headers: Record<string, string>, fallbackMs: number): number {
   const raw = headers["retry-after"]?.trim();
@@ -424,7 +424,7 @@ function assertNoCrossScopeBodyTargets(
   for (const [key, val] of Object.entries(body as Record<string, unknown>)) {
     if (typeof val === "string" && CROSS_SCOPE_BODY_KEY_RE.test(key)) {
       const lowerKey = key.toLowerCase();
-      if (lowerKey === "targetsubscriptionid") {
+      if (lowerKey.endsWith("subscriptionid")) {
         if (!expectedSub || val.trim().toLowerCase() !== expectedSub) {
           throw new Error(
             `Blocked cross-scope mutation field "${key}" targeting subscription "${val}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
@@ -433,9 +433,9 @@ function assertNoCrossScopeBodyTargets(
       } else {
         const subMatch = /\/subscriptions\/([^/]+)/i.exec(val);
         const rgMatch = /\/resourcegroups\/([^/]+)/i.exec(val);
-        if (subMatch && expectedSub && subMatch[1].toLowerCase() !== expectedSub) {
+        if (subMatch && (!expectedSub || subMatch[1].toLowerCase() !== expectedSub)) {
           throw new Error(
-            `Blocked cross-scope mutation field "${key}" targeting subscription "${subMatch[1]}" (expected "${ctx.subscriptionId}").`,
+            `Blocked cross-scope mutation field "${key}" targeting subscription "${subMatch[1]}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
           );
         }
         if (rgMatch) {
@@ -444,7 +444,7 @@ function assertNoCrossScopeBodyTargets(
               `Blocked cross-scope mutation field "${key}" targeting Resource Group "${rgMatch[1]}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
             );
           }
-        } else if (lowerKey === "targetresourcegroup") {
+        } else if (lowerKey.endsWith("resourcegroup") || lowerKey.endsWith("resourcegroupid")) {
           if (!expectedRg || val.trim().toLowerCase() !== expectedRg) {
             throw new Error(
               `Blocked cross-scope mutation field "${key}" targeting Resource Group "${val}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
@@ -568,31 +568,38 @@ export function assertSafeArmTarget(
       );
     }
     if (
-      /^microsoft\.resources\/(?:deployments|deploymentstacks|templatespecs|links|deploymentscripts)(?:\/|$)/i.test(
+      /^microsoft\.resources\/(?:deployments|deploymentstacks|templatespecs|links|deploymentscripts|tags)(?:\/|$)/i.test(
         rgScopedMatch[2],
       )
     ) {
       throw new Error(
-        `Blocked delegating Microsoft.Resources mutation "${rgScopedMatch[2]}": nested deployments and links can target resources outside "${ctx.disposableRgName}".`,
+        `Blocked Microsoft.Resources RG-level mutation "${rgScopedMatch[2]}": delegating deployments and direct RG tag overwrites are forbidden inside "${ctx.disposableRgName}".`,
       );
     }
     return;
   }
 
   // Subscription/location-scoped soft-delete purge/recover ONLY for recorded target-RP resource identities
-  // matching providerNamespace, resource collection type, location, and name.
+  // matching subscriptionId, providerNamespace, resource collection type, location, and name (#51170).
   const softDeleteMatch =
-    /^\/subscriptions\/[^/]+\/providers\/([^/]+)\/locations\/([^/]+)\/deleted([^/]+)\/([^/]+)(?:\/purge)?$/i.exec(
+    /^\/subscriptions\/([^/]+)\/providers\/([^/]+)\/locations\/([^/]+)\/deleted([^/]+)\/([^/]+)(?:\/purge)?$/i.exec(
       pathname,
     );
   if (softDeleteMatch && (upperMethod === "POST" || upperMethod === "DELETE")) {
-    const [, urlProvider, urlLocation, deletedCollectionSuffix, targetName] = softDeleteMatch;
+    const [, urlSubId, urlProvider, urlLocation, deletedCollectionSuffix, targetName] =
+      softDeleteMatch;
+    const normSub = urlSubId.toLowerCase();
     const normProvider = urlProvider.toLowerCase();
     const normLoc = urlLocation.toLowerCase().replace(/\s+/g, "");
     const normCollection = deletedCollectionSuffix.toLowerCase();
     const normName = targetName.toLowerCase();
 
     const matchedOwned = (ctx.ownedTargetResources ?? []).some((res) => {
+      const idSubMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(res.resourceId);
+      const resSub = (res.subscriptionId ?? idSubMatch?.[1])?.toLowerCase();
+      if (!resSub || resSub !== normSub) {
+        return false;
+      }
       if (res.providerNamespace.toLowerCase() !== normProvider) {
         return false;
       }
@@ -654,6 +661,7 @@ export interface SendRawRequestOptions {
   body?: unknown;
   safetyContext: SafetyGuardContext;
   timeoutMs?: number;
+  onBeforeHeaderRedaction?: (unredacted: WireHttpExchange, redacted: WireHttpExchange) => void;
 }
 
 export async function sendRawHttpExchange(
@@ -715,9 +723,10 @@ export async function sendRawHttpExchange(
     }
   }
 
-  return {
+  const timestamp = startedAt.toISOString();
+  const redactedExchange: WireHttpExchange = {
     step: options.step,
-    timestamp: startedAt.toISOString(),
+    timestamp,
     durationMs,
     request: {
       method: options.method.toUpperCase(),
@@ -732,6 +741,34 @@ export async function sendRawHttpExchange(
       ...(rawTextSnippet !== undefined ? { rawTextSnippet } : {}),
     },
   };
+
+  if (options.onBeforeHeaderRedaction) {
+    // Strip only authentication credentials so @secret API headers can be validated in memory before persistence (#51340).
+    const validationSafeReqHeaders = redactHeaders(normalizedRequestHeaders);
+    const validationSafeRespHeaders = redactHeaders(responseHeaders);
+    options.onBeforeHeaderRedaction(
+      {
+        step: options.step,
+        timestamp,
+        durationMs,
+        request: {
+          method: options.method.toUpperCase(),
+          url: options.url,
+          headers: validationSafeReqHeaders,
+          ...(options.body !== undefined ? { body: options.body } : {}),
+        },
+        response: {
+          status: response.status,
+          headers: validationSafeRespHeaders,
+          ...(parsedBody !== undefined ? { body: parsedBody } : {}),
+          ...(rawTextSnippet !== undefined ? { rawTextSnippet } : {}),
+        },
+      },
+      redactedExchange,
+    );
+  }
+
+  return redactedExchange;
 }
 
 export const RUN_OWNERSHIP_TAG = "arm-blackbox-run-id";

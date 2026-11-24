@@ -28,7 +28,12 @@ import {
 import { GENERATED_EXAMPLES_DIRNAME, loadAllProbeTraces, loadLedger } from "./ledger-store.ts";
 import type { BlackboxSummaryReport } from "./render-report.ts";
 import { REPORT_PORTAL_APP_JS } from "./report-portal-app-template.ts";
-import { sanitizePayload, type SanitizeContext } from "./sanitize-example.ts";
+import {
+  escapeSecretPropertySegment,
+  sanitizePayload,
+  splitEscapedDotPath,
+  type SanitizeContext,
+} from "./sanitize-example.ts";
 import { loadProjectedTypeSpecService } from "./typespec-loader.ts";
 import type { CoverageLedger, OperationContract } from "./types.ts";
 
@@ -352,7 +357,8 @@ function collectRequestBodyLeafSpecs(
         continue;
       }
       const wireName = resolveEncodedName(program, prop, "application/json");
-      const propPath = prefix ? `${prefix}.${wireName}` : wireName;
+      const escapedWireName = escapeSecretPropertySegment(wireName);
+      const propPath = prefix ? `${prefix}.${escapedWireName}` : escapedWireName;
       const isOptional =
         (depth === 0 && isPatchImplicitOptional) ||
         prop.optional ||
@@ -470,7 +476,7 @@ function collectRequestBodyLeafSpecs(
 }
 
 function lookupBodyDotPathValues(root: unknown, dotPath: string): unknown[] {
-  const segments = dotPath.split(".");
+  const segments = splitEscapedDotPath(dotPath);
   let frontier: unknown[] = [root];
 
   for (const seg of segments) {

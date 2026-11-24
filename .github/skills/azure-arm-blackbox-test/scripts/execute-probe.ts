@@ -414,16 +414,17 @@ function extractTargetResourceIdentityFromUrl(
   try {
     const encodedPathname = stripConfiguredArmBasePath(urlStr, armBaseUrl).replace(/\/+$/, "");
     const rgMatch =
-      /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/([^/]+)\/([^/]+)\/([^/]+)$/i.exec(
+      /^\/subscriptions\/([^/]+)\/resourcegroups\/([^/]+)\/providers\/([^/]+)\/([^/]+)\/([^/]+)$/i.exec(
         encodedPathname,
       );
     if (!rgMatch) {
       return undefined;
     }
-    const rgName = safeDecodeUriSegment(rgMatch[1]);
-    const providerNamespace = safeDecodeUriSegment(rgMatch[2]);
-    const collectionSegment = safeDecodeUriSegment(rgMatch[3]);
-    const resourceName = safeDecodeUriSegment(rgMatch[4]);
+    const subId = safeDecodeUriSegment(rgMatch[1]);
+    const rgName = safeDecodeUriSegment(rgMatch[2]);
+    const providerNamespace = safeDecodeUriSegment(rgMatch[3]);
+    const collectionSegment = safeDecodeUriSegment(rgMatch[4]);
+    const resourceName = safeDecodeUriSegment(rgMatch[5]);
     const decodedId = encodedPathname
       .split("/")
       .map((s) => safeDecodeUriSegment(s))
@@ -435,6 +436,7 @@ function extractTargetResourceIdentityFromUrl(
         ? String((responseBody as Record<string, unknown>).location)
         : fallbackLocation;
     return {
+      subscriptionId: subId,
       providerNamespace,
       collectionSegment,
       name: resourceName,
@@ -454,8 +456,11 @@ function getOwnedTargetResourcesFromLedger(ledger: CoverageLedger): OwnedTargetR
       continue;
     }
     const meta = f.metadata ?? {};
+    const subMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(f.resourceId);
     if (typeof meta.providerNamespace === "string" && typeof meta.collectionSegment === "string") {
       owned.push({
+        subscriptionId:
+          typeof meta.subscriptionId === "string" ? meta.subscriptionId : subMatch?.[1],
         providerNamespace: meta.providerNamespace,
         collectionSegment: meta.collectionSegment,
         name: f.name,
@@ -662,6 +667,11 @@ export async function executeOperationProbe(
   ];
 
   const exchanges: WireHttpExchange[] = [];
+  const rawValidationExchanges = new WeakMap<WireHttpExchange, WireHttpExchange>();
+  const captureForValidation = (unredacted: WireHttpExchange, redacted: WireHttpExchange): void => {
+    rawValidationExchanges.set(redacted, unredacted);
+  };
+
   const initialExchange = await sendRawHttpExchange({
     step: "initial",
     method,
@@ -671,6 +681,7 @@ export async function executeOperationProbe(
     extraSensitiveHeaders: secretHeaderNames,
     body: input.body,
     safetyContext,
+    onBeforeHeaderRedaction: captureForValidation,
   });
   exchanges.push(initialExchange);
 
@@ -705,6 +716,7 @@ export async function executeOperationProbe(
         resourceId: identity.resourceId,
         provisionedAt: new Date().toISOString(),
         metadata: {
+          subscriptionId: identity.subscriptionId,
           providerNamespace: identity.providerNamespace,
           collectionSegment: identity.collectionSegment,
           location: identity.location,
@@ -775,6 +787,7 @@ export async function executeOperationProbe(
             bearerToken: token,
             extraSensitiveHeaders: secretHeaderNames,
             safetyContext,
+            onBeforeHeaderRedaction: captureForValidation,
           });
           exchanges.push(pollExchange);
           observedLro.pollCount++;
@@ -884,6 +897,7 @@ export async function executeOperationProbe(
               bearerToken: token,
               extraSensitiveHeaders: secretHeaderNames,
               safetyContext,
+              onBeforeHeaderRedaction: captureForValidation,
             });
             exchanges.push(finalGet);
             const finalProv = extractProvisioningState(finalGet.response.body);
@@ -915,6 +929,7 @@ export async function executeOperationProbe(
                 bearerToken: token,
                 extraSensitiveHeaders: secretHeaderNames,
                 safetyContext,
+                onBeforeHeaderRedaction: captureForValidation,
               });
               exchanges.push(locGet);
               observedLro.finalResultSource =
@@ -934,6 +949,7 @@ export async function executeOperationProbe(
                 bearerToken: token,
                 extraSensitiveHeaders: secretHeaderNames,
                 safetyContext,
+                onBeforeHeaderRedaction: captureForValidation,
               });
               exchanges.push(locGet);
               observedLro.finalResultSource =
@@ -993,6 +1009,7 @@ export async function executeOperationProbe(
         bearerToken: token,
         extraSensitiveHeaders: secretHeaderNames,
         safetyContext,
+        onBeforeHeaderRedaction: captureForValidation,
       });
       exchanges.push(nextPageExchange);
       pagesFetched++;
@@ -1023,7 +1040,7 @@ export async function executeOperationProbe(
       contract.typespecProjectDir,
       contract.apiVersion,
       contract.operationId,
-      initialExchange,
+      rawValidationExchanges.get(initialExchange) ?? initialExchange,
     );
 
   const appendUniqueResponseErrors = (errs: typeof responseSchemaErrors) => {
@@ -1062,7 +1079,7 @@ export async function executeOperationProbe(
         contract.typespecProjectDir,
         contract.apiVersion,
         contract.operationId,
-        ex,
+        rawValidationExchanges.get(ex) ?? ex,
       );
       appendUniqueResponseErrors(followCheck.responseErrors);
     }

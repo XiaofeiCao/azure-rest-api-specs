@@ -171,8 +171,15 @@
     </main>
 
     <!-- Slide-out Operation Detail Drawer -->
-    <div id="drawerBackdrop" class="drawer-backdrop hidden"></div>
-    <aside id="detailDrawer" class="drawer hidden" aria-label="Operation Details">
+    <div id="drawerBackdrop" class="drawer-backdrop hidden" aria-hidden="true"></div>
+    <aside
+      id="detailDrawer"
+      class="drawer hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="drawerOpTitle"
+      tabindex="-1"
+    >
       <div class="drawer-header">
         <div>
           <span class="muted" id="drawerServiceLabel"></span>

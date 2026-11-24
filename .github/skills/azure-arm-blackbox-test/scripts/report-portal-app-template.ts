@@ -539,6 +539,30 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       .join("");
   }
 
+  function setBackgroundInert(inert) {
+    for (const sel of ["header.topbar", "#mainContainer"]) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      if (inert) {
+        el.inert = true;
+        el.setAttribute("inert", "");
+        el.setAttribute("aria-hidden", "true");
+      } else {
+        el.inert = false;
+        el.removeAttribute("inert");
+        el.removeAttribute("aria-hidden");
+      }
+    }
+  }
+
+  function getDrawerFocusableElements() {
+    const drawer = document.getElementById("detailDrawer");
+    if (!drawer || drawer.classList.contains("hidden")) {
+      return [];
+    }
+    return [...drawer.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+  }
+
   function openOperationDrawer(serviceId, operationId, triggerEl) {
     const svc = state.bundle.services.find((s) => s.serviceId === serviceId);
     const op = svc?.operations.find((o) => o.operationId === operationId);
@@ -674,6 +698,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       \${exampleHtml}
     \`;
 
+    setBackgroundInert(true);
     document.getElementById("drawerBackdrop").classList.remove("hidden");
     document.getElementById("detailDrawer").classList.remove("hidden");
     const closeBtn = document.getElementById("closeDrawerBtn");
@@ -685,6 +710,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
   function closeDrawer() {
     document.getElementById("drawerBackdrop").classList.add("hidden");
     document.getElementById("detailDrawer").classList.add("hidden");
+    setBackgroundInert(false);
     if (state.lastDrawerTrigger && typeof state.lastDrawerTrigger.focus === "function") {
       state.lastDrawerTrigger.focus();
       state.lastDrawerTrigger = null;
@@ -799,8 +825,34 @@ export const REPORT_PORTAL_APP_JS = `(function () {
   document.getElementById("closeDrawerBtn").addEventListener("click", closeDrawer);
   document.getElementById("drawerBackdrop").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (ev) => {
+    const drawer = document.getElementById("detailDrawer");
+    if (!drawer || drawer.classList.contains("hidden")) {
+      return;
+    }
     if (ev.key === "Escape") {
+      ev.preventDefault();
       closeDrawer();
+      return;
+    }
+    if (ev.key === "Tab") {
+      const focusable = getDrawerFocusableElements();
+      if (focusable.length === 0) {
+        ev.preventDefault();
+        drawer.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      if (ev.shiftKey) {
+        if (active === first || !drawer.contains(active)) {
+          ev.preventDefault();
+          last.focus();
+        }
+      } else if (active === last || !drawer.contains(active)) {
+        ev.preventDefault();
+        first.focus();
+      }
     }
   });
 

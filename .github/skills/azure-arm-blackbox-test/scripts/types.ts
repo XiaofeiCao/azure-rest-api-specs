@@ -153,6 +153,7 @@ export interface DisposableResourceGroupState {
 }
 
 export interface OwnedTargetResource {
+  subscriptionId?: string;
   providerNamespace: string;
   collectionSegment: string;
   name: string;
