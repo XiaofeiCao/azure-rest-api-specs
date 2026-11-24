@@ -12,11 +12,14 @@ import {
   getArmBearerToken,
   parseRetryAfterMs,
   resolveArmRelativeOrAbsoluteUrl,
+  safeDecodeUriSegment,
   sendRawHttpExchange,
   stripConfiguredArmBasePath,
+  verifyLiveDisposableRgOwnership,
   type SafetyGuardContext,
 } from "./auth-and-http.ts";
 import { loadLedger, nextTraceSequence, saveLedger, saveProbeTrace } from "./ledger-store.ts";
+import { sanitizeUrlSecretParameters } from "./sanitize-example.ts";
 import type {
   CoverageLedger,
   LedgerRuntimeState,
@@ -218,7 +221,7 @@ function extractPathSlotsFromUrl(
     for (let i = 0; i < templateSegs.length; i++) {
       const m = /^\{([^}]+)\}$/.exec(templateSegs[i]);
       if (m) {
-        extracted[m[1]] = decodeURIComponent(actualSegs[i]);
+        extracted[m[1]] = safeDecodeUriSegment(actualSegs[i]);
       }
     }
     return extracted;
@@ -238,7 +241,7 @@ function extractPathSlotsFromUrl(
   const match = new RegExp(`^${regexStr}$`, "i").exec(actualPathname);
   if (match) {
     paramNames.forEach((name, idx) => {
-      extracted[name] = decodeURIComponent(match[idx + 1]);
+      extracted[name] = safeDecodeUriSegment(match[idx + 1]);
     });
   }
   return extracted;
@@ -409,15 +412,22 @@ function extractTargetResourceIdentityFromUrl(
   armBaseUrl?: string,
 ): OwnedTargetResource | undefined {
   try {
-    const pathname = stripConfiguredArmBasePath(urlStr, armBaseUrl).replace(/\/+$/, "");
+    const encodedPathname = stripConfiguredArmBasePath(urlStr, armBaseUrl).replace(/\/+$/, "");
     const rgMatch =
       /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/([^/]+)\/([^/]+)\/([^/]+)$/i.exec(
-        pathname,
+        encodedPathname,
       );
     if (!rgMatch) {
       return undefined;
     }
-    const [, rgName, providerNamespace, collectionSegment, resourceName] = rgMatch;
+    const rgName = safeDecodeUriSegment(rgMatch[1]);
+    const providerNamespace = safeDecodeUriSegment(rgMatch[2]);
+    const collectionSegment = safeDecodeUriSegment(rgMatch[3]);
+    const resourceName = safeDecodeUriSegment(rgMatch[4]);
+    const decodedId = encodedPathname
+      .split("/")
+      .map((s) => safeDecodeUriSegment(s))
+      .join("/");
     const bodyLocation =
       responseBody &&
       typeof responseBody === "object" &&
@@ -430,7 +440,7 @@ function extractTargetResourceIdentityFromUrl(
       name: resourceName,
       location: bodyLocation,
       resourceGroupName: rgName,
-      resourceId: pathname,
+      resourceId: decodedId,
     };
   } catch {
     return undefined;
@@ -566,15 +576,6 @@ export async function executeOperationProbe(
   }
   const runtimeState = ensureRuntimeState(ledger);
   const ownedTargetResources = getOwnedTargetResourcesFromLedger(ledger);
-  const safetyContext: SafetyGuardContext = {
-    trustedArmBaseUrl: ledger.armBaseUrl,
-    allowedArmOrigins: ledger.allowedArmOrigins,
-    subscriptionId: ledger.subscriptionId,
-    disposableRgName: ledger.disposableResourceGroup?.name,
-    ownedTargetResources,
-    allowDisposableRgLifecycle: false,
-  };
-
   const expectError = Boolean(input.expectError);
   const method = input.method ?? contract.method;
   if (!expectError && method.toUpperCase() !== contract.method.toUpperCase()) {
@@ -603,6 +604,53 @@ export async function executeOperationProbe(
       `Positive probe URL "${stripConfiguredArmBasePath(targetUrl, ledger.armBaseUrl)}" does not match declared route template "${contract.pathTemplate}" for "${contract.operationId}".`,
     );
   }
+
+  const upperMethod = method.toUpperCase();
+  const isReadOnlyMethod =
+    upperMethod === "GET" || upperMethod === "HEAD" || upperMethod === "OPTIONS";
+  const isCheckNameAvail =
+    upperMethod === "POST" &&
+    /\/checknameavailability$/i.test(stripConfiguredArmBasePath(targetUrl, ledger.armBaseUrl));
+
+  let verifiedRgRunIdTag: string | undefined;
+  const expectedRunId = ledger.disposableResourceGroup?.runId ?? ledger.runId;
+  if (!isReadOnlyMethod && !isCheckNameAvail) {
+    if (!ledger.subscriptionId || !ledger.disposableResourceGroup) {
+      throw new Error(
+        `Blocked mutating ${upperMethod} probe for "${contract.operationId}": disposable Resource Group is not created yet.`,
+      );
+    }
+    if (ledger.disposableResourceGroup.cleanupStatus !== "active") {
+      throw new Error(
+        `Blocked mutating ${upperMethod} probe for "${contract.operationId}": disposable Resource Group "${ledger.disposableResourceGroup.name}" has cleanupStatus "${ledger.disposableResourceGroup.cleanupStatus}".`,
+      );
+    }
+    if (!expectedRunId) {
+      throw new Error(
+        `Blocked mutating ${upperMethod} probe for "${contract.operationId}": missing runId ownership marker in ledger.`,
+      );
+    }
+    verifiedRgRunIdTag = await verifyLiveDisposableRgOwnership({
+      armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
+      subscriptionId: ledger.subscriptionId,
+      rgName: ledger.disposableResourceGroup.name,
+      expectedRunId,
+      bearerToken: token,
+    });
+  }
+
+  const safetyContext: SafetyGuardContext = {
+    trustedArmBaseUrl: ledger.armBaseUrl,
+    allowedArmOrigins: ledger.allowedArmOrigins,
+    subscriptionId: ledger.subscriptionId,
+    disposableRgName: ledger.disposableResourceGroup?.name,
+    disposableRgCleanupStatus: ledger.disposableResourceGroup?.cleanupStatus,
+    expectedRunId,
+    verifiedRgRunIdTag,
+    ownedTargetResources,
+    allowDisposableRgLifecycle: false,
+  };
 
   const secretHeaderNames = [
     ...new Set([
@@ -1153,6 +1201,23 @@ export async function executeOperationProbe(
       if (discoveredNames.length > 0) {
         runtimeState.listItemNamesByResourceType[contract.resourceType] = discoveredNames;
       }
+    }
+  }
+
+  const secretQueryParamNames = contract.parameters
+    .filter((p) => p.in === "query" && p.secretCandidate)
+    .map((p) => p.name);
+  const secretPathSlotNames = contract.parameters
+    .filter((p) => p.in === "path" && p.secretCandidate)
+    .map((p) => p.name);
+  if (secretQueryParamNames.length > 0 || secretPathSlotNames.length > 0) {
+    for (const ex of exchanges) {
+      ex.request.url = sanitizeUrlSecretParameters(ex.request.url, {
+        armBaseUrl: ledger.armBaseUrl,
+        secretQueryParamNames,
+        secretPathTemplate: contract.pathTemplate,
+        secretPathSlotNames,
+      });
     }
   }
 

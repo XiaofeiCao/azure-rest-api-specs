@@ -12,13 +12,14 @@ import {
   isValidDisposableRgName,
   parseRetryAfterMs,
   resolveArmRelativeOrAbsoluteUrl,
+  RUN_OWNERSHIP_TAG,
   sendRawHttpExchange,
+  verifyLiveDisposableRgOwnership,
 } from "./auth-and-http.ts";
 import { loadLedger, saveLedger } from "./ledger-store.ts";
 import type { ExternalDependencyKind, ProvisionedFixture } from "./types.ts";
 
 const ARM_RESOURCES_API_VERSION = "2024-03-01";
-const RUN_OWNERSHIP_TAG = "arm-blackbox-run-id";
 
 export function generateDisposableRgName(serviceHint?: string): string {
   const cleanHint = (serviceHint ?? "svc")
@@ -317,6 +318,9 @@ async function putArmFixtureAndWait(options: {
   body: unknown;
   bearerToken: string;
   disposableRgName: string;
+  disposableRgCleanupStatus: string;
+  expectedRunId: string;
+  verifiedRgRunIdTag: string;
   pollIntervalMs?: number;
   maxPollAttempts?: number;
 }): Promise<Record<string, unknown>> {
@@ -326,6 +330,9 @@ async function putArmFixtureAndWait(options: {
     allowedArmOrigins: options.allowedArmOrigins,
     subscriptionId: options.subscriptionId,
     disposableRgName: options.disposableRgName,
+    disposableRgCleanupStatus: options.disposableRgCleanupStatus,
+    expectedRunId: options.expectedRunId,
+    verifiedRgRunIdTag: options.verifiedRgRunIdTag,
     allowDisposableRgLifecycle: false,
   };
 
@@ -470,6 +477,17 @@ export async function provisionExternalFixture(options: {
       "Create the disposable Resource Group (`rg create`) before provisioning external fixtures.",
     );
   }
+  if (ledger.disposableResourceGroup.cleanupStatus !== "active") {
+    throw new Error(
+      `Refusing to provision fixture while disposable Resource Group "${ledger.disposableResourceGroup.name}" has cleanupStatus "${ledger.disposableResourceGroup.cleanupStatus}".`,
+    );
+  }
+  const expectedRunId = ledger.disposableResourceGroup.runId ?? ledger.runId;
+  if (!expectedRunId) {
+    throw new Error(
+      `Refusing to provision fixture in Resource Group "${ledger.disposableResourceGroup.name}": missing recorded runId ownership marker.`,
+    );
+  }
 
   const sub = ledger.subscriptionId;
   const rg = ledger.disposableResourceGroup.name;
@@ -480,6 +498,14 @@ export async function provisionExternalFixture(options: {
     subscriptionId: sub,
     armBaseUrl: ledger.armBaseUrl,
     tokenResource: ledger.armTokenResource,
+  });
+  const verifiedRgRunIdTag = await verifyLiveDisposableRgOwnership({
+    armBaseUrl: ledger.armBaseUrl,
+    allowedArmOrigins: ledger.allowedArmOrigins,
+    subscriptionId: sub,
+    rgName: rg,
+    expectedRunId,
+    bearerToken: token,
   });
 
   const rgPrefix = `/subscriptions/${encodeURIComponent(sub)}/resourceGroups/${encodeURIComponent(rg)}`;
@@ -496,6 +522,9 @@ export async function provisionExternalFixture(options: {
       body: { location },
       bearerToken: token,
       disposableRgName: rg,
+      disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
+      expectedRunId,
+      verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
     });
     fixture = {
@@ -533,6 +562,9 @@ export async function provisionExternalFixture(options: {
       },
       bearerToken: token,
       disposableRgName: rg,
+      disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
+      expectedRunId,
+      verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
     });
     const vnetId = typeof body.id === "string" ? body.id : resourcePath;
@@ -610,6 +642,9 @@ export async function provisionExternalFixture(options: {
       },
       bearerToken: token,
       disposableRgName: rg,
+      disposableRgCleanupStatus: freshLedger.disposableResourceGroup?.cleanupStatus ?? "active",
+      expectedRunId,
+      verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
     });
     fixture = {
@@ -644,6 +679,9 @@ export async function provisionExternalFixture(options: {
       },
       bearerToken: token,
       disposableRgName: rg,
+      disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
+      expectedRunId,
+      verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
     });
     fixture = {
@@ -666,6 +704,9 @@ export async function provisionExternalFixture(options: {
       },
       bearerToken: token,
       disposableRgName: rg,
+      disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
+      expectedRunId,
+      verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
     });
     fixture = {

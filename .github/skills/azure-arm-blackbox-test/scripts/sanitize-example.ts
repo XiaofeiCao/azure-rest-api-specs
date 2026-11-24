@@ -23,6 +23,9 @@ export interface SanitizeContext {
   armBaseUrl?: string;
   allowedArmOrigins?: string[];
   extraSecretPropertyPaths?: string[];
+  secretQueryParamNames?: string[];
+  secretPathTemplate?: string;
+  secretPathSlotNames?: string[];
   secretCycleRules?: SecretCycleRule[];
   secretConstraints?: Record<string, SecretStringConstraint>;
   maxSecretCycleVariants?: number;
@@ -242,6 +245,93 @@ function findMatchingSecretConstraint(
   return undefined;
 }
 
+export function sanitizeUrlSecretParameters(
+  rawUrl: string,
+  options: {
+    armBaseUrl?: string;
+    secretQueryParamNames?: string[];
+    secretPathTemplate?: string;
+    secretPathSlotNames?: string[];
+  },
+): string {
+  const isAbsolute = /^https?:\/\//i.test(rawUrl);
+  const looksLikeRelativeUrl = !isAbsolute && (rawUrl.startsWith("/") || rawUrl.includes("?"));
+  if (!isAbsolute && !looksLikeRelativeUrl) {
+    return rawUrl;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = isAbsolute ? new URL(rawUrl) : new URL(rawUrl, "https://management.azure.com");
+  } catch {
+    return rawUrl;
+  }
+
+  const secretQueryLower = new Set(
+    (options.secretQueryParamNames ?? []).map((n) => n.toLowerCase()),
+  );
+  let mutated = false;
+
+  for (const key of [...parsed.searchParams.keys()]) {
+    const lowerKey = key.toLowerCase();
+    if (
+      secretQueryLower.has(lowerKey) ||
+      SECRET_KEY_NAME_RE.test(key) ||
+      SECRET_SUBSTRING_KEY_RE.test(key)
+    ) {
+      parsed.searchParams.set(key, "<redacted>");
+      mutated = true;
+    }
+  }
+
+  const secretSlotsLower = new Set((options.secretPathSlotNames ?? []).map((s) => s.toLowerCase()));
+  if (secretSlotsLower.size > 0 && options.secretPathTemplate) {
+    let basePrefix = "";
+    if (options.armBaseUrl) {
+      try {
+        const baseObj = new URL(options.armBaseUrl);
+        if (!isAbsolute || parsed.origin.toLowerCase() === baseObj.origin.toLowerCase()) {
+          basePrefix = baseObj.pathname.replace(/\/+$/, "");
+        }
+      } catch {
+        // Ignore invalid base URL.
+      }
+    }
+    const rawPath = parsed.pathname;
+    const strippedPath =
+      basePrefix && rawPath.toLowerCase().startsWith(`${basePrefix.toLowerCase()}/`)
+        ? rawPath.slice(basePrefix.length)
+        : rawPath;
+    const tSegs = options.secretPathTemplate
+      .split("?")[0]
+      .replace(/^\/+|\/+$/g, "")
+      .split("/");
+    const aSegs = strippedPath.replace(/^\/+|\/+$/g, "").split("/");
+    if (tSegs.length === aSegs.length) {
+      let slotReplaced = false;
+      for (let i = 0; i < tSegs.length; i++) {
+        const m = /^\{([^}]+)\}$/.exec(tSegs[i]);
+        if (m && secretSlotsLower.has(m[1].toLowerCase())) {
+          aSegs[i] = "<redacted>";
+          slotReplaced = true;
+        }
+      }
+      if (slotReplaced) {
+        parsed.pathname = `${basePrefix}/${aSegs.join("/")}`;
+        mutated = true;
+      }
+    }
+  }
+
+  if (!mutated) {
+    return rawUrl;
+  }
+  const rebuilt = isAbsolute
+    ? parsed.toString()
+    : `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  return rebuilt.replace(/%3Credacted%3E/gi, "<redacted>");
+}
+
 export function sanitizeStringValue(
   raw: string,
   ctx: SanitizeContext,
@@ -291,6 +381,14 @@ export function sanitizeStringValue(
   }
 
   let text = raw;
+
+  // Redact @secret query and path parameters on URLs before normalizing hostnames/GUIDs (#60682).
+  text = sanitizeUrlSecretParameters(text, {
+    armBaseUrl: ctx.armBaseUrl,
+    secretQueryParamNames: ctx.secretQueryParamNames,
+    secretPathTemplate: ctx.secretPathTemplate,
+    secretPathSlotNames: ctx.secretPathSlotNames,
+  });
 
   // Normalize custom Canary / EUAP / Dogfood / loopback ARM base URLs to canonical https://management.azure.com.
   if (ctx.armBaseUrl) {
@@ -387,10 +485,13 @@ export function sanitizePayload(
   pathSegments: string[] = [],
   forceSecretSubtree = false,
 ): unknown {
-  // Propagate @secret status from any matched container object/array through all its descendants (#7801)!
+  // Propagate @secret status from any matched container object/array (including root whole-body @secret parameters)
+  // through all its descendants (#7801, #60746)!
+  const rootPropertySegments =
+    pathSegments.length > 0 ? pathSegments : propertyName ? [propertyName] : [];
   const isSecretContainer =
     forceSecretSubtree ||
-    (pathSegments.length > 0 && matchesAnyDeclaredSecretPath(pathSegments, ctx)) ||
+    (rootPropertySegments.length > 0 && matchesAnyDeclaredSecretPath(rootPropertySegments, ctx)) ||
     Boolean(
       propertyName &&
       (SECRET_KEY_NAME_RE.test(propertyName) || SECRET_SUBSTRING_KEY_RE.test(propertyName)),

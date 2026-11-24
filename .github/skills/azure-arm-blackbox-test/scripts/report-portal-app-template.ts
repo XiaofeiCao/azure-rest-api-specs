@@ -8,6 +8,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
     bundle: null,
     selectedServiceId: "all",
     activeTab: "operations",
+    lastDrawerTrigger: null,
   };
 
   function esc(value) {
@@ -158,17 +159,21 @@ export const REPORT_PORTAL_APP_JS = `(function () {
   function renderServicesGrid() {
     const grid = document.getElementById("servicesGrid");
     const allBtn = document.getElementById("selectAllServicesBtn");
-    allBtn.classList.toggle("hidden", state.bundle.services.length <= 1);
+    const multiService = state.bundle.services.length > 1;
+    allBtn.classList.toggle("hidden", !multiService);
     allBtn.classList.toggle("active", state.selectedServiceId === "all");
+    allBtn.setAttribute("aria-pressed", String(state.selectedServiceId === "all"));
 
     grid.innerHTML = state.bundle.services
       .map((svc) => {
-        const isSelected =
-          state.selectedServiceId === svc.serviceId || state.bundle.services.length === 1;
+        const isSelected = state.selectedServiceId === svc.serviceId || !multiService;
         const specUrl = safeHttpsUrl(svc.githubSpecUrl);
         const specHtml = specUrl
           ? \`<a href="\${esc(specUrl)}" target="_blank" rel="noopener noreferrer" data-ext-link="1">\${esc(svc.specRelativeDir)} ↗</a>\`
           : esc(svc.specRelativeDir);
+        const selectBtnHtml = multiService
+          ? \`<button type="button" class="btn btn-secondary btn-sm \${isSelected ? "active" : ""}" aria-pressed="\${isSelected ? "true" : "false"}" data-select-service="\${esc(svc.serviceId)}">\${isSelected ? "Selected ✓" : "Filter to Run"}</button>\`
+          : "";
         return \`
           <div class="service-card \${isSelected ? "selected" : ""}" data-service-id="\${esc(svc.serviceId)}">
             <div class="service-card-top">
@@ -179,6 +184,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
               <div class="tag-row">
                 \${renderEndpointBadge(svc.armBaseUrl)}
                 <span class="version-tag">\${esc(svc.apiVersion)}</span>
+                \${selectBtnHtml}
               </div>
             </div>
             <div class="service-metrics">
@@ -211,7 +217,15 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       link.addEventListener("click", (ev) => ev.stopPropagation());
     });
 
-    if (state.bundle.services.length > 1) {
+    if (multiService) {
+      grid.querySelectorAll("[data-select-service]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const id = btn.getAttribute("data-select-service");
+          state.selectedServiceId = state.selectedServiceId === id ? "all" : id;
+          renderAll();
+        });
+      });
       grid.querySelectorAll(".service-card").forEach((card) => {
         card.addEventListener("click", () => {
           const id = card.getAttribute("data-service-id");
@@ -311,7 +325,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
               <div class="muted">\${esc(svc.apiVersion)}</div>
             </td>
             <td>
-              <strong><code>\${esc(op.operationId)}</code></strong>
+              <button type="button" class="op-link-btn" data-open-svc="\${esc(svc.serviceId)}" data-open-op="\${esc(op.operationId)}"><strong><code>\${esc(op.operationId)}</code></strong></button>
               \${op.blockerReason ? \`<div class="muted">\${esc(String(op.blockerReason).slice(0, 85))}</div>\` : ""}
             </td>
             <td>
@@ -340,9 +354,21 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       link.addEventListener("click", (ev) => ev.stopPropagation());
     });
 
+    tbody.querySelectorAll("[data-open-op]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openOperationDrawer(
+          btn.getAttribute("data-open-svc"),
+          btn.getAttribute("data-open-op"),
+          btn,
+        );
+      });
+    });
+
     tbody.querySelectorAll("tr.clickable-row").forEach((tr) => {
       tr.addEventListener("click", () => {
-        openOperationDrawer(tr.getAttribute("data-svc"), tr.getAttribute("data-op"));
+        const rowBtn = tr.querySelector("[data-open-op]");
+        openOperationDrawer(tr.getAttribute("data-svc"), tr.getAttribute("data-op"), rowBtn);
       });
     });
   }
@@ -399,7 +425,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
         ({ svc, op, param }) => \`
           <tr class="clickable-row" data-svc="\${esc(svc.serviceId)}" data-op="\${esc(op.operationId)}">
             <td>\${esc(svc.providerNamespace.replace(/^Microsoft\\./, ""))}</td>
-            <td><code>\${esc(op.operationId)}</code></td>
+            <td><button type="button" class="op-link-btn" data-open-svc="\${esc(svc.serviceId)}" data-open-op="\${esc(op.operationId)}"><code>\${esc(op.operationId)}</code></button></td>
             <td><strong><code>\${esc(param.name)}</code></strong></td>
             <td><span class="badge badge-neutral">\${esc(param.in)}</span></td>
             <td>\${param.required ? "<strong>Required</strong>" : '<span class="muted">Optional</span>'}</td>
@@ -417,9 +443,21 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       )
       .join("");
 
+    tbody.querySelectorAll("[data-open-op]").forEach((btn) => {
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        openOperationDrawer(
+          btn.getAttribute("data-open-svc"),
+          btn.getAttribute("data-open-op"),
+          btn,
+        );
+      });
+    });
+
     tbody.querySelectorAll("tr.clickable-row").forEach((tr) => {
       tr.addEventListener("click", () => {
-        openOperationDrawer(tr.getAttribute("data-svc"), tr.getAttribute("data-op"));
+        const rowBtn = tr.querySelector("[data-open-op]");
+        openOperationDrawer(tr.getAttribute("data-svc"), tr.getAttribute("data-op"), rowBtn);
       });
     });
   }
@@ -501,10 +539,13 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       .join("");
   }
 
-  function openOperationDrawer(serviceId, operationId) {
+  function openOperationDrawer(serviceId, operationId, triggerEl) {
     const svc = state.bundle.services.find((s) => s.serviceId === serviceId);
     const op = svc?.operations.find((o) => o.operationId === operationId);
     if (!svc || !op) return;
+    if (triggerEl && typeof triggerEl.focus === "function") {
+      state.lastDrawerTrigger = triggerEl;
+    }
 
     document.getElementById("drawerServiceLabel").textContent =
       \`\${svc.providerNamespace} (\${svc.apiVersion})\`;
@@ -635,11 +676,19 @@ export const REPORT_PORTAL_APP_JS = `(function () {
 
     document.getElementById("drawerBackdrop").classList.remove("hidden");
     document.getElementById("detailDrawer").classList.remove("hidden");
+    const closeBtn = document.getElementById("closeDrawerBtn");
+    if (closeBtn && typeof closeBtn.focus === "function") {
+      closeBtn.focus();
+    }
   }
 
   function closeDrawer() {
     document.getElementById("drawerBackdrop").classList.add("hidden");
     document.getElementById("detailDrawer").classList.add("hidden");
+    if (state.lastDrawerTrigger && typeof state.lastDrawerTrigger.focus === "function") {
+      state.lastDrawerTrigger.focus();
+      state.lastDrawerTrigger = null;
+    }
   }
 
   function updateActiveTabVisibility() {

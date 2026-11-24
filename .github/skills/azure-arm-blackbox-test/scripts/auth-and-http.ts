@@ -157,13 +157,14 @@ export function resolveArmRelativeOrAbsoluteUrl(armBaseUrl: string, pathOrUrl: s
 
 /**
  * Strips any configured `armBaseUrl` pathname prefix (e.g. `/arm-canary`) from a URL's pathname
- * when the URL targets the configured base origin, yielding the canonical `/subscriptions/...` path.
+ * WITHOUT decoding percent-encoded characters (`%25`, `%2F`) so downstream parameter extractors
+ * decode each captured slot exactly once (#60789).
  */
 export function stripConfiguredArmBasePath(targetUrl: string, trustedArmBaseUrl?: string): string {
   const parsedTarget = /^https?:\/\//i.test(targetUrl)
     ? new URL(targetUrl)
     : new URL(targetUrl.startsWith("/") ? targetUrl : `/${targetUrl}`, DEFAULT_ARM_BASE_URL);
-  const rawPathname = decodeURIComponent(parsedTarget.pathname);
+  const rawPathname = parsedTarget.pathname;
   if (!trustedArmBaseUrl) {
     return rawPathname;
   }
@@ -179,9 +180,39 @@ export function stripConfiguredArmBasePath(targetUrl: string, trustedArmBaseUrl?
       }
     }
   } catch {
-    // Fall back to raw decoded pathname if base URL cannot be parsed.
+    // Fall back to raw encoded pathname if base URL cannot be parsed.
   }
   return rawPathname;
+}
+
+export function findHeaderCaseInsensitive(
+  headers: Record<string, string> | undefined,
+  headerName: string,
+): string | undefined {
+  if (!headers) {
+    return undefined;
+  }
+  if (headers[headerName] !== undefined) {
+    return headers[headerName];
+  }
+  const lower = headerName.toLowerCase();
+  if (headers[lower] !== undefined) {
+    return headers[lower];
+  }
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lower) {
+      return v;
+    }
+  }
+  return undefined;
+}
+
+export function safeDecodeUriSegment(rawSegment: string): string {
+  try {
+    return decodeURIComponent(rawSegment);
+  } catch {
+    return rawSegment;
+  }
 }
 
 function resolveAzExecutable(): string {
@@ -271,6 +302,9 @@ export interface SafetyGuardContext {
   allowedArmOrigins?: string[];
   subscriptionId?: string;
   disposableRgName?: string;
+  disposableRgCleanupStatus?: string;
+  expectedRunId?: string;
+  verifiedRgRunIdTag?: string;
   ownedTargetResources?: OwnedTargetResource[];
   allowDisposableRgLifecycle?: boolean;
 }
@@ -442,7 +476,20 @@ export function assertSafeArmTarget(
 
   assertNoCrossScopeBodyTargets(requestBody, ctx);
 
-  const pathname = stripConfiguredArmBasePath(targetUrl, ctx.trustedArmBaseUrl).replace(/\/+$/, "");
+  const encodedPathname = stripConfiguredArmBasePath(targetUrl, ctx.trustedArmBaseUrl).replace(
+    /\/+$/,
+    "",
+  );
+  // Reject encoded path-separator smuggling (%2F / %5C) on mutating ARM targets.
+  if (/%2f|%5c/i.test(encodedPathname)) {
+    throw new Error(
+      `Blocked mutating ${upperMethod} request containing percent-encoded path separators: ${encodedPathname}`,
+    );
+  }
+  const pathname = encodedPathname
+    .split("/")
+    .map((seg) => safeDecodeUriSegment(seg))
+    .join("/");
   const subSegmentMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(pathname);
 
   // Non-destructive ARM name-availability checks are subscription/provider scoped POSTs.
@@ -483,6 +530,19 @@ export function assertSafeArmTarget(
     );
   }
 
+  if (!ctx.allowDisposableRgLifecycle) {
+    if (ctx.disposableRgCleanupStatus !== undefined && ctx.disposableRgCleanupStatus !== "active") {
+      throw new Error(
+        `Blocked mutating ${upperMethod} request to ${pathname}: disposable Resource Group "${ctx.disposableRgName}" is not active (cleanupStatus="${ctx.disposableRgCleanupStatus}").`,
+      );
+    }
+    if (ctx.expectedRunId !== undefined && ctx.verifiedRgRunIdTag !== ctx.expectedRunId) {
+      throw new Error(
+        `Blocked mutating ${upperMethod} request to ${pathname}: live Resource Group ownership tag "${ctx.verifiedRgRunIdTag ?? "<unverified>"}" does not match expected runId "${ctx.expectedRunId}".`,
+      );
+    }
+  }
+
   const rgLower = ctx.disposableRgName.toLowerCase();
 
   // Direct create/update/delete of the disposable RG itself (when manage-rg invokes it).
@@ -496,17 +556,27 @@ export function assertSafeArmTarget(
     );
   }
 
-  // Operations scoped to a Resource Provider inside the disposable RG (rejects RG-level cross-scope actions such as /moveResources: #3904).
-  const rgScopedMatch = /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/.+$/i.exec(
+  // Operations scoped to a Resource Provider inside the disposable RG (rejects RG-level cross-scope actions such as /moveResources
+  // AND delegating Microsoft.Resources deployments/stacks/links that can target external RGs: #3904, #60636).
+  const rgScopedMatch = /^\/subscriptions\/[^/]+\/resourcegroups\/([^/]+)\/providers\/(.+)$/i.exec(
     pathname,
   );
   if (rgScopedMatch) {
-    if (rgScopedMatch[1].toLowerCase() === rgLower) {
-      return;
+    if (rgScopedMatch[1].toLowerCase() !== rgLower) {
+      throw new Error(
+        `Blocked mutating ${upperMethod} targeting Resource Group "${rgScopedMatch[1]}": mutations are strictly confined to "${ctx.disposableRgName}".`,
+      );
     }
-    throw new Error(
-      `Blocked mutating ${upperMethod} targeting Resource Group "${rgScopedMatch[1]}": mutations are strictly confined to "${ctx.disposableRgName}".`,
-    );
+    if (
+      /^microsoft\.resources\/(?:deployments|deploymentstacks|templatespecs|links|deploymentscripts)(?:\/|$)/i.test(
+        rgScopedMatch[2],
+      )
+    ) {
+      throw new Error(
+        `Blocked delegating Microsoft.Resources mutation "${rgScopedMatch[2]}": nested deployments and links can target resources outside "${ctx.disposableRgName}".`,
+      );
+    }
+    return;
   }
 
   // Subscription/location-scoped soft-delete purge/recover ONLY for recorded target-RP resource identities
@@ -591,20 +661,20 @@ export async function sendRawHttpExchange(
 ): Promise<WireHttpExchange> {
   assertSafeArmTarget(options.method, options.url, options.safetyContext, options.body);
 
-  const requestHeaders: Record<string, string> = {
-    Accept: "application/json",
-    Authorization: `Bearer ${options.bearerToken}`,
-    ...options.headers,
-  };
+  // Normalize request header keys via Fetch `Headers` so duplicate spellings combine consistently
+  // and saved exchanges always expose lowercase header keys (#60839).
+  const headerBag = new Headers();
+  headerBag.set("accept", "application/json");
+  headerBag.set("authorization", `Bearer ${options.bearerToken}`);
+  for (const [k, v] of Object.entries(options.headers ?? {})) {
+    headerBag.set(k, v);
+  }
 
   let serializedBody: string | undefined;
   if (options.body !== undefined) {
-    const existingContentTypeEntry = Object.entries(requestHeaders).find(
-      ([k]) => k.toLowerCase() === "content-type",
-    );
-    const effectiveContentType = existingContentTypeEntry?.[1] ?? "application/json";
-    if (!existingContentTypeEntry) {
-      requestHeaders["Content-Type"] = effectiveContentType;
+    const effectiveContentType = headerBag.get("content-type") ?? "application/json";
+    if (!headerBag.has("content-type")) {
+      headerBag.set("content-type", effectiveContentType);
     }
     const isJsonMediaType = /\bjson\b/i.test(effectiveContentType);
     serializedBody =
@@ -613,11 +683,16 @@ export async function sendRawHttpExchange(
         : JSON.stringify(options.body);
   }
 
+  const normalizedRequestHeaders: Record<string, string> = {};
+  headerBag.forEach((val, key) => {
+    normalizedRequestHeaders[key.toLowerCase()] = val;
+  });
+
   const startedAt = new Date();
   const startPerf = performance.now();
   const response = await fetch(options.url, {
     method: options.method.toUpperCase(),
-    headers: requestHeaders,
+    headers: normalizedRequestHeaders,
     body: serializedBody,
     redirect: "manual",
     signal: AbortSignal.timeout(options.timeoutMs ?? 60_000),
@@ -647,7 +722,7 @@ export async function sendRawHttpExchange(
     request: {
       method: options.method.toUpperCase(),
       url: options.url,
-      headers: redactHeaders(requestHeaders, options.extraSensitiveHeaders),
+      headers: redactHeaders(normalizedRequestHeaders, options.extraSensitiveHeaders),
       ...(options.body !== undefined ? { body: options.body } : {}),
     },
     response: {
@@ -657,4 +732,59 @@ export async function sendRawHttpExchange(
       ...(rawTextSnippet !== undefined ? { rawTextSnippet } : {}),
     },
   };
+}
+
+export const RUN_OWNERSHIP_TAG = "arm-blackbox-run-id";
+const ARM_RESOURCES_TAG_CHECK_API_VERSION = "2024-03-01";
+
+/**
+ * Verifies against live ARM that the recorded disposable Resource Group exists and carries
+ * the exact `arm-blackbox-run-id` tag for this ledger run before non-lifecycle mutations (#60602).
+ */
+export async function verifyLiveDisposableRgOwnership(options: {
+  armBaseUrl: string;
+  allowedArmOrigins?: string[];
+  subscriptionId: string;
+  rgName: string;
+  expectedRunId: string;
+  bearerToken: string;
+}): Promise<string> {
+  const rgCheckUrl = resolveArmRelativeOrAbsoluteUrl(
+    options.armBaseUrl,
+    `/subscriptions/${encodeURIComponent(options.subscriptionId)}/resourcegroups/${encodeURIComponent(options.rgName)}?api-version=${ARM_RESOURCES_TAG_CHECK_API_VERSION}`,
+  );
+  const check = await sendRawHttpExchange({
+    step: "initial",
+    method: "GET",
+    url: rgCheckUrl,
+    bearerToken: options.bearerToken,
+    safetyContext: {
+      trustedArmBaseUrl: options.armBaseUrl,
+      allowedArmOrigins: options.allowedArmOrigins,
+      subscriptionId: options.subscriptionId,
+      disposableRgName: options.rgName,
+      allowDisposableRgLifecycle: true,
+    },
+  });
+  if (check.response.status < 200 || check.response.status >= 300) {
+    throw new Error(
+      `Failed live ownership check for disposable Resource Group "${options.rgName}" before mutating call: HTTP ${check.response.status}.`,
+    );
+  }
+  const bodyObj =
+    check.response.body && typeof check.response.body === "object"
+      ? (check.response.body as Record<string, unknown>)
+      : undefined;
+  const tagsObj =
+    bodyObj?.tags && typeof bodyObj.tags === "object"
+      ? (bodyObj.tags as Record<string, unknown>)
+      : undefined;
+  const liveRunId =
+    typeof tagsObj?.[RUN_OWNERSHIP_TAG] === "string" ? tagsObj[RUN_OWNERSHIP_TAG] : undefined;
+  if (liveRunId !== options.expectedRunId) {
+    throw new Error(
+      `Blocked mutation in Resource Group "${options.rgName}": live ${RUN_OWNERSHIP_TAG} tag is "${liveRunId ?? "<missing>"}", expected "${options.expectedRunId}".`,
+    );
+  }
+  return liveRunId;
 }

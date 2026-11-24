@@ -38,8 +38,12 @@ import {
   type HttpOperationResponse,
   type MetadataInfo,
 } from "@typespec/http";
+import { findHeaderCaseInsensitive, safeDecodeUriSegment } from "./auth-and-http.ts";
 import { resolveBodyParameterName, type LoadedTypeSpecService } from "./typespec-loader.ts";
 import type { TypeSpecSchemaIssue, WireHttpExchange } from "./types.ts";
+
+const SECRET_DIAGNOSTIC_NAME_RE =
+  /(password|secret|connectionstring|primarykey|secondarykey|accesskey|apikey|sastoken|sharedkey|clientsecret|privatekey|token)/i;
 
 interface ValidationContext {
   program: Program;
@@ -47,8 +51,19 @@ interface ValidationContext {
   visibility: Visibility;
   isPatchImplicitOptional: boolean;
   strictEnumCase: boolean;
+  inSecretSubtree?: boolean;
   issues: TypeSpecSchemaIssue[];
   activePairs: Set<string>;
+}
+
+function formatDiagnosticSample(value: unknown, isSecretValue = false, maxLen = 60): string {
+  if (isSecretValue) {
+    return '"<redacted>"';
+  }
+  if (typeof value === "string") {
+    return JSON.stringify(value.length > maxLen ? `${value.slice(0, maxLen)}...` : value);
+  }
+  return JSON.stringify(value);
 }
 
 function getRootScalarName(scalar: Scalar): string {
@@ -125,12 +140,19 @@ function validatePropertyLevelConstraints(
   jsonPath: string,
   ctx: ValidationContext,
 ): void {
+  const isPropSecret =
+    Boolean(ctx.inSecretSubtree) ||
+    isSecret(ctx.program, prop) ||
+    isSecret(ctx.program, prop.type) ||
+    SECRET_DIAGNOSTIC_NAME_RE.test(wireName) ||
+    SECRET_DIAGNOSTIC_NAME_RE.test(prop.name);
+
   if (typeof propVal === "string") {
     const pMinLen = getMinLength(ctx.program, prop);
     if (pMinLen !== undefined && propVal.length < pMinLen) {
       ctx.issues.push({
         code: "MIN_LENGTH_VIOLATION",
-        message: `Property "${wireName}" length ${propVal.length} is less than @minLength(${pMinLen}) at ${jsonPath}.`,
+        message: `Property "${wireName}" length is less than @minLength(${pMinLen}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -139,7 +161,7 @@ function validatePropertyLevelConstraints(
     if (pMaxLen !== undefined && propVal.length > pMaxLen) {
       ctx.issues.push({
         code: "MAX_LENGTH_VIOLATION",
-        message: `Property "${wireName}" length ${propVal.length} exceeds @maxLength(${pMaxLen}) at ${jsonPath}.`,
+        message: `Property "${wireName}" length exceeds @maxLength(${pMaxLen}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -150,7 +172,7 @@ function validatePropertyLevelConstraints(
         if (!new RegExp(pPattern).test(propVal)) {
           ctx.issues.push({
             code: "PATTERN_VIOLATION",
-            message: `Property "${wireName}" value ${JSON.stringify(propVal)} does not match @pattern(${JSON.stringify(pPattern)}) at ${jsonPath}.`,
+            message: `Property "${wireName}" value ${formatDiagnosticSample(propVal, isPropSecret)} does not match @pattern(${JSON.stringify(pPattern)}) at ${jsonPath}.`,
             path: jsonPath,
             severity: "error",
           });
@@ -160,11 +182,12 @@ function validatePropertyLevelConstraints(
       }
     }
   } else if (typeof propVal === "number" && Number.isFinite(propVal)) {
+    const shownNum = isPropSecret ? "<redacted>" : String(propVal);
     const pMinVal = getMinValue(ctx.program, prop);
     if (pMinVal !== undefined && propVal < pMinVal) {
       ctx.issues.push({
         code: "MIN_VALUE_VIOLATION",
-        message: `Property "${wireName}" value ${propVal} is less than @minValue(${pMinVal}) at ${jsonPath}.`,
+        message: `Property "${wireName}" value ${shownNum} is less than @minValue(${pMinVal}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -173,7 +196,7 @@ function validatePropertyLevelConstraints(
     if (pMaxVal !== undefined && propVal > pMaxVal) {
       ctx.issues.push({
         code: "MAX_VALUE_VIOLATION",
-        message: `Property "${wireName}" value ${propVal} exceeds @maxValue(${pMaxVal}) at ${jsonPath}.`,
+        message: `Property "${wireName}" value ${shownNum} exceeds @maxValue(${pMaxVal}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -182,7 +205,7 @@ function validatePropertyLevelConstraints(
     if (pMinEx !== undefined && propVal <= pMinEx) {
       ctx.issues.push({
         code: "MIN_VALUE_EXCLUSIVE_VIOLATION",
-        message: `Property "${wireName}" value ${propVal} must be > @minValueExclusive(${pMinEx}) at ${jsonPath}.`,
+        message: `Property "${wireName}" value ${shownNum} must be > @minValueExclusive(${pMinEx}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -191,7 +214,7 @@ function validatePropertyLevelConstraints(
     if (pMaxEx !== undefined && propVal >= pMaxEx) {
       ctx.issues.push({
         code: "MAX_VALUE_EXCLUSIVE_VIOLATION",
-        message: `Property "${wireName}" value ${propVal} must be < @maxValueExclusive(${pMaxEx}) at ${jsonPath}.`,
+        message: `Property "${wireName}" value ${shownNum} must be < @maxValueExclusive(${pMaxEx}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -224,11 +247,17 @@ function validateScalarValue(
   jsonPath: string,
   ctx: ValidationContext,
 ): void {
+  const isScalarSecret = Boolean(ctx.inSecretSubtree) || isSecret(ctx.program, scalar);
   // Honor scalar-level @encode(encoding, wireType) overrides (#8261).
   const scalarEncode =
     getEncode(ctx.program, scalar) ?? findScalarConstraint(ctx.program, scalar, getEncode);
   if (scalarEncode && scalarEncode.type !== scalar) {
-    validateScalarValue(value, scalarEncode.type, jsonPath, ctx);
+    validateScalarValue(
+      value,
+      scalarEncode.type,
+      jsonPath,
+      isScalarSecret ? { ...ctx, inSecretSubtree: true } : ctx,
+    );
     return;
   }
 
@@ -258,7 +287,7 @@ function validateScalarValue(
     if (minLen !== undefined && value.length < minLen) {
       ctx.issues.push({
         code: "MIN_LENGTH_VIOLATION",
-        message: `String length ${value.length} is less than @minLength(${minLen}) at ${jsonPath}.`,
+        message: `String length is less than @minLength(${minLen}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -268,7 +297,7 @@ function validateScalarValue(
     if (maxLen !== undefined && value.length > maxLen) {
       ctx.issues.push({
         code: "MAX_LENGTH_VIOLATION",
-        message: `String length ${value.length} exceeds @maxLength(${maxLen}) at ${jsonPath}.`,
+        message: `String length exceeds @maxLength(${maxLen}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -281,7 +310,7 @@ function validateScalarValue(
         if (!re.test(value)) {
           ctx.issues.push({
             code: "PATTERN_VIOLATION",
-            message: `Value "${value.slice(0, 60)}" does not match @pattern("${pattern}") at ${jsonPath}.`,
+            message: `Value ${formatDiagnosticSample(value, isScalarSecret)} does not match @pattern("${pattern}") at ${jsonPath}.`,
             path: jsonPath,
             severity: "error",
           });
@@ -303,11 +332,12 @@ function validateScalarValue(
       });
       return;
     }
+    const shownNum = isScalarSecret ? "<redacted>" : String(value);
     // Walk full scalar ancestry so custom scalars like `scalar HourInDay extends int32` enforce integer bounds (#8279)!
     if (hasScalarAncestorInSet(scalar, INTEGER_SCALARS) && !Number.isInteger(value)) {
       ctx.issues.push({
         code: "INVALID_INTEGER",
-        message: `Expected integer (TypeSpec scalar "${scalar.name}") at ${jsonPath}, got ${value}.`,
+        message: `Expected integer (TypeSpec scalar "${scalar.name}") at ${jsonPath}, got ${shownNum}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -317,7 +347,7 @@ function validateScalarValue(
     if (minVal !== undefined && value < minVal) {
       ctx.issues.push({
         code: "MIN_VALUE_VIOLATION",
-        message: `Value ${value} is less than @minValue(${minVal}) at ${jsonPath}.`,
+        message: `Value ${shownNum} is less than @minValue(${minVal}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -327,7 +357,7 @@ function validateScalarValue(
     if (maxVal !== undefined && value > maxVal) {
       ctx.issues.push({
         code: "MAX_VALUE_VIOLATION",
-        message: `Value ${value} exceeds @maxValue(${maxVal}) at ${jsonPath}.`,
+        message: `Value ${shownNum} exceeds @maxValue(${maxVal}) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -357,7 +387,7 @@ function validateEnumValue(
   if (!allowed.includes(value as string | number)) {
     ctx.issues.push({
       code: "INVALID_ENUM_VALUE",
-      message: `Value ${JSON.stringify(value)} is not a valid member of closed enum "${enumType.name}" ([${allowed.join(", ")}]) at ${jsonPath}.`,
+      message: `Value ${formatDiagnosticSample(value, ctx.inSecretSubtree)} is not a valid member of closed enum "${enumType.name}" ([${allowed.join(", ")}]) at ${jsonPath}.`,
       path: jsonPath,
       severity: "error",
     });
@@ -408,7 +438,7 @@ function validateUnionValue(
     if (!unionEnum.open) {
       ctx.issues.push({
         code: "INVALID_UNION_ENUM_VALUE",
-        message: `Value ${JSON.stringify(value)} is not in closed union "${unionType.name ?? "union"}" ([${memberValues.join(", ")}]) at ${jsonPath}.`,
+        message: `Value ${formatDiagnosticSample(value, ctx.inSecretSubtree)} is not in closed union "${unionType.name ?? "union"}" ([${memberValues.join(", ")}]) at ${jsonPath}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -422,7 +452,7 @@ function validateUnionValue(
       if (caseInsensitiveMatch !== undefined) {
         ctx.issues.push({
           code: "UNION_CASE_MISMATCH",
-          message: `Value "${value}" differs in casing from declared TypeSpec union variant "${String(caseInsensitiveMatch)}" at ${jsonPath}.`,
+          message: `Value ${formatDiagnosticSample(value, ctx.inSecretSubtree)} differs in casing from declared TypeSpec union variant "${String(caseInsensitiveMatch)}" at ${jsonPath}.`,
           path: jsonPath,
           severity: ctx.strictEnumCase ? "error" : "warning",
         });
@@ -622,16 +652,26 @@ function validateModelValue(
     }
 
     // Honor property-level @encode(encoding, wireType) overrides (#8261) and validate property-level constraints (#28/#29).
-    validatePropertyLevelConstraints(propVal, prop, wireName, `${jsonPath}.${wireName}`, ctx);
+    const propSecret =
+      Boolean(ctx.inSecretSubtree) ||
+      isSecret(ctx.program, prop) ||
+      isSecret(ctx.program, prop.type) ||
+      SECRET_DIAGNOSTIC_NAME_RE.test(wireName) ||
+      SECRET_DIAGNOSTIC_NAME_RE.test(prop.name);
+    const propCtx = propSecret ? { ...ctx, inSecretSubtree: true } : ctx;
+    validatePropertyLevelConstraints(propVal, prop, wireName, `${jsonPath}.${wireName}`, propCtx);
     const propEncode = getEncode(ctx.program, prop);
     const effectivePropType = propEncode ? propEncode.type : prop.type;
-    validateValueAgainstType(propVal, effectivePropType, `${jsonPath}.${wireName}`, ctx);
+    validateValueAgainstType(propVal, effectivePropType, `${jsonPath}.${wireName}`, propCtx);
   }
 
   if (effectiveModel.indexer) {
+    const indexerSecret =
+      Boolean(ctx.inSecretSubtree) || isSecret(ctx.program, effectiveModel.indexer.value);
     const itemCtx: ValidationContext = {
       ...ctx,
       visibility: ctx.visibility | Visibility.Item,
+      ...(indexerSecret ? { inSecretSubtree: true } : {}),
     };
     for (const [k, v] of Object.entries(obj)) {
       if (!knownWireProps.has(k) && v !== undefined && v !== null) {
@@ -667,7 +707,7 @@ export function validateValueAgainstType(
     if (value !== type.value) {
       ctx.issues.push({
         code: "LITERAL_MISMATCH",
-        message: `Expected string literal "${type.value}" at ${jsonPath}, got ${JSON.stringify(value)}.`,
+        message: `Expected string literal "${type.value}" at ${jsonPath}, got ${formatDiagnosticSample(value, ctx.inSecretSubtree)}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -679,7 +719,7 @@ export function validateValueAgainstType(
     if (value !== type.value) {
       ctx.issues.push({
         code: "LITERAL_MISMATCH",
-        message: `Expected numeric literal ${type.value} at ${jsonPath}, got ${JSON.stringify(value)}.`,
+        message: `Expected numeric literal ${type.value} at ${jsonPath}, got ${formatDiagnosticSample(value, ctx.inSecretSubtree)}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -691,7 +731,7 @@ export function validateValueAgainstType(
     if (value !== type.value) {
       ctx.issues.push({
         code: "LITERAL_MISMATCH",
-        message: `Expected boolean literal ${String(type.value)} at ${jsonPath}, got ${JSON.stringify(value)}.`,
+        message: `Expected boolean literal ${String(type.value)} at ${jsonPath}, got ${formatDiagnosticSample(value, ctx.inSecretSubtree)}.`,
         path: jsonPath,
         severity: "error",
       });
@@ -725,7 +765,9 @@ export function validateValueAgainstType(
       return;
     }
     ctx.activePairs.add(cycleKey);
-    validateModelValue(value, type, jsonPath, ctx);
+    const modelCtx =
+      isSecret(ctx.program, type) && !ctx.inSecretSubtree ? { ...ctx, inSecretSubtree: true } : ctx;
+    validateModelValue(value, type, jsonPath, modelCtx);
     ctx.activePairs.delete(cycleKey);
   }
 }
@@ -762,16 +804,24 @@ function extractPathParamsForValidation(
   actualUrl: string,
 ): Record<string, string> {
   const cleanTemplate = pathTemplate.split("?")[0].replace(/^\/+|\/+$/g, "");
-  const actualPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  let rawPathname = new URL(actualUrl).pathname.replace(/^\/+|\/+$/g, "");
+  // Strip any Canary proxy base-path prefix before `/subscriptions/` or `/providers/` when template starts there.
+  const firstTemplateStatic = cleanTemplate.split("/")[0]?.toLowerCase();
+  if (firstTemplateStatic === "subscriptions" || firstTemplateStatic === "providers") {
+    const markerIdx = rawPathname.toLowerCase().indexOf(`${firstTemplateStatic}/`);
+    if (markerIdx > 0) {
+      rawPathname = rawPathname.slice(markerIdx);
+    }
+  }
   const templateSegs = cleanTemplate.split("/");
-  const actualSegs = actualPathname.split("/");
+  const actualSegs = rawPathname.split("/");
   const extracted: Record<string, string> = {};
 
   if (templateSegs.length === actualSegs.length) {
     for (let i = 0; i < templateSegs.length; i++) {
       const m = /^\{([^}]+)\}$/.exec(templateSegs[i]);
       if (m) {
-        extracted[m[1]] = decodeURIComponent(actualSegs[i]);
+        extracted[m[1]] = safeDecodeUriSegment(actualSegs[i]);
       }
     }
     return extracted;
@@ -788,10 +838,10 @@ function extractPathParamsForValidation(
       return seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     })
     .join("\\/");
-  const match = new RegExp(`^${regexStr}$`, "i").exec(actualPathname);
+  const match = new RegExp(`^${regexStr}$`, "i").exec(rawPathname);
   if (match) {
     paramNames.forEach((name, idx) => {
-      extracted[name] = decodeURIComponent(match[idx + 1]);
+      extracted[name] = safeDecodeUriSegment(match[idx + 1]);
     });
   }
   return extracted;
@@ -847,21 +897,23 @@ function validateSuppliedHttpParameter(
   ctx: ValidationContext,
   coerceFromWireString: boolean,
 ): void {
+  const isParamSecret =
+    Boolean(ctx.inSecretSubtree) ||
+    isSecret(ctx.program, paramProp) ||
+    isSecret(ctx.program, paramProp.type) ||
+    SECRET_DIAGNOSTIC_NAME_RE.test(wireName) ||
+    SECRET_DIAGNOSTIC_NAME_RE.test(paramProp.name);
   // Redacted secret values in traces/examples (<redacted>) intentionally replace raw secret material.
-  if (
-    rawVal === "<redacted>" &&
-    (isSecret(ctx.program, paramProp) ||
-      isSecret(ctx.program, paramProp.type) ||
-      /(password|secret|key|token|credential)/i.test(wireName))
-  ) {
+  if (rawVal === "<redacted>" && isParamSecret) {
     return;
   }
+  const paramCtx = isParamSecret ? { ...ctx, inSecretSubtree: true } : ctx;
   const propEncode = getEncode(ctx.program, paramProp);
   const effectiveType = propEncode ? propEncode.type : paramProp.type;
   const coerced = coerceFromWireString ? coerceHttpWireScalarString(rawVal, effectiveType) : rawVal;
 
-  validatePropertyLevelConstraints(coerced, paramProp, wireName, jsonPath, ctx);
-  validateValueAgainstType(coerced, effectiveType, jsonPath, ctx);
+  validatePropertyLevelConstraints(coerced, paramProp, wireName, jsonPath, paramCtx);
+  validateValueAgainstType(coerced, effectiveType, jsonPath, paramCtx);
 }
 
 export function validateStatusMonitorResultAgainstTypeSpec(
@@ -1023,8 +1075,7 @@ export function validateWireExchangeAgainstTypeSpec(
           validateSuppliedHttpParameter(val, p.param, p.name, `$.query.${p.name}`, reqCtx, true);
         }
       } else if (p.type === "header" && p.name.toLowerCase() !== "content-type") {
-        const val =
-          exchange.request.headers[p.name] ?? exchange.request.headers[p.name.toLowerCase()];
+        const val = findHeaderCaseInsensitive(exchange.request.headers, p.name);
         if (val === undefined) {
           if (!p.param.optional) {
             reqCtx.issues.push({
@@ -1053,7 +1104,15 @@ export function validateWireExchangeAgainstTypeSpec(
           });
         }
       } else {
-        validateValueAgainstType(exchange.request.body, reqBody.type, "$.body", reqCtx);
+        const isBodySecret =
+          (reqBody.property ? isSecret(service.program, reqBody.property) : false) ||
+          isSecret(service.program, reqBody.type);
+        validateValueAgainstType(
+          exchange.request.body,
+          reqBody.type,
+          "$.body",
+          isBodySecret ? { ...reqCtx, inSecretSubtree: true } : reqCtx,
+        );
       }
     }
   }
@@ -1112,7 +1171,15 @@ export function validateWireExchangeAgainstTypeSpec(
 
     if (respBody && !isVoidType(respBody.type)) {
       if (exchange.response.body !== undefined) {
-        validateValueAgainstType(exchange.response.body, respBody.type, "$.response.body", respCtx);
+        const isRespBodySecret =
+          (respBody.property ? isSecret(service.program, respBody.property) : false) ||
+          isSecret(service.program, respBody.type);
+        validateValueAgainstType(
+          exchange.response.body,
+          respBody.type,
+          "$.response.body",
+          isRespBodySecret ? { ...respCtx, inSecretSubtree: true } : respCtx,
+        );
       } else if (exchange.response.rawTextSnippet !== undefined) {
         respCtx.issues.push({
           code: "INVALID_JSON_RESPONSE_BODY",

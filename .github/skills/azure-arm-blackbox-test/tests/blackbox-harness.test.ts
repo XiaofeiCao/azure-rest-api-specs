@@ -8,6 +8,7 @@ import {
   assertSafeArmTarget,
   assertTrustedArmOrigin,
   inferArmTokenResource,
+  stripConfiguredArmBasePath,
   validateAndNormalizeArmBaseUrl,
 } from "../scripts/auth-and-http.ts";
 import { executeOperationProbe } from "../scripts/execute-probe.ts";
@@ -1833,12 +1834,84 @@ interface PrivateConns {
     expect(exText).toContain("https://management.azure.com/asyncOps/w-canary-1");
 
     await deleteDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
-    const canaryReport = await buildSummaryReport(workDir);
+
+    // Mutating probe after RG deletion is rejected immediately (#60602)!
+    await expect(
+      executeOperationProbe({
+        workDir,
+        bearerToken: MOCK_TOKEN,
+        input: {
+          operationId: "Widgets_CreateOrUpdate",
+          body: { location: "eastus", properties: { skuTier: "Standard" } },
+        },
+      }),
+    ).rejects.toThrow(/cleanupStatus "deleted"/);
+
+    // Delegating Microsoft.Resources/deployments inside RG is blocked (#60636)!
+    expect(() =>
+      assertSafeArmTarget(
+        "PUT",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-appconfig-abc123/providers/Microsoft.Resources/deployments/nested?api-version=2024-03-01`,
+        {
+          trustedArmBaseUrl: "https://management.azure.com",
+          subscriptionId: REAL_SUB_ID,
+          disposableRgName: "rg-arm-blackbox-appconfig-abc123",
+          disposableRgCleanupStatus: "active",
+          expectedRunId: "run1",
+          verifiedRgRunIdTag: "run1",
+        },
+      ),
+    ).toThrow(/Blocked delegating Microsoft\.Resources/);
+
+    // stripConfiguredArmBasePath preserves percent-encoded %25 and %2F for single-pass decoding (#60789)!
+    expect(
+      stripConfiguredArmBasePath(
+        `${canaryBaseUrl}/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-test/providers/Microsoft.MockWidget/widgets/budget%25`,
+        canaryBaseUrl,
+      ),
+    ).toBe(
+      `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-arm-blackbox-test/providers/Microsoft.MockWidget/widgets/budget%25`,
+    );
+
+    // Root whole-body @secret object AND @secret query parameters on URLs are redacted (#60682, #60746)!
+    const rootSecretSanitized = sanitizePayload(
+      { opaqueMaterial: "ROOT_OBJECT_SECRET_MATERIAL" },
+      { extraSecretPropertyPaths: ["parameters"] },
+      "parameters",
+    );
+    expect(JSON.stringify(rootSecretSanitized)).not.toContain("ROOT_OBJECT_SECRET_MATERIAL");
+    expect(JSON.stringify(rootSecretSanitized)).toContain("<redacted>");
+
+    const urlSecretSanitized = sanitizePayload(
+      "https://management.azure.com/subscriptions/0000/providers/Microsoft.Foo/items?api-version=2025-01-01&opaqueProof=LIVE_SECRET_QUERY_VAL",
+      { secretQueryParamNames: ["opaqueProof"] },
+    );
+    expect(String(urlSecretSanitized)).not.toContain("LIVE_SECRET_QUERY_VAL");
+    expect(String(urlSecretSanitized)).toContain("opaqueProof=<redacted>");
+
+    // Aggregating two runs of the same provider + apiVersion keeps distinct serviceIds (#60893)!
+    const workDirSecond = path.join(tempRoot, "work-canary-second");
+    await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-01-01",
+      workDir: workDirSecond,
+      armBaseUrl: canaryBaseUrl,
+      subscriptionId: REAL_SUB_ID,
+      location: "westus2",
+    });
+    await buildSummaryReport(workDirSecond, { emitHtml: false });
+
+    const canaryReport = await buildSummaryReport(workDir, { extraWorkDirs: [workDirSecond] });
     expect(canaryReport.report.armBaseUrl).toBe(canaryBaseUrl);
     const canaryDataJs = fs.readFileSync(
       path.join(canaryReport.htmlDir!, "assets", "portal-data.js"),
       "utf8",
     );
+    const canaryBundle = JSON.parse(
+      fs.readFileSync(path.join(canaryReport.htmlDir!, "assets", "portal-data.json"), "utf8"),
+    ) as { services: Array<{ serviceId: string }> };
+    expect(canaryBundle.services.length).toBe(2);
+    expect(canaryBundle.services[0].serviceId).not.toBe(canaryBundle.services[1].serviceId);
     // Inline script bundle escapes </script> to prevent XSS breakout!
     expect(canaryDataJs).not.toContain("</script>");
     expect(canaryDataJs).toContain("\\u003c/script\\u003e");

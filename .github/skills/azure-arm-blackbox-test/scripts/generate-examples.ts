@@ -1,6 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { stripConfiguredArmBasePath } from "./auth-and-http.ts";
+import {
+  findHeaderCaseInsensitive,
+  safeDecodeUriSegment,
+  stripConfiguredArmBasePath,
+} from "./auth-and-http.ts";
 import {
   GENERATED_EXAMPLES_DIRNAME,
   loadAllProbeTraces,
@@ -68,7 +72,7 @@ function extractPathParametersFromUrl(
     const match = new RegExp(`^${regexStr}$`, "i").exec(actualPathname);
     if (match) {
       paramNames.forEach((name, idx) => {
-        extracted[name] = decodeURIComponent(match[idx + 1]);
+        extracted[name] = safeDecodeUriSegment(match[idx + 1]);
       });
     }
     return extracted;
@@ -77,7 +81,7 @@ function extractPathParametersFromUrl(
   for (let i = 0; i < templateSegs.length; i++) {
     const paramMatch = /^\{([^}]+)\}$/.exec(templateSegs[i]);
     if (paramMatch) {
-      extracted[paramMatch[1]] = decodeURIComponent(actualSegs[i]);
+      extracted[paramMatch[1]] = safeDecodeUriSegment(actualSegs[i]);
     }
   }
   return extracted;
@@ -93,7 +97,10 @@ function sanitizeResponseBodyForStatus(
     return undefined;
   }
   if (contract.secretResponseStatuses?.includes(statusCode)) {
-    return "<redacted>";
+    if (typeof body === "string") {
+      return "<redacted>";
+    }
+    return sanitizePayload(body, sanitizeCtx, undefined, "", undefined, [], true);
   }
   return sanitizePayload(body, sanitizeCtx);
 }
@@ -170,9 +177,7 @@ export function buildXMsExampleFromTrace(
         parameters[paramSpec.name] = sanitizePayload(queryVal, sanitizeCtx, paramSpec.name);
       }
     } else if (paramSpec.in === "header") {
-      const headerVal =
-        initial.request.headers[paramSpec.name] ??
-        initial.request.headers[paramSpec.name.toLowerCase()];
+      const headerVal = findHeaderCaseInsensitive(initial.request.headers, paramSpec.name);
       if (headerVal !== undefined && paramSpec.name.toLowerCase() !== "authorization") {
         parameters[paramSpec.name] = sanitizePayload(headerVal, sanitizeCtx, paramSpec.name);
       }
@@ -181,6 +186,10 @@ export function buildXMsExampleFromTrace(
         initial.request.body,
         sanitizeCtx,
         paramSpec.secretCandidate ? paramSpec.name : undefined,
+        "",
+        undefined,
+        [],
+        Boolean(paramSpec.secretCandidate),
       );
     }
   }
@@ -389,6 +398,13 @@ export async function generateLiveExamples(
       armBaseUrl: ledger.armBaseUrl,
       allowedArmOrigins: ledger.allowedArmOrigins,
       extraSecretPropertyPaths: contract.secretProperties,
+      secretQueryParamNames: contract.parameters
+        .filter((p) => p.in === "query" && p.secretCandidate)
+        .map((p) => p.name),
+      secretPathTemplate: contract.pathTemplate,
+      secretPathSlotNames: contract.parameters
+        .filter((p) => p.in === "path" && p.secretCandidate)
+        .map((p) => p.name),
       secretCycleRules: contract.secretCycleRules,
       secretConstraints: contract.secretConstraints,
     };

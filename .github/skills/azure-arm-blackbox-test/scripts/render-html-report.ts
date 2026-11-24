@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getUnionAsEnum } from "@azure-tools/typespec-azure-core";
@@ -19,7 +20,11 @@ import {
   type MetadataInfo,
   type Visibility as VisibilityType,
 } from "@typespec/http";
-import { stripConfiguredArmBasePath } from "./auth-and-http.ts";
+import {
+  findHeaderCaseInsensitive,
+  safeDecodeUriSegment,
+  stripConfiguredArmBasePath,
+} from "./auth-and-http.ts";
 import { GENERATED_EXAMPLES_DIRNAME, loadAllProbeTraces, loadLedger } from "./ledger-store.ts";
 import type { BlackboxSummaryReport } from "./render-report.ts";
 import { REPORT_PORTAL_APP_JS } from "./report-portal-app-template.ts";
@@ -517,7 +522,7 @@ function extractPathParamsFromUrl(
     for (let i = 0; i < tSegs.length; i++) {
       const m = /^\{([^}]+)\}$/.exec(tSegs[i]);
       if (m && aSegs[i]) {
-        out[m[1].toLowerCase()] = decodeURIComponent(aSegs[i]);
+        out[m[1].toLowerCase()] = safeDecodeUriSegment(aSegs[i]);
       }
     }
     return out;
@@ -537,7 +542,7 @@ function extractPathParamsFromUrl(
   const match = new RegExp(`^${regexStr}$`, "i").exec(actualPathname);
   if (match) {
     names.forEach((n, idx) => {
-      out[n] = decodeURIComponent(match[idx + 1]);
+      out[n] = safeDecodeUriSegment(match[idx + 1]);
     });
   }
   return out;
@@ -582,6 +587,13 @@ function buildOperationSanitizeContext(
     armBaseUrl: ledger.armBaseUrl,
     allowedArmOrigins: ledger.allowedArmOrigins,
     extraSecretPropertyPaths: contract?.secretProperties,
+    secretQueryParamNames: contract?.parameters
+      .filter((p) => p.in === "query" && p.secretCandidate)
+      .map((p) => p.name),
+    secretPathTemplate: contract?.pathTemplate,
+    secretPathSlotNames: contract?.parameters
+      .filter((p) => p.in === "path" && p.secretCandidate)
+      .map((p) => p.name),
     secretCycleRules: contract?.secretCycleRules,
     secretConstraints: contract?.secretConstraints,
   };
@@ -660,7 +672,14 @@ async function aggregateServiceRunForHtml(
     specIdx >= 0
       ? `https://github.com/Azure/azure-rest-api-specs/tree/main/${specRelativeDir}`
       : undefined;
-  const serviceId = `${ledger.providerNamespace.toLowerCase()}::${ledger.apiVersion}`;
+  const runDiscriminator =
+    ledger.runId ??
+    crypto
+      .createHash("sha256")
+      .update(path.resolve(runDir).toLowerCase())
+      .digest("hex")
+      .slice(0, 8);
+  const serviceId = `${ledger.providerNamespace.toLowerCase()}::${ledger.apiVersion}::${runDiscriminator}`;
 
   const operations: PortalOperationEntry[] = [];
   for (const opId of ledger.executionOrder) {
@@ -717,7 +736,7 @@ async function aggregateServiceRunForHtml(
               break;
             }
           } else if (p.in === "header" && ex.step === "initial") {
-            const hVal = ex.request.headers[p.name] ?? ex.request.headers[p.name.toLowerCase()];
+            const hVal = findHeaderCaseInsensitive(ex.request.headers, p.name);
             if (hVal !== undefined) {
               exercised = true;
               const cleanVal = sanitizePayload(hVal, opCtx, p.name);
@@ -830,7 +849,7 @@ async function aggregateServiceRunForHtml(
       let displayUrl = sanitizedFullUrl;
       try {
         const u = new URL(sanitizedFullUrl);
-        displayUrl = `${u.pathname}${u.search}`;
+        displayUrl = `${u.pathname}${u.search}`.replace(/%3Credacted%3E/gi, "<redacted>");
       } catch {
         // Keep sanitized URL string if non-standard.
       }
