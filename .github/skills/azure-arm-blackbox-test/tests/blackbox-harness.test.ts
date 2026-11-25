@@ -3,7 +3,10 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { analyzeBehavioralDiscrepancies } from "../scripts/analyze-behavior.ts";
+import {
+  analyzeBehavioralDiscrepancies,
+  runTypeSpecLiveValidation,
+} from "../scripts/analyze-behavior.ts";
 import {
   assertSafeArmTarget,
   assertTrustedArmOrigin,
@@ -2121,6 +2124,11 @@ interface KvItems {
   update is ArmCustomPatchAsync<KvItem, KvItemUpdate>;
   #suppress "@azure-tools/typespec-azure-resource-manager/arm-delete-operation-response-codes" "Legacy 200|202|204 delete contract"
   delete is ArmResourceDeleteAsync<KvItem>;
+  getLogOutput is ArmResourceActionSync<KvItem, void, {
+    @statusCode statusCode: 200;
+    @header contentType: "text/plain";
+    @body output: string;
+  }>;
 }
 `,
       "utf8",
@@ -2205,6 +2213,11 @@ interface KvItems {
           );
           return;
         }
+        if (pathname.endsWith("/getLogOutput") && method === "POST") {
+          res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+          res.end("LOG_LINE_".repeat(200) + "TAIL_MARKER_END");
+          return;
+        }
         if (method === "DELETE") {
           // Declared LRO (200 | 202 | 204), but completes synchronously with 204 (like KeyValues_Delete)!
           res.writeHead(204);
@@ -2268,6 +2281,19 @@ interface KvItems {
         body: { properties: { value: "v2" } },
       },
     });
+    const logProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "KvItems_GetLogOutput",
+        pathOrUrl: `${itemUrl}/getLogOutput`,
+      },
+    });
+    expect(logProbe.trace.discrepancies).toEqual([]);
+    expect(typeof logProbe.trace.exchanges[0].response.body).toBe("string");
+    expect(String(logProbe.trace.exchanges[0].response.body)).toContain("TAIL_MARKER_END");
+    expect((logProbe.trace.exchanges[0].response.body as string).length).toBeGreaterThan(1500);
+
     const delProbe = await executeOperationProbe({
       workDir,
       bearerToken: MOCK_TOKEN,
@@ -2280,12 +2306,21 @@ interface KvItems {
     expect(patchProbe.trace.discrepancies).toEqual([]);
     expect(delProbe.trace.discrepancies).toEqual([]);
 
+    // Reject --write-to-spec when TypeSpec schema validation is disabled!
+    await expect(
+      generateLiveExamples({
+        workDir,
+        writeToSpec: true,
+        validateWithTypeSpec: false,
+      }),
+    ).rejects.toThrow(/Cannot disable TypeSpec validation/);
+
     const artifacts = await generateLiveExamples({
       workDir,
       writeToSpec: true,
       validateWithTypeSpec: true,
     });
-    expect(artifacts.length).toBe(4);
+    expect(artifacts.length).toBe(5);
 
     // 1. Synchronous 204 DELETE on 200|202|204 contract emits ONLY "204" in scratch and is skipped by --write-to-spec!
     const delArtifact = artifacts.find((a) => a.operationId === "KvItems_Delete")!;
@@ -2321,7 +2356,12 @@ interface KvItems {
     expect(fs.readdirSync(specExamplesDir).sort()).toEqual([
       "KvItems_CreateOrUpdate.json",
       "KvItems_Get.json",
+      "KvItems_GetLogOutput.json",
     ]);
+    const logExDoc = JSON.parse(
+      fs.readFileSync(path.join(specExamplesDir, "KvItems_GetLogOutput.json"), "utf8"),
+    ) as { responses: { "200": { body: string } } };
+    expect(logExDoc.responses["200"].body).toContain("TAIL_MARKER_END");
 
     // 4. Headerless 202 on a declared DELETE/POST/PATCH LRO is flagged by evaluateExampleOavCompleteness (LRO_RESPONSE_HEADER)!
     const headerlessCheck = evaluateExampleOavCompleteness(inv.operations["KvItems_Delete"], {
@@ -2333,15 +2373,106 @@ interface KvItems {
     // 5. Summary report & HTML portal bundle surface OAV-complete vs wire-subset counts!
     await deleteDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
     const { report, htmlDir } = await buildSummaryReport(workDir);
-    expect(report.exampleSummary.totalGenerated).toBe(4);
-    expect(report.exampleSummary.oavComplete).toBe(2);
+    expect(report.exampleSummary.totalGenerated).toBe(5);
+    expect(report.exampleSummary.oavComplete).toBe(3);
     expect(report.exampleSummary.wireSubsetIncomplete).toBe(2);
     const portalData = JSON.parse(
       fs.readFileSync(path.join(htmlDir!, "assets", "portal-data.json"), "utf8"),
     ) as {
       portfolioSummary: { totalGeneratedExamples: number; oavCompleteExamples: number };
     };
-    expect(portalData.portfolioSummary.totalGeneratedExamples).toBe(4);
-    expect(portalData.portfolioSummary.oavCompleteExamples).toBe(2);
+    expect(portalData.portfolioSummary.totalGeneratedExamples).toBe(5);
+    expect(portalData.portfolioSummary.oavCompleteExamples).toBe(3);
+    // Atomic writes leave zero residual .tmp files in workDir!
+    expect(fs.readdirSync(workDir).some((f) => f.endsWith(".tmp"))).toBe(false);
+
+    // 6. Verify nested external resource IDs (e.g. dataDisks[].managedDisk.id), encoded ?%73%69%67= SAS signatures,
+    //    400 error secret sanitization, and validation failure propagation!
+    expect(() =>
+      assertSafeArmTarget(
+        "PUT",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/resourceGroups/${rgName}/providers/Microsoft.Compute/virtualMachines/vm1?api-version=2024-07-01`,
+        {
+          trustedArmBaseUrl: "https://management.azure.com",
+          subscriptionId: REAL_SUB_ID,
+          disposableRgName: rgName,
+          disposableRgCleanupStatus: "active",
+          expectedRunId: activeRunId,
+          verifiedRgRunIdTag: activeRunId,
+        },
+        {
+          properties: {
+            storageProfile: {
+              dataDisks: [
+                {
+                  deleteOption: "Delete",
+                  managedDisk: {
+                    id: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-external-disks/providers/Microsoft.Compute/disks/prod-disk-01`,
+                  },
+                },
+              ],
+            },
+          },
+        },
+      ),
+    ).toThrow(
+      /Blocked cross-scope mutation field "properties\.storageProfile\.dataDisks\[0\]\.managedDisk\.id"/,
+    );
+
+    const encodedSigSanitized = String(
+      sanitizePayload(
+        "https://contoso.blob.core.windows.net/a?%73%69%67=LIVE_SIGNATURE_SECRET",
+        {},
+      ),
+    );
+    expect(encodedSigSanitized).not.toContain("LIVE_SIGNATURE_SECRET");
+    expect(encodedSigSanitized).toContain("sig=<redacted>");
+
+    const err400Discrepancies = analyzeBehavioralDiscrepancies({
+      contract: {
+        ...inv.operations["KvItems_CreateOrUpdate"],
+        secretProperties: ["error.opaqueProof"],
+      },
+      expectError: false,
+      exchanges: [
+        {
+          step: "initial",
+          timestamp: new Date().toISOString(),
+          durationMs: 10,
+          request: { method: "PUT", url: "https://management.azure.com/x", headers: {} },
+          response: {
+            status: 400,
+            headers: {},
+            body: {
+              error: {
+                code: "InvalidInput",
+                message: "Rejected",
+                opaqueProof: "RAW_400_SECRET_PROOF_987",
+              },
+            },
+          },
+        },
+      ],
+      observedLro: { detected: false, detectionSignals: [], pollCount: 0 },
+      requestSchemaErrors: [],
+      responseSchemaErrors: [],
+    });
+    expect(JSON.stringify(err400Discrepancies)).not.toContain("RAW_400_SECRET_PROOF_987");
+    expect(JSON.stringify(err400Discrepancies)).toContain("<redacted>");
+
+    const failedValidation = await runTypeSpecLiveValidation(
+      path.join(tempRoot, "nonexistent-spec-dir"),
+      "2025-01-01",
+      "KvItems_CreateOrUpdate",
+      {
+        step: "initial",
+        timestamp: new Date().toISOString(),
+        durationMs: 1,
+        request: { method: "PUT", url: "https://management.azure.com/x", headers: {} },
+        response: { status: 400, headers: {} },
+      },
+    );
+    expect(failedValidation.requestErrors.length).toBeGreaterThan(0);
+    expect(failedValidation.requestErrors[0].code).toBe("TYPESPEC_VALIDATION_ERROR");
   });
 });

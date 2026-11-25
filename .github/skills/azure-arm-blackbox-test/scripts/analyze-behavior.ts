@@ -1,4 +1,5 @@
 import { isPathOrAncestorDeclaredSecret, splitEscapedDotPath } from "./sanitize-example.ts";
+import { sanitizePayload, type SanitizeContext } from "./sanitize-example.ts";
 import { loadProjectedTypeSpecService } from "./typespec-loader.ts";
 import {
   validateStatusMonitorResultAgainstTypeSpec,
@@ -58,16 +59,15 @@ export async function runTypeSpecLiveValidation(
     const service = await loadProjectedTypeSpecService(typespecProjectDir, apiVersion);
     return validateWireExchangeAgainstTypeSpec(service, operationId, exchange);
   } catch (err) {
+    const validationIssue: TypeSpecSchemaIssue = {
+      code: "TYPESPEC_VALIDATION_ERROR",
+      message: err instanceof Error ? err.message : String(err),
+      path: "$",
+      severity: "error",
+    };
     return {
-      requestErrors: [],
-      responseErrors: [
-        {
-          code: "TYPESPEC_VALIDATION_ERROR",
-          message: err instanceof Error ? err.message : String(err),
-          path: "$",
-          severity: "error",
-        },
-      ],
+      requestErrors: [validationIssue],
+      responseErrors: [validationIssue],
     };
   }
 }
@@ -292,6 +292,37 @@ export function analyzeBehavioralDiscrepancies(
   // 5. Spec-valid request rejected by live service (400 BadRequest with 0 TypeSpec request errors).
   const hardRequestErrors = requestSchemaErrors.filter((e) => e.severity === "error");
   if (!expectError && initial.response.status === 400 && hardRequestErrors.length === 0) {
+    const errSanitizeCtx: SanitizeContext = {
+      extraSecretPropertyPaths: contract.secretProperties,
+      secretQueryParamNames: contract.parameters
+        .filter((p) => p.in === "query" && p.secretCandidate)
+        .map((p) => p.name),
+      secretPathTemplate: contract.pathTemplate,
+      secretPathSlotNames: contract.parameters
+        .filter((p) => p.in === "path" && p.secretCandidate)
+        .map((p) => p.name),
+      secretCycleRules: contract.secretCycleRules,
+      secretConstraints: contract.secretConstraints,
+    };
+    const forceSecretErrorBody = Boolean(
+      contract.secretResponseStatuses?.includes("400") ||
+      contract.secretResponseStatuses?.includes("*"),
+    );
+    const rawErrorSource = initial.response.body ?? initial.response.rawTextSnippet;
+    const sanitizedErrorBody =
+      rawErrorSource === undefined
+        ? undefined
+        : forceSecretErrorBody && typeof rawErrorSource === "string"
+          ? "<redacted>"
+          : sanitizePayload(
+              rawErrorSource,
+              errSanitizeCtx,
+              undefined,
+              "",
+              undefined,
+              [],
+              forceSecretErrorBody,
+            );
     discrepancies.push({
       ruleId: DISCREPANCY_RULES.SCHEMA_REQUEST_REJECTED,
       severity: "warning",
@@ -299,10 +330,10 @@ export function analyzeBehavioralDiscrepancies(
       sourceLocation: contract.sourceLocation,
       summary: `Request payload satisfied the TypeSpec request model (0 request schema errors), but live service rejected it with HTTP 400.`,
       specExpectation: `Payload conforming to ${contract.operationId} TypeSpec parameter/body models should be accepted or constraints should be modeled in TypeSpec.`,
-      actualWireBehavior: `Service returned HTTP 400: ${JSON.stringify(initial.response.body ?? initial.response.rawTextSnippet ?? {}).slice(0, 300)}`,
+      actualWireBehavior: `Service returned HTTP 400: ${JSON.stringify(sanitizedErrorBody ?? {}).slice(0, 300)}`,
       evidence: {
         status: 400,
-        errorBody: initial.response.body,
+        ...(sanitizedErrorBody !== undefined ? { errorBody: sanitizedErrorBody } : {}),
       },
     });
   }

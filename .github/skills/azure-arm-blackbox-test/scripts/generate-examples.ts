@@ -428,6 +428,11 @@ export function buildXMsExampleFromTrace(
 export async function generateLiveExamples(
   options: GenerateExamplesOptions,
 ): Promise<GeneratedExampleArtifact[]> {
+  if (options.writeToSpec && options.validateWithTypeSpec === false) {
+    throw new Error(
+      "Cannot disable TypeSpec validation (validateWithTypeSpec: false) when writeToSpec is enabled.",
+    );
+  }
   const ledger = loadLedger(options.workDir);
   const allTraces = loadAllProbeTraces(options.workDir);
 

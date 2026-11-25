@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { CoverageLedger, ProbeTrace } from "./types.ts";
@@ -5,6 +6,23 @@ import type { CoverageLedger, ProbeTrace } from "./types.ts";
 export const LEDGER_FILENAME = "coverage-ledger.json";
 export const TRACES_DIRNAME = "traces";
 export const GENERATED_EXAMPLES_DIRNAME = "examples";
+
+function writeFileAtomicallySync(targetPath: string, content: string): void {
+  const parentDir = path.dirname(targetPath);
+  fs.mkdirSync(parentDir, { recursive: true });
+  const tmpPath = `${targetPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, content, "utf8");
+    fs.renameSync(tmpPath, targetPath);
+  } catch (err) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch {
+      // Ignore best-effort temp cleanup error.
+    }
+    throw err;
+  }
+}
 
 export function getLedgerPath(workDir: string): string {
   return path.join(workDir, LEDGER_FILENAME);
@@ -21,19 +39,17 @@ export function loadLedger(workDir: string): CoverageLedger {
 }
 
 export function saveLedger(workDir: string, ledger: CoverageLedger): void {
-  fs.mkdirSync(workDir, { recursive: true });
   ledger.updatedAt = new Date().toISOString();
-  fs.writeFileSync(getLedgerPath(workDir), `${JSON.stringify(ledger, null, 2)}\n`, "utf8");
+  writeFileAtomicallySync(getLedgerPath(workDir), `${JSON.stringify(ledger, null, 2)}\n`);
 }
 
 export function saveProbeTrace(workDir: string, trace: ProbeTrace): string {
   const tracesDir = path.join(workDir, TRACES_DIRNAME);
-  fs.mkdirSync(tracesDir, { recursive: true });
   const safeOpId = trace.operationId.replace(/[^a-zA-Z0-9_-]/g, "_");
   const safeScenario = trace.scenario.replace(/[^a-zA-Z0-9_-]/g, "_");
   const filename = `${String(trace.sequence).padStart(3, "0")}-${safeOpId}-${safeScenario}.json`;
   const fullPath = path.join(tracesDir, filename);
-  fs.writeFileSync(fullPath, `${JSON.stringify(trace, null, 2)}\n`, "utf8");
+  writeFileAtomicallySync(fullPath, `${JSON.stringify(trace, null, 2)}\n`);
   return fullPath;
 }
 

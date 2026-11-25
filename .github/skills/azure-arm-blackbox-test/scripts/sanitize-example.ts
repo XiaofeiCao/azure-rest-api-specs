@@ -14,7 +14,9 @@ const SECRET_SUBSTRING_KEY_RE =
 
 const CONNECTION_STRING_VALUE_RE = /(AccountKey|SharedAccessKey|Secret|Password)\s*=\s*[^;]+/gi;
 
-const SAS_SIG_VALUE_RE = /([?&](?:sig|s|c|h)=)[^&\s"]+/gi;
+const SAS_SIG_VALUE_RE =
+  /([?&](?:(?:s|%73|%53)(?:i|%69|%49)(?:g|%67|%47)|s|%73|%53|c|%63|%43|h|%68|%48)=)[^&\s"]+/gi;
+const URL_SIGNING_QUERY_KEYS = new Set(["sig", "s", "c", "h"]);
 const JWT_VALUE_RE = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 
 export interface SanitizeContext {
@@ -322,6 +324,7 @@ export function sanitizeUrlSecretParameters(
   for (const key of [...parsed.searchParams.keys()]) {
     const lowerKey = key.toLowerCase();
     if (
+      URL_SIGNING_QUERY_KEYS.has(lowerKey) ||
       secretQueryLower.has(lowerKey) ||
       SECRET_KEY_NAME_RE.test(key) ||
       SECRET_SUBSTRING_KEY_RE.test(key)

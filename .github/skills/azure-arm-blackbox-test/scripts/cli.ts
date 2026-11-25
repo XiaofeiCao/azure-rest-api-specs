@@ -281,6 +281,11 @@ export async function runCli(argv: string[]): Promise<void> {
     if (!values["work-dir"]) {
       throw new Error("generate-examples requires --work-dir <dir>");
     }
+    if (values["write-to-spec"] && values["skip-schema-check"]) {
+      throw new Error(
+        "Cannot combine --write-to-spec with --skip-schema-check: examples promoted into the TypeSpec project must pass TypeSpec validation.",
+      );
+    }
     const generated = await generateLiveExamples({
       workDir: values["work-dir"],
       writeToSpec: values["write-to-spec"],

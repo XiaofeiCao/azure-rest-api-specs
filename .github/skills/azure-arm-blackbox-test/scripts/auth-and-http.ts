@@ -397,11 +397,44 @@ export function parseRetryAfterMs(headers: Record<string, string>, fallbackMs: n
   return fallbackMs;
 }
 
+function assertArmReferenceStaysWithinDisposableScope(
+  rawText: string,
+  fieldLabel: string,
+  ctx: SafetyGuardContext,
+): void {
+  const expectedSub = ctx.subscriptionId?.toLowerCase();
+  const expectedRg = ctx.disposableRgName?.toLowerCase();
+  const decoded = safeDecodeUriSegment(rawText.trim());
+  const looksLikeArmRef = /^(?:\/subscriptions\/|https?:\/\/[^\s"'?#]*\/subscriptions\/)/i.test(
+    decoded,
+  );
+  if (!looksLikeArmRef) {
+    return;
+  }
+  const subMatch = /\/subscriptions\/([^/?#\s"']+)/i.exec(decoded);
+  const rgMatch = /\/resourcegroups\/([^/?#\s"']+)/i.exec(decoded);
+  if (subMatch && (!expectedSub || subMatch[1].toLowerCase() !== expectedSub)) {
+    throw new Error(
+      `Blocked cross-scope mutation field "${fieldLabel}" targeting subscription "${subMatch[1]}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
+    );
+  }
+  if (rgMatch && (!expectedRg || rgMatch[1].toLowerCase() !== expectedRg)) {
+    throw new Error(
+      `Blocked cross-scope mutation field "${fieldLabel}" targeting Resource Group "${rgMatch[1]}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+    );
+  }
+}
+
 function assertNoCrossScopeBodyTargets(
   body: unknown,
   ctx: SafetyGuardContext,
   ancestors = new Set<object>(),
+  currentPath = "",
 ): void {
+  if (typeof body === "string") {
+    assertArmReferenceStaysWithinDisposableScope(body, currentPath || "$", ctx);
+    return;
+  }
   if (!body || typeof body !== "object") {
     return;
   }
@@ -412,8 +445,13 @@ function assertNoCrossScopeBodyTargets(
   nextAncestors.add(body);
 
   if (Array.isArray(body)) {
-    for (const item of body) {
-      assertNoCrossScopeBodyTargets(item, ctx, nextAncestors);
+    for (let i = 0; i < body.length; i++) {
+      assertNoCrossScopeBodyTargets(
+        body[i],
+        ctx,
+        nextAncestors,
+        currentPath ? `${currentPath}[${i}]` : `[${i}]`,
+      );
     }
     return;
   }
@@ -422,38 +460,44 @@ function assertNoCrossScopeBodyTargets(
   const expectedRg = ctx.disposableRgName?.toLowerCase();
 
   for (const [key, val] of Object.entries(body as Record<string, unknown>)) {
-    if (typeof val === "string" && CROSS_SCOPE_BODY_KEY_RE.test(key)) {
-      const lowerKey = key.toLowerCase();
-      if (lowerKey.endsWith("subscriptionid")) {
-        if (!expectedSub || val.trim().toLowerCase() !== expectedSub) {
-          throw new Error(
-            `Blocked cross-scope mutation field "${key}" targeting subscription "${val}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
-          );
-        }
-      } else {
-        const subMatch = /\/subscriptions\/([^/]+)/i.exec(val);
-        const rgMatch = /\/resourcegroups\/([^/]+)/i.exec(val);
-        if (subMatch && (!expectedSub || subMatch[1].toLowerCase() !== expectedSub)) {
-          throw new Error(
-            `Blocked cross-scope mutation field "${key}" targeting subscription "${subMatch[1]}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
-          );
-        }
-        if (rgMatch) {
-          if (!expectedRg || rgMatch[1].toLowerCase() !== expectedRg) {
+    const fieldLabel = currentPath ? `${currentPath}.${key}` : key;
+    assertArmReferenceStaysWithinDisposableScope(key, fieldLabel, ctx);
+
+    if (typeof val === "string") {
+      if (CROSS_SCOPE_BODY_KEY_RE.test(key)) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey.endsWith("subscriptionid")) {
+          if (!expectedSub || val.trim().toLowerCase() !== expectedSub) {
             throw new Error(
-              `Blocked cross-scope mutation field "${key}" targeting Resource Group "${rgMatch[1]}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+              `Blocked cross-scope mutation field "${key}" targeting subscription "${val}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
             );
           }
-        } else if (lowerKey.endsWith("resourcegroup") || lowerKey.endsWith("resourcegroupid")) {
-          if (!expectedRg || val.trim().toLowerCase() !== expectedRg) {
+        } else {
+          const subMatch = /\/subscriptions\/([^/]+)/i.exec(val);
+          const rgMatch = /\/resourcegroups\/([^/]+)/i.exec(val);
+          if (subMatch && (!expectedSub || subMatch[1].toLowerCase() !== expectedSub)) {
             throw new Error(
-              `Blocked cross-scope mutation field "${key}" targeting Resource Group "${val}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+              `Blocked cross-scope mutation field "${key}" targeting subscription "${subMatch[1]}" (expected "${ctx.subscriptionId ?? "<unset>"}").`,
             );
+          }
+          if (rgMatch) {
+            if (!expectedRg || rgMatch[1].toLowerCase() !== expectedRg) {
+              throw new Error(
+                `Blocked cross-scope mutation field "${key}" targeting Resource Group "${rgMatch[1]}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+              );
+            }
+          } else if (lowerKey.endsWith("resourcegroup") || lowerKey.endsWith("resourcegroupid")) {
+            if (!expectedRg || val.trim().toLowerCase() !== expectedRg) {
+              throw new Error(
+                `Blocked cross-scope mutation field "${key}" targeting Resource Group "${val}" outside "${ctx.disposableRgName ?? "<unset>"}".`,
+              );
+            }
           }
         }
       }
+      assertArmReferenceStaysWithinDisposableScope(val, fieldLabel, ctx);
     } else if (val && typeof val === "object") {
-      assertNoCrossScopeBodyTargets(val, ctx, nextAncestors);
+      assertNoCrossScopeBodyTargets(val, ctx, nextAncestors, fieldLabel);
     }
   }
 }
@@ -713,13 +757,19 @@ export async function sendRawHttpExchange(
   });
 
   const rawText = await response.text();
+  const contentType = (responseHeaders["content-type"] ?? "").toLowerCase();
+  const isPlainTextMediaType = /^text\/plain\b/.test(contentType);
   let parsedBody: unknown;
   let rawTextSnippet: string | undefined;
   if (rawText.length > 0) {
-    try {
-      parsedBody = JSON.parse(rawText);
-    } catch {
-      rawTextSnippet = rawText.slice(0, 1000);
+    if (isPlainTextMediaType) {
+      parsedBody = rawText;
+    } else {
+      try {
+        parsedBody = JSON.parse(rawText);
+      } catch {
+        rawTextSnippet = rawText.slice(0, 1000);
+      }
     }
   }
 
