@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { analyzeBehavioralDiscrepancies } from "./analyze-behavior.ts";
+import { evaluateExampleOavCompleteness, type XMsExampleDocument } from "./generate-examples.ts";
 import {
   GENERATED_EXAMPLES_DIRNAME,
   loadAllProbeTraces,
@@ -52,6 +53,18 @@ export interface BlackboxSummaryReport {
     blockerReason?: string;
   }>;
   generatedExampleFiles: string[];
+  exampleSummary: {
+    totalGenerated: number;
+    oavComplete: number;
+    wireSubsetIncomplete: number;
+    incompleteExamples: Array<{
+      file: string;
+      operationId: string;
+      observedStatusCodes: string[];
+      missingDeclaredStatusCodes: string[];
+      reasons: string[];
+    }>;
+  };
 }
 
 function formatSourceLoc(
@@ -186,6 +199,37 @@ export async function buildSummaryReport(
         .map((f) => path.join(examplesDir, f))
     : [];
 
+  let oavCompleteCount = 0;
+  const incompleteExamples: BlackboxSummaryReport["exampleSummary"]["incompleteExamples"] = [];
+  for (const exFile of generatedExampleFiles) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(exFile, "utf8")) as Partial<XMsExampleDocument>;
+      const opId = parsed.operationId ?? path.basename(exFile, ".json");
+      const oavCheck = evaluateExampleOavCompleteness(ledger.operations[opId], {
+        responses: parsed.responses ?? {},
+      });
+      if (oavCheck.oavComplete) {
+        oavCompleteCount++;
+      } else {
+        incompleteExamples.push({
+          file: exFile,
+          operationId: opId,
+          observedStatusCodes: oavCheck.observedStatusCodes,
+          missingDeclaredStatusCodes: oavCheck.missingDeclaredStatusCodes,
+          reasons: oavCheck.oavIssues,
+        });
+      }
+    } catch (err) {
+      incompleteExamples.push({
+        file: exFile,
+        operationId: path.basename(exFile, ".json"),
+        observedStatusCodes: [],
+        missingDeclaredStatusCodes: [],
+        reasons: [err instanceof Error ? err.message : String(err)],
+      });
+    }
+  }
+
   const report: BlackboxSummaryReport = {
     generatedAt: new Date().toISOString(),
     serviceName: ledger.serviceName,
@@ -228,6 +272,12 @@ export async function buildSummaryReport(
       blockerReason: e.blockerReason,
     })),
     generatedExampleFiles,
+    exampleSummary: {
+      totalGenerated: generatedExampleFiles.length,
+      oavComplete: oavCompleteCount,
+      wireSubsetIncomplete: incompleteExamples.length,
+      incompleteExamples,
+    },
   };
 
   const jsonPath = path.join(workDir, "blackbox-report.json");
@@ -275,7 +325,9 @@ function renderMarkdownReport(report: BlackboxSummaryReport): string {
   lines.push(
     `- **Behavioral Discrepancies**: **${report.discrepancySummary.total}** (Blocking: ${report.discrepancySummary.blocking}, Warning: ${report.discrepancySummary.warning}, Info: ${report.discrepancySummary.info})`,
   );
-  lines.push(`- **Generated Sanitized Examples**: **${report.generatedExampleFiles.length}**`);
+  lines.push(
+    `- **Generated Sanitized Examples**: **${report.exampleSummary.totalGenerated}** (**${report.exampleSummary.oavComplete}** OAV-complete for \`--write-to-spec\`, **${report.exampleSummary.wireSubsetIncomplete}** wire-subset partial 2xx)`,
+  );
   if (report.disposableResourceGroup) {
     lines.push(
       `- **Disposable Test RG**: \`${report.disposableResourceGroup.name}\` (${report.disposableResourceGroup.location}) — cleanup status: **\`${report.disposableResourceGroup.cleanupStatus}\`**`,
@@ -335,8 +387,22 @@ function renderMarkdownReport(report: BlackboxSummaryReport): string {
   if (report.generatedExampleFiles.length === 0) {
     lines.push("No example files generated yet.");
   } else {
+    const incompleteByFile = new Map(
+      report.exampleSummary.incompleteExamples.map((item) => [item.file, item]),
+    );
     for (const exFile of report.generatedExampleFiles) {
-      lines.push(`- \`${path.basename(exFile)}\` (\`${exFile}\`)`);
+      const inc = incompleteByFile.get(exFile);
+      if (inc) {
+        const missingNote =
+          inc.missingDeclaredStatusCodes.length > 0
+            ? `, missing declared \`[${inc.missingDeclaredStatusCodes.join(", ")}]\``
+            : "";
+        lines.push(
+          `- \`${path.basename(exFile)}\` — wire-subset \`[${inc.observedStatusCodes.join(", ")}]\`${missingNote}; skipped by \`--write-to-spec\` (\`${exFile}\`)`,
+        );
+      } else {
+        lines.push(`- \`${path.basename(exFile)}\` — OAV-complete (\`${exFile}\`)`);
+      }
     }
   }
   lines.push("");

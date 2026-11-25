@@ -104,8 +104,9 @@ node .github/skills/azure-arm-blackbox-test/scripts/cli.ts generate-examples \
   --work-dir <work-dir>
 ```
 
-- Pass `--write-to-spec` **only** when the user asked to write/update `<typespec-project>/examples/<api-version>/*.json`.
-- Consult [references/example-sanitization-and-wiring.md](references/example-sanitization-and-wiring.md) for secret redaction (`SEC-SECRET-DETECT`), PII scrubbing, and LRO dual-response requirements (`EX-COVERAGE`).
+- By default, `generate-examples` writes pure wire-truth examples (containing strictly the HTTP status codes, headers, and bodies observed on the live wire) to `<work-dir>/examples/<api-version>/*.json` without modifying the repository.
+- Pass `--write-to-spec` **only** when the user asked to promote examples into `<typespec-project>/examples/<api-version>/*.json`. `--write-to-spec` writes **only** examples that are both TypeSpec-valid (`schemaValid: true`) and OAV-complete (`oavComplete: true` — covering all declared `2xx` status codes for `OAV111` and required `Location` / `Azure-AsyncOperation` headers on `202` LROs), and reports any skipped wire-subset operations.
+- Consult [references/example-sanitization-and-wiring.md](references/example-sanitization-and-wiring.md) for secret redaction (`SEC-SECRET-DETECT`), PII scrubbing, pure wire-truth LRO stitching, and `--write-to-spec` OAV-completeness gating.
 
 ### Step 5: Tear Down Disposable RG and Render Final Report
 

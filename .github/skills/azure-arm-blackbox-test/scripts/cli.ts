@@ -286,6 +286,18 @@ export async function runCli(argv: string[]): Promise<void> {
       writeToSpec: values["write-to-spec"],
       validateWithTypeSpec: !values["skip-schema-check"],
     });
+    if (values["write-to-spec"]) {
+      const promotedCount = generated.filter((g) => g.writtenSpecPaths.length > 0).length;
+      const skipped = generated.filter((g) => g.specWriteSkippedReason);
+      console.error(
+        `[generate-examples] --write-to-spec promoted ${promotedCount}/${generated.length} example(s) to spec; skipped ${skipped.length} incomplete/invalid example(s).`,
+      );
+      for (const item of skipped) {
+        console.error(
+          `  - ${item.exampleName} (${item.operationId}): ${item.specWriteSkippedReason}`,
+        );
+      }
+    }
     console.log(JSON.stringify(generated, null, 2));
     return;
   }

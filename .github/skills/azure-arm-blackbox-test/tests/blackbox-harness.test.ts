@@ -12,7 +12,10 @@ import {
   validateAndNormalizeArmBaseUrl,
 } from "../scripts/auth-and-http.ts";
 import { executeOperationProbe } from "../scripts/execute-probe.ts";
-import { generateLiveExamples } from "../scripts/generate-examples.ts";
+import {
+  evaluateExampleOavCompleteness,
+  generateLiveExamples,
+} from "../scripts/generate-examples.ts";
 import {
   createDisposableResourceGroup,
   deleteDisposableResourceGroup,
@@ -672,6 +675,7 @@ interface DeletedStores {
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", () => resolve());
     });
+    server.keepAliveTimeout = 60_000;
     servers.push(server);
     const addr = server.address() as { port: number };
     baseUrl = `http://127.0.0.1:${addr.port}`;
@@ -1228,6 +1232,7 @@ interface PrivateConns {
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", () => resolve());
     });
+    server.keepAliveTimeout = 60_000;
     servers.push(server);
     baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 
@@ -1705,6 +1710,7 @@ interface PrivateConns {
     await new Promise<void>((resolve) => {
       pollServer.listen(0, "127.0.0.1", () => resolve());
     });
+    pollServer.keepAliveTimeout = 60_000;
     servers.push(pollServer);
     pollServerUrl = `http://127.0.0.1:${(pollServer.address() as { port: number }).port}`;
 
@@ -1795,6 +1801,7 @@ interface PrivateConns {
     await new Promise<void>((resolve) => {
       canaryServer.listen(0, "127.0.0.1", () => resolve());
     });
+    canaryServer.keepAliveTimeout = 60_000;
     servers.push(canaryServer);
     canaryBaseUrl = `http://127.0.0.1:${(canaryServer.address() as { port: number }).port}/arm-canary`;
 
@@ -2053,5 +2060,288 @@ interface PrivateConns {
     expect(overrideLedger.armTokenResource).toBe("api://custom-rg-stage-audience");
     expect(overrideLedger.allowedArmOrigins).toContain(pollServerUrl.toLowerCase());
     await deleteDisposableResourceGroup({ workDir: workDirOverride, bearerToken: MOCK_TOKEN });
+  });
+
+  it("enforces pure wire-truth example responses without backfilling un-observed 2xx codes and gates --write-to-spec on OAV completeness", async () => {
+    const tempRoot = makeTempDir();
+    const projectDir = path.join(
+      tempRoot,
+      "specification",
+      "mockkv",
+      "resource-manager",
+      "Microsoft.MockKv",
+      "MockKv",
+    );
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "tspconfig.yaml"), "{}\n", "utf8");
+    fs.writeFileSync(
+      path.join(projectDir, "main.tsp"),
+      `
+import "@typespec/http";
+import "@typespec/rest";
+import "@typespec/versioning";
+import "@azure-tools/typespec-azure-core";
+import "@azure-tools/typespec-azure-resource-manager";
+
+using TypeSpec.Http;
+using TypeSpec.Rest;
+using TypeSpec.Versioning;
+using Azure.ResourceManager;
+
+@armProviderNamespace
+@service(#{ title: "Microsoft.MockKv" })
+@versioned(Versions)
+namespace Microsoft.MockKv;
+
+enum Versions {
+  @armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v5)
+  v2025_01_01: "2025-01-01",
+}
+
+model KvItem is TrackedResource<KvItemProperties> {
+  ...ResourceNameParameter<KvItem, "itemName", "items", "^[a-zA-Z0-9-]{3,24}$">;
+}
+
+model KvItemProperties {
+  value?: string;
+  @visibility(Lifecycle.Read)
+  provisioningState?: ResourceProvisioningState;
+}
+
+model KvItemUpdate {
+  properties?: {
+    value?: string;
+  };
+}
+
+@armResourceOperations
+interface KvItems {
+  get is ArmResourceRead<KvItem>;
+  createOrUpdate is ArmResourceCreateOrReplaceAsync<KvItem>;
+  update is ArmCustomPatchAsync<KvItem, KvItemUpdate>;
+  #suppress "@azure-tools/typespec-azure-resource-manager/arm-delete-operation-response-codes" "Legacy 200|202|204 delete contract"
+  delete is ArmResourceDeleteAsync<KvItem>;
+}
+`,
+      "utf8",
+    );
+
+    let mockBaseUrl = "";
+    const server = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      const pathname = reqUrl.pathname;
+      const method = (req.method ?? "GET").toUpperCase();
+
+      if (/^\/subscriptions\/[^/]+\/resourcegroups\/rg-arm-blackbox-[^/]+$/i.test(pathname)) {
+        const rgName = pathname.split("/").pop()!;
+        if (method === "PUT" || method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: rgName,
+              location: "eastus",
+              tags: { "arm-blackbox-ephemeral": "true", "arm-blackbox-run-id": activeRunId },
+              properties: { provisioningState: "Succeeded" },
+            }),
+          );
+          return;
+        }
+        if (method === "DELETE") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({}));
+          return;
+        }
+      }
+
+      if (pathname.endsWith("/asyncOps/put-kv-1") && method === "GET") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "Succeeded" }));
+        return;
+      }
+
+      if (pathname.includes("/providers/Microsoft.MockKv/items/item-01")) {
+        if (method === "PUT") {
+          res.writeHead(201, {
+            "Content-Type": "application/json",
+            "Azure-AsyncOperation": `${mockBaseUrl}/subscriptions/${REAL_SUB_ID}/providers/Microsoft.MockKv/locations/eastus/asyncOps/put-kv-1?api-version=2025-01-01`,
+            "Retry-After": "0",
+          });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: "item-01",
+              type: "Microsoft.MockKv/items",
+              location: "eastus",
+              properties: { value: "v1", provisioningState: "Creating" },
+            }),
+          );
+          return;
+        }
+        if (method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: "item-01",
+              type: "Microsoft.MockKv/items",
+              location: "eastus",
+              properties: { value: "v1", provisioningState: "Succeeded" },
+            }),
+          );
+          return;
+        }
+        if (method === "PATCH") {
+          // Declared LRO (200 | 202), but completes synchronously with 200!
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: "item-01",
+              type: "Microsoft.MockKv/items",
+              location: "eastus",
+              properties: { value: "v2", provisioningState: "Succeeded" },
+            }),
+          );
+          return;
+        }
+        if (method === "DELETE") {
+          // Declared LRO (200 | 202 | 204), but completes synchronously with 204 (like KeyValues_Delete)!
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "NotFound", message: "Not found" } }));
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    server.keepAliveTimeout = 60_000;
+    servers.push(server);
+    mockBaseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const workDir = path.join(tempRoot, "work");
+    const inv = await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-01-01",
+      workDir,
+      armBaseUrl: mockBaseUrl,
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus",
+    });
+    const activeRunId = inv.runId!;
+
+    const { rgName } = await createDisposableResourceGroup({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+    });
+    const itemUrl = `/subscriptions/${REAL_SUB_ID}/resourceGroups/${rgName}/providers/Microsoft.MockKv/items/item-01`;
+
+    await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "KvItems_CreateOrUpdate",
+        pathOrUrl: itemUrl,
+        body: { location: "eastus", properties: { value: "v1" } },
+        pollIntervalMs: 5,
+      },
+    });
+    await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "KvItems_Get",
+        pathOrUrl: itemUrl,
+      },
+    });
+    const patchProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "KvItems_Update",
+        pathOrUrl: itemUrl,
+        body: { properties: { value: "v2" } },
+      },
+    });
+    const delProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "KvItems_Delete",
+        pathOrUrl: itemUrl,
+      },
+    });
+    // Synchronous completion of declared LRO produces zero behavioral discrepancies!
+    expect(patchProbe.trace.discrepancies).toEqual([]);
+    expect(delProbe.trace.discrepancies).toEqual([]);
+
+    const artifacts = await generateLiveExamples({
+      workDir,
+      writeToSpec: true,
+      validateWithTypeSpec: true,
+    });
+    expect(artifacts.length).toBe(4);
+
+    // 1. Synchronous 204 DELETE on 200|202|204 contract emits ONLY "204" in scratch and is skipped by --write-to-spec!
+    const delArtifact = artifacts.find((a) => a.operationId === "KvItems_Delete")!;
+    const delDoc = JSON.parse(fs.readFileSync(delArtifact.scratchPath, "utf8")) as {
+      responses: Record<string, unknown>;
+    };
+    expect(Object.keys(delDoc.responses)).toEqual(["204"]);
+    expect(delDoc.responses["202"]).toBeUndefined();
+    expect(delDoc.responses["200"]).toBeUndefined();
+    expect(delArtifact.oavComplete).toBe(false);
+    expect(delArtifact.missingDeclaredStatusCodes).toEqual(["200", "202"]);
+    expect(delArtifact.writtenSpecPaths).toEqual([]);
+    expect(delArtifact.specWriteSkippedReason).toContain("OAV111");
+
+    // 2. Synchronous 200 PATCH on 200|202 contract emits ONLY "200" in scratch and is skipped by --write-to-spec!
+    const patchArtifact = artifacts.find((a) => a.operationId === "KvItems_Update")!;
+    const patchDoc = JSON.parse(fs.readFileSync(patchArtifact.scratchPath, "utf8")) as {
+      responses: Record<string, unknown>;
+    };
+    expect(Object.keys(patchDoc.responses)).toEqual(["200"]);
+    expect(patchArtifact.oavComplete).toBe(false);
+    expect(patchArtifact.writtenSpecPaths).toEqual([]);
+
+    // 3. PUT (201 + final-get 200) and GET (200) covered 100% of declared 2xx codes and WERE promoted to spec!
+    const putArtifact = artifacts.find((a) => a.operationId === "KvItems_CreateOrUpdate")!;
+    const getArtifact = artifacts.find((a) => a.operationId === "KvItems_Get")!;
+    expect(putArtifact.oavComplete).toBe(true);
+    expect(putArtifact.writtenSpecPaths.length).toBe(1);
+    expect(getArtifact.oavComplete).toBe(true);
+    expect(getArtifact.writtenSpecPaths.length).toBe(1);
+
+    const specExamplesDir = path.join(projectDir, "examples", "2025-01-01");
+    expect(fs.readdirSync(specExamplesDir).sort()).toEqual([
+      "KvItems_CreateOrUpdate.json",
+      "KvItems_Get.json",
+    ]);
+
+    // 4. Headerless 202 on a declared DELETE/POST/PATCH LRO is flagged by evaluateExampleOavCompleteness (LRO_RESPONSE_HEADER)!
+    const headerlessCheck = evaluateExampleOavCompleteness(inv.operations["KvItems_Delete"], {
+      responses: { "200": {}, "202": {}, "204": {} },
+    });
+    expect(headerlessCheck.oavComplete).toBe(false);
+    expect(headerlessCheck.oavIssues.some((m) => m.includes("LRO_RESPONSE_HEADER"))).toBe(true);
+
+    // 5. Summary report & HTML portal bundle surface OAV-complete vs wire-subset counts!
+    await deleteDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
+    const { report, htmlDir } = await buildSummaryReport(workDir);
+    expect(report.exampleSummary.totalGenerated).toBe(4);
+    expect(report.exampleSummary.oavComplete).toBe(2);
+    expect(report.exampleSummary.wireSubsetIncomplete).toBe(2);
+    const portalData = JSON.parse(
+      fs.readFileSync(path.join(htmlDir!, "assets", "portal-data.json"), "utf8"),
+    ) as {
+      portfolioSummary: { totalGeneratedExamples: number; oavCompleteExamples: number };
+    };
+    expect(portalData.portfolioSummary.totalGeneratedExamples).toBe(4);
+    expect(portalData.portfolioSummary.oavCompleteExamples).toBe(2);
   });
 });

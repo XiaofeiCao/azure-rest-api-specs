@@ -27,7 +27,7 @@ export interface GenerateExamplesOptions {
   validateWithTypeSpec?: boolean;
 }
 
-interface XMsExampleDocument {
+export interface XMsExampleDocument {
   title: string;
   operationId: string;
   parameters: Record<string, unknown>;
@@ -38,6 +38,13 @@ interface XMsExampleDocument {
       body?: unknown;
     }
   >;
+}
+
+export interface ExampleOavCompleteness {
+  observedStatusCodes: string[];
+  missingDeclaredStatusCodes: string[];
+  oavComplete: boolean;
+  oavIssues: string[];
 }
 
 function extractPathParametersFromUrl(
@@ -123,24 +130,145 @@ function assertContainedFilePath(parentDir: string, candidateFile: string): void
   }
 }
 
-function pickDeclaredHeaders(
+const CANONICAL_LRO_WIRE_HEADERS: ReadonlyArray<{ lower: string; canonical: string }> = [
+  { lower: "azure-asyncoperation", canonical: "Azure-AsyncOperation" },
+  { lower: "location", canonical: "Location" },
+  { lower: "operation-location", canonical: "Operation-Location" },
+  { lower: "retry-after", canonical: "Retry-After" },
+];
+
+const LRO_ALLOWED_2XX_BY_METHOD: Record<string, ReadonlySet<string>> = {
+  POST: new Set(["200", "201", "202", "204"]),
+  PATCH: new Set(["200", "201", "202"]),
+  DELETE: new Set(["200", "202", "204"]),
+  PUT: new Set(["200", "201", "202"]),
+};
+
+function isObservedLroCompletedCleanly(observedLro: ProbeTrace["observedLro"]): boolean {
+  if (!observedLro.detected) {
+    return false;
+  }
+  if (observedLro.completionStatus !== undefined) {
+    return observedLro.completionStatus === "succeeded";
+  }
+  const term = observedLro.terminalProvisioningState ?? "";
+  return !/^(failed|canceled|cancelled|creating|updating|deleting|provisioning|accepted|running|inprogress)$/i.test(
+    term,
+  );
+}
+
+function pickWireResponseHeaders(
   contract: OperationContract,
   statusCode: string,
   actualHeaders: Record<string, string>,
   sanitizeCtx: SanitizeContext,
+  preserveWireLroHeaders = false,
 ): Record<string, string> | undefined {
   const declared = contract.declaredResponseHeaders[statusCode] ?? [];
-  if (declared.length === 0) {
-    return undefined;
-  }
   const picked: Record<string, string> = {};
+  const pickedLower = new Set<string>();
+
   for (const headerName of declared) {
-    const val = actualHeaders[headerName.toLowerCase()];
+    const val = findHeaderCaseInsensitive(actualHeaders, headerName);
     if (val !== undefined) {
       picked[headerName] = String(sanitizePayload(val, sanitizeCtx, headerName));
+      pickedLower.add(headerName.toLowerCase());
     }
   }
+
+  if (preserveWireLroHeaders) {
+    for (const lroHeader of CANONICAL_LRO_WIRE_HEADERS) {
+      if (pickedLower.has(lroHeader.lower)) {
+        continue;
+      }
+      const val = findHeaderCaseInsensitive(actualHeaders, lroHeader.lower);
+      if (val !== undefined) {
+        picked[lroHeader.canonical] = String(
+          sanitizePayload(val, sanitizeCtx, lroHeader.canonical),
+        );
+        pickedLower.add(lroHeader.lower);
+      }
+    }
+  }
+
   return Object.keys(picked).length > 0 ? picked : undefined;
+}
+
+export function evaluateExampleOavCompleteness(
+  contract: OperationContract | undefined,
+  exampleDoc: Pick<XMsExampleDocument, "responses">,
+): ExampleOavCompleteness {
+  const responses = exampleDoc.responses ?? {};
+  const observedStatusCodes = Object.keys(responses).sort();
+  if (!contract) {
+    return {
+      observedStatusCodes,
+      missingDeclaredStatusCodes: [],
+      oavComplete: false,
+      oavIssues: ["Operation contract not found in coverage ledger."],
+    };
+  }
+
+  const declared2xxCodes = contract.declaredStatusCodes
+    .filter((code) => /^2\d\d$/.test(code))
+    .sort();
+  const missingDeclaredStatusCodes = declared2xxCodes.filter(
+    (code) => responses[code] === undefined,
+  );
+  const undocumentedStatusCodes = observedStatusCodes.filter(
+    (code) => !contract.declaredStatusCodes.includes(code),
+  );
+
+  const oavIssues: string[] = [];
+  if (missingDeclaredStatusCodes.length > 0) {
+    oavIssues.push(
+      `Live wire observed [${observedStatusCodes.join(", ")}], missing declared 2xx status code(s) [${missingDeclaredStatusCodes.join(", ")}] required by OAV111 (RESPONSE_STATUS_CODE_NOT_IN_EXAMPLE).`,
+    );
+  }
+  if (undocumentedStatusCodes.length > 0) {
+    oavIssues.push(
+      `Live wire observed undocumented status code(s) [${undocumentedStatusCodes.join(", ")}] not declared in TypeSpec [${declared2xxCodes.join(", ")}].`,
+    );
+  }
+
+  if (contract.isLroDeclared) {
+    const allowedLroSet = LRO_ALLOWED_2XX_BY_METHOD[contract.method.toUpperCase()];
+    if (allowedLroSet) {
+      const disallowedLroCodes = observedStatusCodes.filter(
+        (code) => /^2\d\d$/.test(code) && !allowedLroSet.has(code),
+      );
+      if (disallowedLroCodes.length > 0) {
+        oavIssues.push(
+          `Response status code(s) [${disallowedLroCodes.join(", ")}] violate OAV LRO_RESPONSE_CODE for ${contract.method} LRO.`,
+        );
+      }
+    }
+
+    const methodUpper = contract.method.toUpperCase();
+    if (
+      (methodUpper === "POST" || methodUpper === "PATCH" || methodUpper === "DELETE") &&
+      responses["202"] !== undefined
+    ) {
+      const headers202 = responses["202"].headers ?? {};
+      const locVal = findHeaderCaseInsensitive(headers202, "location");
+      const asyncVal = findHeaderCaseInsensitive(headers202, "azure-asyncoperation");
+      const hasArmLroHeader = Boolean(
+        (locVal && locVal.trim().length > 0) || (asyncVal && asyncVal.trim().length > 0),
+      );
+      if (!hasArmLroHeader) {
+        oavIssues.push(
+          'Response "202" is missing non-empty Location or Azure-AsyncOperation header required by OAV LRO_RESPONSE_HEADER.',
+        );
+      }
+    }
+  }
+
+  return {
+    observedStatusCodes,
+    missingDeclaredStatusCodes,
+    oavComplete: oavIssues.length === 0,
+    oavIssues,
+  };
 }
 
 export function buildXMsExampleFromTrace(
@@ -204,11 +332,12 @@ export function buildXMsExampleFromTrace(
   const finalGet = [...trace.exchanges].reverse().find((ex) => ex.step === "final-get");
   const lastPoll = [...trace.exchanges].reverse().find((ex) => ex.step === "poll");
 
-  const initialHeaders = pickDeclaredHeaders(
+  const initialHeaders = pickWireResponseHeaders(
     contract,
     initialCode,
     initial.response.headers,
     sanitizeCtx,
+    trace.observedLro.detected && (initialCode === "201" || initialCode === "202"),
   );
   responses[initialCode] = {
     ...(initialHeaders ? { headers: initialHeaders } : {}),
@@ -224,111 +353,64 @@ export function buildXMsExampleFromTrace(
       : {}),
   };
 
-  // For LRO operations, include terminal response (EX-COVERAGE requires both initial and final responses on LROs).
-  if (trace.observedLro.detected || contract.isLroDeclared) {
-    const terminalResourceExchange =
+  // Pure wire-truth LRO stitching: emit a terminal response ONLY when an LRO actually ran
+  // and completed cleanly on the wire, and a real terminal operation exchange/payload was observed.
+  // Never synthesize or clone un-observed 2xx status codes, headers, or bodies.
+  if (isObservedLroCompletedCleanly(trace.observedLro)) {
+    const canUseLastPollAsTerminal =
+      (trace.observedLro.pollingHeaderUsed === "location" ||
+        trace.observedLro.pollingHeaderUsed === "resource-get") &&
+      lastPoll !== undefined &&
+      lastPoll.response.status >= 200 &&
+      lastPoll.response.status < 300 &&
+      lastPoll.response.status !== 202 &&
+      (contract.declaredStatusCodes.includes(String(lastPoll.response.status)) ||
+        !contract.isLroDeclared);
+
+    const terminalWireExchange =
       finalGet && finalGet.response.status >= 200 && finalGet.response.status < 300
         ? finalGet
-        : (contract.method === "PUT" || contract.method === "PATCH") &&
-            trace.observedLro.completionStatus === "succeeded" &&
-            (trace.observedLro.finalResultSource === "final-resource-get" ||
-              trace.observedLro.finalResultSource === "location-body") &&
-            lastPoll &&
-            lastPoll.response.status >= 200 &&
-            lastPoll.response.status < 300 &&
-            lastPoll.response.body !== undefined
+        : canUseLastPollAsTerminal
           ? lastPoll
           : undefined;
 
-    if (terminalResourceExchange) {
-      const finalCode = String(terminalResourceExchange.response.status);
-      const finalHeaders = pickDeclaredHeaders(
+    if (terminalWireExchange) {
+      const finalCode = String(terminalWireExchange.response.status);
+      const finalHeaders = pickWireResponseHeaders(
         contract,
         finalCode,
-        terminalResourceExchange.response.headers,
+        terminalWireExchange.response.headers,
         sanitizeCtx,
+        false,
       );
       responses[finalCode] = {
         ...(finalHeaders ? { headers: finalHeaders } : {}),
-        ...(terminalResourceExchange.response.body !== undefined
+        ...(terminalWireExchange.response.body !== undefined
           ? {
               body: sanitizeResponseBodyForStatus(
                 contract,
                 finalCode,
-                terminalResourceExchange.response.body,
+                terminalWireExchange.response.body,
                 sanitizeCtx,
               ),
             }
           : {}),
       };
     } else if (
-      contract.method === "DELETE" &&
-      initialCode === "202" &&
-      trace.observedLro.completionStatus === "succeeded" &&
-      (contract.declaredStatusCodes.includes("200") || contract.declaredStatusCodes.includes("204"))
-    ) {
-      const terminalDeleteCode =
-        contract.declaredStatusCodes.includes("204") &&
-        contract.declaredResponseHasSchema?.["204"] === false
-          ? "204"
-          : contract.declaredStatusCodes.includes("200") &&
-              contract.declaredResponseHasSchema?.["200"] === false
-            ? "200"
-            : undefined;
-      if (terminalDeleteCode) {
-        responses[terminalDeleteCode] = {};
-      }
-    } else if (
       contract.method === "POST" &&
-      initialCode === "202" &&
-      trace.observedLro.completionStatus === "succeeded" &&
+      trace.observedLro.finalResultSource === "status-monitor-body" &&
       lastPoll &&
       lastPoll.response.status === 200 &&
-      contract.declaredStatusCodes.includes("200")
+      contract.declaredStatusCodes.includes("200") &&
+      lastPoll.response.body &&
+      typeof lastPoll.response.body === "object"
     ) {
-      if (
-        trace.observedLro.finalResultSource === "location-body" &&
-        lastPoll.response.body !== undefined
-      ) {
+      const monitorObj = lastPoll.response.body as Record<string, unknown>;
+      const extractedResult = monitorObj.result ?? monitorObj.properties;
+      if (extractedResult !== undefined) {
         responses["200"] = {
-          body: sanitizeResponseBodyForStatus(contract, "200", lastPoll.response.body, sanitizeCtx),
+          body: sanitizeResponseBodyForStatus(contract, "200", extractedResult, sanitizeCtx),
         };
-      } else if (
-        trace.observedLro.finalResultSource === "status-monitor-body" &&
-        lastPoll.response.body &&
-        typeof lastPoll.response.body === "object"
-      ) {
-        const monitorObj = lastPoll.response.body as Record<string, unknown>;
-        const extractedResult = monitorObj.result ?? monitorObj.properties;
-        if (extractedResult !== undefined) {
-          responses["200"] = {
-            body: sanitizeResponseBodyForStatus(contract, "200", extractedResult, sanitizeCtx),
-          };
-        }
-      } else if (
-        trace.observedLro.finalResultSource === "none" &&
-        contract.declaredResponseHasSchema?.["200"] === false
-      ) {
-        responses["200"] = {};
-      }
-    }
-  }
-
-  // Populate remaining declared 2xx status codes required by OAV RESPONSE_STATUS_CODE_NOT_IN_EXAMPLE.
-  for (const declaredCode of contract.declaredStatusCodes) {
-    if (!declaredCode.startsWith("2") || responses[declaredCode] !== undefined) {
-      continue;
-    }
-    const hasSchema = contract.declaredResponseHasSchema?.[declaredCode];
-    if (hasSchema === false) {
-      responses[declaredCode] = {};
-    } else if (
-      (contract.method === "PUT" || contract.method === "PATCH") &&
-      (declaredCode === "200" || declaredCode === "201")
-    ) {
-      const donor = responses["200"] ?? responses["201"];
-      if (donor?.body !== undefined) {
-        responses[declaredCode] = { body: donor.body };
       }
     }
   }
@@ -439,15 +521,24 @@ export async function generateLiveExamples(
       }
     }
 
-    // Only write into `<typespecProjectDir>/examples/` when schemaValid is true (or --skip-schema-check was passed: #8063)!
+    const oavCheck = evaluateExampleOavCompleteness(contract, exampleDoc);
+
+    // Only promote into `<typespecProjectDir>/examples/` when both TypeSpec-valid and OAV-complete!
     const writtenSpecPaths: string[] = [];
-    if (options.writeToSpec && schemaValid) {
-      const tspExDir = path.join(ledger.typespecProjectDir, "examples", ledger.apiVersion);
-      fs.mkdirSync(tspExDir, { recursive: true });
-      const tspExPath = path.join(tspExDir, filename);
-      assertContainedFilePath(tspExDir, tspExPath);
-      fs.writeFileSync(tspExPath, serialized, "utf8");
-      writtenSpecPaths.push(tspExPath);
+    let specWriteSkippedReason: string | undefined;
+    if (options.writeToSpec) {
+      if (!schemaValid) {
+        specWriteSkippedReason = `Skipped --write-to-spec (TypeSpec validation failed): ${schemaErrors.join("; ")}`;
+      } else if (!oavCheck.oavComplete) {
+        specWriteSkippedReason = `Skipped --write-to-spec (OAV incomplete): ${oavCheck.oavIssues.join(" ")}`;
+      } else {
+        const tspExDir = path.join(ledger.typespecProjectDir, "examples", ledger.apiVersion);
+        fs.mkdirSync(tspExDir, { recursive: true });
+        const tspExPath = path.join(tspExDir, filename);
+        assertContainedFilePath(tspExDir, tspExPath);
+        fs.writeFileSync(tspExPath, serialized, "utf8");
+        writtenSpecPaths.push(tspExPath);
+      }
     }
 
     const cov = ledger.coverage[contract.operationId];
@@ -463,6 +554,11 @@ export async function generateLiveExamples(
       writtenSpecPaths,
       schemaValid,
       schemaErrors,
+      observedStatusCodes: oavCheck.observedStatusCodes,
+      missingDeclaredStatusCodes: oavCheck.missingDeclaredStatusCodes,
+      oavComplete: oavCheck.oavComplete,
+      oavIssues: oavCheck.oavIssues,
+      ...(specWriteSkippedReason ? { specWriteSkippedReason } : {}),
     });
   }
 

@@ -63,6 +63,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
     let blockingDisc = 0;
     let warningDisc = 0;
     let examples = 0;
+    let oavCompleteExamples = 0;
 
     const byLocation = {
       path: { total: 0, exercised: 0 },
@@ -86,6 +87,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       blockingDisc += s.discrepancySummary.blocking;
       warningDisc += s.discrepancySummary.warning;
       examples += s.generatedExamplesCount;
+      oavCompleteExamples += Number(s.oavCompleteExamplesCount) || 0;
 
       const p = s.parameterCoverage;
       reqTotal += p.requiredTotal;
@@ -123,6 +125,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       blockingDisc,
       warningDisc,
       examples,
+      oavCompleteExamples,
     };
   }
 
@@ -201,7 +204,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
               <div class="mini-metric">
                 <div class="mini-metric-label">Discrepancies</div>
                 <div class="mini-metric-val">\${Number(svc.discrepancySummary.total) || 0}</div>
-                <div class="mini-metric-sub">\${Number(svc.generatedExamplesCount) || 0} live examples</div>
+                <div class="mini-metric-sub">\${Number(svc.generatedExamplesCount) || 0} examples (\${Number(svc.oavCompleteExamplesCount) || 0} OAV-ready)</div>
               </div>
             </div>
             <div class="service-footer">
@@ -242,7 +245,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
       <div class="kpi-card">
         <div class="kpi-label">Validated Mgmt Services</div>
         <div class="kpi-value">\${metrics.serviceCount}</div>
-        <div class="kpi-detail">\${metrics.examples} sanitized live TypeSpec examples generated</div>
+        <div class="kpi-detail">\${metrics.examples} pure-wire examples (\${metrics.oavCompleteExamples} OAV-complete)</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">API Operation Coverage</div>
@@ -309,7 +312,7 @@ export const REPORT_PORTAL_APP_JS = `(function () {
         const lroBadge = op.observedLro?.detected
           ? \`<span class="badge badge-neutral" title="Polled \${Number(op.observedLro.pollCount) || 0}x via \${esc(op.observedLro.pollingHeaderUsed || "wire")}">LRO (\${Number(op.observedLro.pollCount) || 0} polls)</span>\`
           : op.isLroDeclared
-            ? '<span class="badge badge-neutral">LRO (sync 200)</span>'
+            ? \`<span class="badge badge-neutral">LRO (sync \${Number(op.lastHttpStatus) || 200})</span>\`
             : "";
         const srcUrl = safeHttpsUrl(op.githubSourceUrl);
         const sourceCell = srcUrl
@@ -614,12 +617,27 @@ export const REPORT_PORTAL_APP_JS = `(function () {
     const exampleHtml =
       op.examples.length > 0
         ? op.examples
-            .map(
-              (ex) => \`
-                <h4>Sanitized Live Example: <code>\${esc(ex.name)}.json</code></h4>
+            .map((ex) => {
+              const obsCodes =
+                Array.isArray(ex.observedStatusCodes) && ex.observedStatusCodes.length > 0
+                  ? ex.observedStatusCodes.join(", ")
+                  : "";
+              const missingCodes =
+                Array.isArray(ex.missingDeclaredStatusCodes) &&
+                ex.missingDeclaredStatusCodes.length > 0
+                  ? ex.missingDeclaredStatusCodes.join(", ")
+                  : "";
+              const oavBadge =
+                ex.oavComplete === false
+                  ? \`<span class="badge badge-neutral" title="\${esc((ex.oavIssues || []).join(" "))}">Wire-Subset [\${esc(obsCodes || "partial")}]\${missingCodes ? \` · missing declared [\${esc(missingCodes)}]\` : ""}</span>\`
+                  : obsCodes
+                    ? \`<span class="badge badge-passed">OAV-Complete [\${esc(obsCodes)}]</span>\`
+                    : "";
+              return \`
+                <h4>Sanitized Live Example: <code>\${esc(ex.name)}.json</code> \${oavBadge}</h4>
                 <pre class="code-pre">\${esc(JSON.stringify(ex.content, null, 2))}</pre>
-              \`,
-            )
+              \`;
+            })
             .join("")
         : '<p class="muted">No positive 2xx live example recorded for this operation.</p>';
 

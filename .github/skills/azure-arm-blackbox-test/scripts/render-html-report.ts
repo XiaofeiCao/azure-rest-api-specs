@@ -25,6 +25,7 @@ import {
   safeDecodeUriSegment,
   stripConfiguredArmBasePath,
 } from "./auth-and-http.ts";
+import { evaluateExampleOavCompleteness, type XMsExampleDocument } from "./generate-examples.ts";
 import { GENERATED_EXAMPLES_DIRNAME, loadAllProbeTraces, loadLedger } from "./ledger-store.ts";
 import type { BlackboxSummaryReport } from "./render-report.ts";
 import { REPORT_PORTAL_APP_JS } from "./report-portal-app-template.ts";
@@ -98,6 +99,10 @@ export interface PortalOperationEntry {
   examples: Array<{
     name: string;
     content: unknown;
+    observedStatusCodes: string[];
+    missingDeclaredStatusCodes: string[];
+    oavComplete: boolean;
+    oavIssues: string[];
   }>;
 }
 
@@ -132,6 +137,7 @@ export interface PortalServiceEntry {
   parameterCoverage: ParameterCoverageStats;
   discrepancySummary: BlackboxSummaryReport["discrepancySummary"];
   generatedExamplesCount: number;
+  oavCompleteExamplesCount: number;
   discrepancies: PortalDiscrepancyEntry[];
   operations: PortalOperationEntry[];
 }
@@ -149,6 +155,7 @@ export interface PortalDataBundle {
     blockingDiscrepancies: number;
     warningDiscrepancies: number;
     totalGeneratedExamples: number;
+    oavCompleteExamples: number;
   };
   services: PortalServiceEntry[];
 }
@@ -645,18 +652,29 @@ async function aggregateServiceRunForHtml(
         .sort()
     : [];
 
-  const examplesByOp = new Map<string, Array<{ name: string; content: unknown }>>();
+  let oavCompleteExamplesCount = 0;
+  const examplesByOp = new Map<string, PortalOperationEntry["examples"]>();
   for (const file of exampleFiles) {
-    const parsed = JSON.parse(fs.readFileSync(path.join(examplesDir, file), "utf8")) as {
-      operationId?: string;
-    };
+    const parsed = JSON.parse(
+      fs.readFileSync(path.join(examplesDir, file), "utf8"),
+    ) as Partial<XMsExampleDocument>;
     const opId = parsed.operationId ?? file.replace(/\.json$/, "");
     const contract = ledger.operations[opId];
     const opCtx = buildOperationSanitizeContext(ledger, contract);
+    const oavCheck = evaluateExampleOavCompleteness(contract, {
+      responses: parsed.responses ?? {},
+    });
+    if (oavCheck.oavComplete) {
+      oavCompleteExamplesCount++;
+    }
     const list = examplesByOp.get(opId) ?? [];
     list.push({
       name: file.replace(/\.json$/, ""),
       content: sanitizePayload(parsed, opCtx),
+      observedStatusCodes: oavCheck.observedStatusCodes,
+      missingDeclaredStatusCodes: oavCheck.missingDeclaredStatusCodes,
+      oavComplete: oavCheck.oavComplete,
+      oavIssues: oavCheck.oavIssues,
     });
     examplesByOp.set(opId, list);
   }
@@ -940,6 +958,7 @@ async function aggregateServiceRunForHtml(
     parameterCoverage: serviceParamStats,
     discrepancySummary: report.discrepancySummary,
     generatedExamplesCount: exampleFiles.length,
+    oavCompleteExamplesCount,
     discrepancies,
     operations,
   };
@@ -986,6 +1005,10 @@ export async function renderLocalHtmlReportBundle(options: {
   const blockingDiscrepancies = services.reduce((acc, s) => acc + s.discrepancySummary.blocking, 0);
   const warningDiscrepancies = services.reduce((acc, s) => acc + s.discrepancySummary.warning, 0);
   const totalGeneratedExamples = services.reduce((acc, s) => acc + s.generatedExamplesCount, 0);
+  const oavCompleteExamples = services.reduce(
+    (acc, s) => acc + (s.oavCompleteExamplesCount ?? 0),
+    0,
+  );
   const portfolioParamCoverage = mergeParamStats(services.map((s) => s.parameterCoverage));
 
   const bundle: PortalDataBundle = {
@@ -1001,6 +1024,7 @@ export async function renderLocalHtmlReportBundle(options: {
       blockingDiscrepancies,
       warningDiscrepancies,
       totalGeneratedExamples,
+      oavCompleteExamples,
     },
     services,
   };

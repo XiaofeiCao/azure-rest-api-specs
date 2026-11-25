@@ -316,4 +316,9 @@ export interface GeneratedExampleArtifact {
   writtenSpecPaths: string[];
   schemaValid: boolean;
   schemaErrors: string[];
+  observedStatusCodes: string[];
+  missingDeclaredStatusCodes: string[];
+  oavComplete: boolean;
+  oavIssues: string[];
+  specWriteSkippedReason?: string;
 }

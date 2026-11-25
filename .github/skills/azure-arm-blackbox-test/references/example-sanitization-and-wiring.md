@@ -21,16 +21,18 @@ Real-life TypeSpec examples (`examples/<api-version>/*.json`) captured from live
 
 Always spot-check generated example JSON files for service-specific custom secret field names before committing to `specification/`.
 
-## 2. LRO Dual-Response Assembly (`EX-COVERAGE`)
+## 2. Pure Wire-Truth Response Assembly (`scripts/generate-examples.ts`)
 
-Repository rule `EX-COVERAGE` requires LRO examples to include **both** the initial async response (`201` or `202`, including declared polling headers) and the terminal response (`200` or `204`):
+`generate-examples` enforces **strict wire-truth** across every generated example — it never synthesizes, backfills, or clones un-observed `2xx` status codes, headers, or bodies:
 
-- For `PUT` returning `201` (initial `Creating`) followed by `final-get` `200` (`Succeeded`), `generate-examples` populates both `"201"` and `"200"` in `responses`.
-- For `PUT` returning `200` (`Creating`) followed by `final-get` `200` (`Succeeded`), `responses["200"]` records the terminal `Succeeded` payload.
-- For async `DELETE` / void `POST` returning `202` and completing with no body, `generate-examples` populates `"202"` (with declared headers) plus `"200": {}` or `"204": {}` according to TypeSpec declared status codes.
+- **Initial exchange**: Always records the actual HTTP status code (`initial.response.status`), declared response headers present on the wire (plus sanitized wire-observed `Azure-AsyncOperation`, `Location`, `Operation-Location`, and `Retry-After` headers on `201`/`202` LRO responses), and the sanitized response body if present.
+- **Completed LRO terminal exchange**: Adds a second response entry **only** when an LRO was genuinely detected and completed cleanly on the wire, and a real terminal operation response was observed (`final-get` `2xx`, a terminal non-`202` `Location` / `resource-get` poll response, or an unwrapped `result`/`properties` payload from a `POST` status monitor).
+  - For example, `PUT` returning `201` (`Creating`) followed by `final-get` `200` (`Succeeded`) populates both `"201"` and `"200"` from real wire exchanges.
+  - Synchronous completions of multi-status or LRO-declared operations (such as a `DELETE` declaring `200 | 202 | 204` that returns synchronous `HTTP 204` on the wire) emit **only** `"204": {}` — never a fabricated headerless `"202": {}` or `"200": {}`.
+  - Async `DELETE` operations monitored via `Azure-AsyncOperation` (where the status monitor returns an `OperationStatusResult` envelope rather than a `DELETE` response) emit **only** `"202"` with its sanitized LRO polling headers.
 
-## 3. Native TypeSpec Example Validation & Writing (`scripts/typespec-validator.ts`)
+## 3. Native TypeSpec Validation & `--write-to-spec` OAV-Completeness Gating
 
-- By default, `generate-examples` writes candidate examples only to `<work-dir>/examples/<api-version>/` and validates them directly in-memory against the projected TypeSpec `HttpOperation` parameter and response models (`validateExampleAgainstTypeSpec`).
-- Wire-contract discrepancies (`SCHEMA-RESPONSE-DRIFT`, `UNION_CASE_MISMATCH`, etc.) are evaluated exclusively on the unsanitized live HTTP exchanges in `execute-probe.ts`. Post-sanitization example validation in `generate-examples` ensures that redaction placeholders and assembled dual LRO responses remain valid against TypeSpec constraints (`@pattern`, `@minLength`, `@maxLength`).
-- When `--write-to-spec` is explicitly requested, only schema-valid examples (`schemaValid: true`, or when `--skip-schema-check` is passed) are copied to `<typespecProjectDir>/examples/<api-version>/<ExampleName>.json` (never touching or generating Swagger files).
+- **Scratch output (`<work-dir>/examples/<api-version>/`)**: Always receives pure wire-truth example JSON files for all positive `2xx` traces (including wire-subset runs) and surfaces them in `<work-dir>/report-html/index.html` with `OAV-Complete` vs. `Wire-Subset` badges.
+- **In-memory TypeSpec validation (`scripts/typespec-validator.ts`)**: Validates generated examples directly against projected TypeSpec `HttpOperation` parameter and response models (`validateExampleAgainstTypeSpec`) to confirm redaction placeholders satisfy `@pattern`, `@minLength`, and `@maxLength` constraints. Wire-contract discrepancies (`SCHEMA-RESPONSE-DRIFT`, `UNION_CASE_MISMATCH`, etc.) remain evaluated exclusively on unsanitized live HTTP exchanges in `execute-probe.ts`.
+- **`--write-to-spec` OAV-completeness gate (`evaluateExampleOavCompleteness`)**: Because `azure-rest-api-specs` Swagger/OAV CI (`oav-runner`) enforces `OAV111` (`RESPONSE_STATUS_CODE_NOT_IN_EXAMPLE` — requiring every declared `2xx` code in `responses`) and `LRO_RESPONSE_HEADER` (requiring non-empty `Location` or `Azure-AsyncOperation` on `202` LRO responses for `POST`/`PATCH`/`DELETE`), `--write-to-spec` promotes **only** examples where `schemaValid && oavComplete` into `<typespecProjectDir>/examples/<api-version>/<ExampleName>.json`, and explicitly reports every skipped wire-subset operation with its observed vs. missing declared `2xx` status codes.
