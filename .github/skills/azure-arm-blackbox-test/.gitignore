@@ -1,0 +1,4 @@
+# Local dependencies and session artifacts
+/node_modules/
+/coverage/
+/.work/
