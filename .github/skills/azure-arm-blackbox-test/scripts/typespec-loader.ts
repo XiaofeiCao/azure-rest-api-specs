@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getArmProviderNamespace } from "@azure-tools/typespec-azure-resource-manager";
 import {
   createTCGCContext,
   getLibraryName,
@@ -233,7 +234,7 @@ export async function loadProjectedTypeSpecService(
     }
     const service = services[0];
     const serviceNamespace = service.type;
-    const providerNamespace = getNamespaceFullName(serviceNamespace);
+    const rawNamespaceName = getNamespaceFullName(serviceNamespace);
 
     const versioningMutators = getVersioningMutators(program, serviceNamespace);
     let projectedNamespace: Namespace = serviceNamespace;
@@ -243,14 +244,14 @@ export async function loadProjectedTypeSpecService(
     if (versioningMutators?.kind === "versioned") {
       availableApiVersions = versioningMutators.snapshots.map((s) => s.version.value);
       if (availableApiVersions.length === 0) {
-        throw new Error(`@versioned namespace ${providerNamespace} defines zero versions.`);
+        throw new Error(`@versioned namespace ${rawNamespaceName} defines zero versions.`);
       }
       const chosenVersion =
         requestedApiVersion ?? availableApiVersions[availableApiVersions.length - 1];
       const snapshot = versioningMutators.snapshots.find((s) => s.version.value === chosenVersion);
       if (!snapshot) {
         throw new Error(
-          `api-version "${chosenVersion}" is not defined in TypeSpec namespace ${providerNamespace}. Available TypeSpec versions: ${availableApiVersions.join(", ")}`,
+          `api-version "${chosenVersion}" is not defined in TypeSpec namespace ${rawNamespaceName}. Available TypeSpec versions: ${availableApiVersions.join(", ")}`,
         );
       }
       selectedApiVersion = chosenVersion;
@@ -279,10 +280,28 @@ export async function loadProjectedTypeSpecService(
     });
     const [httpOperations] = listHttpOperationsIn(program, projectedNamespace);
     const operationsById = new Map<string, HttpOperation>();
+    const routeProviderCounts = new Map<string, number>();
     for (const httpOp of httpOperations) {
       const opId = resolveCanonicalOperationId(tcgcContext, program, httpOp.operation);
       operationsById.set(opId, httpOp);
+      const providerMatches = [...httpOp.path.matchAll(/\/providers\/([^/?]+)/gi)].map((m) => m[1]);
+      const targetRp = providerMatches[providerMatches.length - 1];
+      if (
+        targetRp &&
+        !targetRp.startsWith("{") &&
+        targetRp.toLowerCase() !== "microsoft.resources"
+      ) {
+        routeProviderCounts.set(targetRp, (routeProviderCounts.get(targetRp) ?? 0) + 1);
+      }
     }
+
+    const armDecoratorProvider =
+      getArmProviderNamespace(program, projectedNamespace) ??
+      getArmProviderNamespace(program, serviceNamespace);
+    const majorityRouteProvider = [...routeProviderCounts.entries()].sort(
+      (a, b) => b[1] - a[1],
+    )[0]?.[0];
+    const providerNamespace = armDecoratorProvider || majorityRouteProvider || rawNamespaceName;
 
     return {
       typespecProjectDir,

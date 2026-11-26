@@ -24,7 +24,11 @@ import {
   saveProbeTrace,
   updateLedgerAtomically,
 } from "./ledger-store.ts";
-import { sanitizeUrlSecretParameters } from "./sanitize-example.ts";
+import {
+  sanitizePayload,
+  sanitizeUrlSecretParameters,
+  type SanitizeContext,
+} from "./sanitize-example.ts";
 import type {
   CoverageLedger,
   LedgerRuntimeState,
@@ -784,6 +788,54 @@ export async function executeOperationProbe(
   let paginationFailureReason: string | undefined;
   let followUpException: unknown;
 
+  const secretQueryParamNames = contract.parameters
+    .filter((p) => p.in === "query" && p.secretCandidate)
+    .map((p) => p.name);
+  const secretPathSlotNames = contract.parameters
+    .filter((p) => p.in === "path" && p.secretCandidate)
+    .map((p) => p.name);
+  const scrubProbeUrl = (rawUrl: string): string =>
+    sanitizeUrlSecretParameters(rawUrl, {
+      armBaseUrl: ledger.armBaseUrl,
+      secretQueryParamNames,
+      secretPathTemplate: contract.pathTemplate,
+      secretPathSlotNames,
+    });
+  const diagnosticSanitizeCtx: SanitizeContext = {
+    subscriptionId: ledger.subscriptionId,
+    disposableRgName: ledger.disposableResourceGroup?.name,
+    armBaseUrl: ledger.armBaseUrl,
+    allowedArmOrigins: ledger.allowedArmOrigins,
+    extraSecretPropertyPaths: contract.secretProperties,
+    secretQueryParamNames,
+    secretPathTemplate: contract.pathTemplate,
+    secretPathSlotNames,
+    secretCycleRules: contract.secretCycleRules,
+    secretConstraints: contract.secretConstraints,
+  };
+  const formatSafeFailureBodySnippet = (rawBodyOrText: unknown, statusStr: string): string => {
+    if (rawBodyOrText === undefined) {
+      return "";
+    }
+    const forceWholeSecret = Boolean(
+      contract.secretResponseStatuses?.includes(statusStr) ||
+      contract.secretResponseStatuses?.includes("*"),
+    );
+    if (forceWholeSecret && typeof rawBodyOrText === "string") {
+      return "<redacted>";
+    }
+    const sanitized = sanitizePayload(
+      rawBodyOrText,
+      diagnosticSanitizeCtx,
+      undefined,
+      "",
+      undefined,
+      [],
+      forceWholeSecret,
+    );
+    return JSON.stringify(sanitized ?? "").slice(0, 240);
+  };
+
   try {
     if (observedLro.detected) {
       if (!shouldPoll || !lroInit.pollTargetUrl) {
@@ -1020,7 +1072,7 @@ export async function executeOperationProbe(
       const resolvedNext = resolvePollingUrl(ledger.armBaseUrl, nextLinkVal);
       if (visitedNextLinks.has(resolvedNext)) {
         paginationCompletedCleanly = false;
-        paginationFailureReason = `Pagination cycle detected on nextLink: ${resolvedNext}`;
+        paginationFailureReason = `Pagination cycle detected on nextLink: ${scrubProbeUrl(resolvedNext)}`;
         break;
       }
       if (pagesFetched >= maxPages) {
@@ -1050,7 +1102,8 @@ export async function executeOperationProbe(
   } catch (err) {
     // Persist partial trace & failure status if any follow-up poll/final-get/nextLink throws or fails safety check (#4267)!
     followUpException = err;
-    const errMsg = err instanceof Error ? err.message : String(err);
+    const rawErrMsg = err instanceof Error ? err.message : String(err);
+    const errMsg = String(sanitizePayload(rawErrMsg, diagnosticSanitizeCtx));
     if (observedLro.detected && observedLro.completionStatus !== "succeeded") {
       observedLro.completionStatus = "failed";
       lroFailureReason = errMsg;
@@ -1140,6 +1193,32 @@ export async function executeOperationProbe(
     .replace(/\/+$/, "")
     .toLowerCase();
 
+  // Scrub signed URLs & secret query/path slots on all recorded exchanges BEFORE discrepancy analysis & trace persistence!
+  const traceNextLinkField = pagingHint?.nextLinkName ?? "nextLink";
+  for (const ex of exchanges) {
+    ex.request.url = scrubProbeUrl(ex.request.url);
+    for (const pollHeaderKey of [
+      "azure-asyncoperation",
+      "location",
+      "operation-location",
+    ] as const) {
+      if (typeof ex.response.headers[pollHeaderKey] === "string") {
+        ex.response.headers[pollHeaderKey] = scrubProbeUrl(ex.response.headers[pollHeaderKey]);
+      }
+    }
+    if (
+      traceNextLinkField &&
+      ex.response.body &&
+      typeof ex.response.body === "object" &&
+      !Array.isArray(ex.response.body)
+    ) {
+      const bodyRec = ex.response.body as Record<string, unknown>;
+      if (typeof bodyRec[traceNextLinkField] === "string") {
+        bodyRec[traceNextLinkField] = scrubProbeUrl(bodyRec[traceNextLinkField]);
+      }
+    }
+  }
+
   // Auto-attach saved priorPutBody strictly by exact resource path so GET of resource B never compares against resource A (#7963).
   const effectivePriorPutBody =
     input.priorPutBody ??
@@ -1155,6 +1234,7 @@ export async function executeOperationProbe(
     requestSchemaErrors,
     responseSchemaErrors,
     priorPutBody: effectivePriorPutBody,
+    armBaseUrl: ledger.armBaseUrl,
   });
 
   const isInitial2xx =
@@ -1195,7 +1275,7 @@ export async function executeOperationProbe(
         : undefined) ??
       lroFailureReason ??
       paginationFailureReason ??
-      `HTTP ${initialExchange.response.status}: ${JSON.stringify(initialExchange.response.body ?? initialExchange.response.rawTextSnippet ?? "").slice(0, 240)}`)
+      `HTTP ${initialExchange.response.status}: ${formatSafeFailureBodySnippet(initialExchange.response.body ?? initialExchange.response.rawTextSnippet, String(initialExchange.response.status))}`)
     : undefined;
 
   // Record observed path slots, PUT bodies, and List child item names to merge atomically under ledger lock.
@@ -1262,23 +1342,6 @@ export async function executeOperationProbe(
         newListDiscoveredNames = discoveredNames;
         runtimeState.listItemNamesByResourceType[contract.resourceType] = discoveredNames;
       }
-    }
-  }
-
-  const secretQueryParamNames = contract.parameters
-    .filter((p) => p.in === "query" && p.secretCandidate)
-    .map((p) => p.name);
-  const secretPathSlotNames = contract.parameters
-    .filter((p) => p.in === "path" && p.secretCandidate)
-    .map((p) => p.name);
-  if (secretQueryParamNames.length > 0 || secretPathSlotNames.length > 0) {
-    for (const ex of exchanges) {
-      ex.request.url = sanitizeUrlSecretParameters(ex.request.url, {
-        armBaseUrl: ledger.armBaseUrl,
-        secretQueryParamNames,
-        secretPathTemplate: contract.pathTemplate,
-        secretPathSlotNames,
-      });
     }
   }
 
@@ -1421,7 +1484,31 @@ export async function executeProbeBatch(options: {
         break;
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      let batchSanitizeCtx: SanitizeContext = {};
+      try {
+        const curLedger = loadLedger(options.workDir);
+        const opContract = curLedger.operations[item.operationId];
+        batchSanitizeCtx = {
+          subscriptionId: curLedger.subscriptionId,
+          disposableRgName: curLedger.disposableResourceGroup?.name,
+          armBaseUrl: curLedger.armBaseUrl,
+          allowedArmOrigins: curLedger.allowedArmOrigins,
+          extraSecretPropertyPaths: opContract?.secretProperties,
+          secretQueryParamNames: opContract?.parameters
+            .filter((p) => p.in === "query" && p.secretCandidate)
+            .map((p) => p.name),
+          secretPathTemplate: opContract?.pathTemplate,
+          secretPathSlotNames: opContract?.parameters
+            .filter((p) => p.in === "path" && p.secretCandidate)
+            .map((p) => p.name),
+          secretCycleRules: opContract?.secretCycleRules,
+          secretConstraints: opContract?.secretConstraints,
+        };
+      } catch {
+        // Fallback to default URL/token sanitizer if ledger cannot be read.
+      }
+      const msg = String(sanitizePayload(rawMsg, batchSanitizeCtx));
       results.push({
         operationId: item.operationId,
         action: "probe",
@@ -1430,7 +1517,7 @@ export async function executeProbeBatch(options: {
         failureReason: msg,
       });
       if (!options.continueOnError) {
-        throw err;
+        throw new Error(msg, { cause: err });
       }
     }
   }

@@ -905,6 +905,8 @@ function collectTypeSpecResponseSecrets(
     const respCodes: string[] = [];
     if (typeof resp.statusCodes === "number") {
       respCodes.push(String(resp.statusCodes));
+    } else if (resp.statusCodes === "*") {
+      respCodes.push("*");
     } else if (typeof resp.statusCodes === "object") {
       for (let c = resp.statusCodes.start; c <= resp.statusCodes.end; c++) {
         respCodes.push(String(c));

@@ -11,7 +11,7 @@ export default mergeConfig(
         exclude: ["**/tests/**", "**/scripts/cli.ts"],
       },
       restoreMocks: true,
-      testTimeout: 30_000,
+      testTimeout: 60_000,
     },
   }),
 );

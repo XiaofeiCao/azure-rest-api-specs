@@ -174,11 +174,8 @@ export function saveProbeTrace(workDir: string, trace: ProbeTrace): string {
     const safeScenario = trace.scenario.replace(/[^a-zA-Z0-9_-]/g, "_");
     const existingFiles = fs.readdirSync(tracesDir).filter((name) => name.endsWith(".json"));
     const requestedPrefix = `${String(trace.sequence).padStart(3, "0")}-`;
-    const requestedFilename = `${requestedPrefix}${safeOpId}-${safeScenario}.json`;
-    const collidesWithDifferentTrace = existingFiles.some(
-      (name) => name.startsWith(requestedPrefix) && name !== requestedFilename,
-    );
-    if (collidesWithDifferentTrace) {
+    const collidesWithExistingSeq = existingFiles.some((name) => name.startsWith(requestedPrefix));
+    if (collidesWithExistingSeq) {
       trace.sequence = nextTraceSequence(workDir);
     }
     const finalFilename = `${String(trace.sequence).padStart(3, "0")}-${safeOpId}-${safeScenario}.json`;

@@ -168,10 +168,24 @@ function pickWireResponseHeaders(
   const picked: Record<string, string> = {};
   const pickedLower = new Set<string>();
 
+  const secretHeadersLower = new Set(
+    (contract.secretResponseHeaders ?? []).map((h) => h.toLowerCase()),
+  );
   for (const headerName of declared) {
     const val = findHeaderCaseInsensitive(actualHeaders, headerName);
     if (val !== undefined) {
-      picked[headerName] = String(sanitizePayload(val, sanitizeCtx, headerName));
+      const isSecretHeader = secretHeadersLower.has(headerName.toLowerCase());
+      picked[headerName] = String(
+        sanitizePayload(
+          val,
+          sanitizeCtx,
+          headerName,
+          headerName,
+          undefined,
+          [headerName],
+          isSecretHeader,
+        ),
+      );
       pickedLower.add(headerName.toLowerCase());
     }
   }
@@ -408,7 +422,11 @@ export function buildXMsExampleFromTrace(
       const monitorObj = lastPoll.response.body as Record<string, unknown>;
       const extractedResult = monitorObj.result ?? monitorObj.properties;
       if (extractedResult !== undefined) {
+        const monitorHeaders =
+          pickWireResponseHeaders(contract, "200", lastPoll.response.headers, sanitizeCtx, false) ??
+          responses["200"]?.headers;
         responses["200"] = {
+          ...(monitorHeaders ? { headers: monitorHeaders } : {}),
           body: sanitizeResponseBodyForStatus(contract, "200", extractedResult, sanitizeCtx),
         };
       }

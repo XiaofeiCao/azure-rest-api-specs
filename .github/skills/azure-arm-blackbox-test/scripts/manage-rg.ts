@@ -359,7 +359,22 @@ export async function deleteDisposableResourceGroup(options: {
 
   if (options.wait) {
     const pollIntervalMs = options.pollIntervalMs ?? 5000;
-    const maxAttempts = options.maxPollAttempts ?? Number.POSITIVE_INFINITY;
+    const maxAttempts = options.maxPollAttempts ?? 720;
+    const rawDeleteMonitorHeader =
+      delExchange.response.headers["azure-asyncoperation"] ??
+      delExchange.response.headers["operation-location"] ??
+      delExchange.response.headers.location;
+    const deleteMonitorUrl = rawDeleteMonitorHeader
+      ? resolveArmRelativeOrAbsoluteUrl(ledger.armBaseUrl, rawDeleteMonitorHeader)
+      : undefined;
+    const rgPollSafety = {
+      trustedArmBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
+      subscriptionId: ledger.subscriptionId,
+      disposableRgName: rg.name,
+      allowDisposableRgLifecycle: true,
+    };
+
     for (let i = 0; i < maxAttempts; i++) {
       await delay(pollIntervalMs);
       const refreshedToken = getArmBearerToken({
@@ -368,18 +383,50 @@ export async function deleteDisposableResourceGroup(options: {
         armBaseUrl: ledger.armBaseUrl,
         tokenResource: ledger.armTokenResource,
       });
+
+      if (deleteMonitorUrl) {
+        const monitorCheck = await sendRawHttpExchange({
+          step: "poll",
+          method: "GET",
+          url: deleteMonitorUrl,
+          bearerToken: refreshedToken,
+          safetyContext: rgPollSafety,
+        });
+        if (
+          monitorCheck.response.status >= 400 &&
+          monitorCheck.response.status !== 404 &&
+          monitorCheck.response.status !== 429 &&
+          monitorCheck.response.status < 500
+        ) {
+          rg.cleanupStatus = "cleanup_failed";
+          saveLedger(options.workDir, ledger);
+          throw new Error(
+            `Disposable Resource Group "${rg.name}" deletion monitor failed with HTTP ${monitorCheck.response.status}.`,
+          );
+        }
+        const monBody =
+          monitorCheck.response.body && typeof monitorCheck.response.body === "object"
+            ? (monitorCheck.response.body as Record<string, unknown>)
+            : undefined;
+        const monStatus =
+          typeof monBody?.status === "string"
+            ? monBody.status
+            : extractProvisioningState(monitorCheck.response.body);
+        if (isFailedOrCanceledState(monStatus)) {
+          rg.cleanupStatus = "cleanup_failed";
+          saveLedger(options.workDir, ledger);
+          throw new Error(
+            `Disposable Resource Group "${rg.name}" deletion failed asynchronously (status="${monStatus}").`,
+          );
+        }
+      }
+
       const check = await sendRawHttpExchange({
         step: "poll",
         method: "GET",
         url,
         bearerToken: refreshedToken,
-        safetyContext: {
-          trustedArmBaseUrl: ledger.armBaseUrl,
-          allowedArmOrigins: ledger.allowedArmOrigins,
-          subscriptionId: ledger.subscriptionId,
-          disposableRgName: rg.name,
-          allowDisposableRgLifecycle: true,
-        },
+        safetyContext: rgPollSafety,
       });
       if (check.response.status === 404) {
         rg.cleanupStatus = "deleted";
@@ -387,7 +434,32 @@ export async function deleteDisposableResourceGroup(options: {
         saveLedger(options.workDir, ledger);
         return { rgName: rg.name, cleanupStatus: "deleted" };
       }
+      if (
+        check.response.status >= 400 &&
+        check.response.status !== 429 &&
+        check.response.status < 500
+      ) {
+        rg.cleanupStatus = "cleanup_failed";
+        saveLedger(options.workDir, ledger);
+        throw new Error(
+          `Failed to poll disposable Resource Group "${rg.name}" deletion: HTTP ${check.response.status}.`,
+        );
+      }
+      const rgProvState = extractProvisioningState(check.response.body);
+      if (isFailedOrCanceledState(rgProvState)) {
+        rg.cleanupStatus = "cleanup_failed";
+        saveLedger(options.workDir, ledger);
+        throw new Error(
+          `Disposable Resource Group "${rg.name}" entered terminal failure provisioningState "${rgProvState}" during deletion.`,
+        );
+      }
     }
+
+    rg.cleanupStatus = "cleanup_failed";
+    saveLedger(options.workDir, ledger);
+    throw new Error(
+      `Timed out waiting for disposable Resource Group "${rg.name}" deletion after ${maxAttempts} poll attempts.`,
+    );
   }
 
   return { rgName: rg.name, cleanupStatus: rg.cleanupStatus };
@@ -519,11 +591,14 @@ async function putArmFixtureAndWait(options: {
     }
   }
 
+  const finalBearerToken = options.refreshBearerToken
+    ? options.refreshBearerToken()
+    : options.bearerToken;
   const finalGet = await sendRawHttpExchange({
     step: "final-get",
     method: "GET",
     url,
-    bearerToken: options.bearerToken,
+    bearerToken: finalBearerToken,
     safetyContext,
   });
   if (finalGet.response.status < 200 || finalGet.response.status >= 300) {
@@ -589,6 +664,13 @@ export async function provisionExternalFixture(options: {
     armBaseUrl: ledger.armBaseUrl,
     tokenResource: ledger.armTokenResource,
   });
+  const refreshBearerToken = () =>
+    getArmBearerToken({
+      explicitToken: options.bearerToken,
+      subscriptionId: sub,
+      armBaseUrl: ledger.armBaseUrl,
+      tokenResource: ledger.armTokenResource,
+    });
   const verifiedRgRunIdTag = await verifyLiveDisposableRgOwnership({
     armBaseUrl: ledger.armBaseUrl,
     allowedArmOrigins: ledger.allowedArmOrigins,
@@ -611,6 +693,7 @@ export async function provisionExternalFixture(options: {
       resourcePathWithQuery: `${resourcePath}?api-version=2023-01-31`,
       body: { location },
       bearerToken: token,
+      refreshBearerToken,
       disposableRgName: rg,
       disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
       expectedRunId,
@@ -652,11 +735,13 @@ export async function provisionExternalFixture(options: {
         },
       },
       bearerToken: token,
+      refreshBearerToken,
       disposableRgName: rg,
       disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
       expectedRunId,
       verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
+      maxPollAttempts: options.maxPollAttempts,
     });
     const vnetId = typeof body.id === "string" ? body.id : resourcePath;
     fixture = {
@@ -731,12 +816,20 @@ export async function provisionExternalFixture(options: {
           ],
         },
       },
-      bearerToken: token,
+      bearerToken: refreshBearerToken(),
+      refreshBearerToken: () =>
+        getArmBearerToken({
+          explicitToken: options.bearerToken,
+          subscriptionId: sub,
+          armBaseUrl: freshLedger.armBaseUrl,
+          tokenResource: freshLedger.armTokenResource,
+        }),
       disposableRgName: rg,
       disposableRgCleanupStatus: freshLedger.disposableResourceGroup?.cleanupStatus ?? "active",
       expectedRunId,
       verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
+      maxPollAttempts: options.maxPollAttempts,
     });
     fixture = {
       kind: "private-endpoint",
@@ -770,11 +863,13 @@ export async function provisionExternalFixture(options: {
         },
       },
       bearerToken: token,
+      refreshBearerToken,
       disposableRgName: rg,
       disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
       expectedRunId,
       verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
+      maxPollAttempts: options.maxPollAttempts,
     });
     fixture = {
       kind: "storage-account",
@@ -795,11 +890,13 @@ export async function provisionExternalFixture(options: {
         properties: { sku: { name: "PerGB2018" }, retentionInDays: 30 },
       },
       bearerToken: token,
+      refreshBearerToken,
       disposableRgName: rg,
       disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
       expectedRunId,
       verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
+      maxPollAttempts: options.maxPollAttempts,
     });
     fixture = {
       kind: "log-analytics",
@@ -843,13 +940,6 @@ export async function provisionExternalFixture(options: {
         `Invalid --resource-path "${options.customResourcePath}": expected "providers/<Namespace>/<type>/<name>" or full path inside disposable RG "${rg}".`,
       );
     }
-    const refreshBearerToken = () =>
-      getArmBearerToken({
-        explicitToken: options.bearerToken,
-        subscriptionId: sub,
-        armBaseUrl: ledger.armBaseUrl,
-        tokenResource: ledger.armTokenResource,
-      });
     const effectiveBody =
       options.customBody && typeof options.customBody === "object"
         ? "location" in options.customBody

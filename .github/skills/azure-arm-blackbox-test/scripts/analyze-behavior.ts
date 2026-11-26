@@ -1,5 +1,10 @@
-import { isPathOrAncestorDeclaredSecret, splitEscapedDotPath } from "./sanitize-example.ts";
-import { sanitizePayload, type SanitizeContext } from "./sanitize-example.ts";
+import {
+  isPathOrAncestorDeclaredSecret,
+  sanitizePayload,
+  sanitizeUrlSecretParameters,
+  splitEscapedDotPath,
+  type SanitizeContext,
+} from "./sanitize-example.ts";
 import { loadProjectedTypeSpecService } from "./typespec-loader.ts";
 import {
   validateStatusMonitorResultAgainstTypeSpec,
@@ -116,6 +121,7 @@ export interface AnalyzeBehaviorInput {
   requestSchemaErrors: TypeSpecSchemaIssue[];
   responseSchemaErrors: TypeSpecSchemaIssue[];
   priorPutBody?: unknown;
+  armBaseUrl?: string;
 }
 
 export function analyzeBehavioralDiscrepancies(
@@ -129,12 +135,29 @@ export function analyzeBehavioralDiscrepancies(
     requestSchemaErrors,
     responseSchemaErrors,
     priorPutBody,
+    armBaseUrl,
   } = input;
   const discrepancies: BehavioralDiscrepancy[] = [];
   const initial = exchanges[0];
   if (!initial) {
     return discrepancies;
   }
+
+  const secretQueryParamNames = contract.parameters
+    .filter((p) => p.in === "query" && p.secretCandidate)
+    .map((p) => p.name);
+  const secretPathSlotNames = contract.parameters
+    .filter((p) => p.in === "path" && p.secretCandidate)
+    .map((p) => p.name);
+  const scrubDiagnosticUrl = (rawUrl: string | undefined): string | undefined =>
+    rawUrl === undefined
+      ? undefined
+      : sanitizeUrlSecretParameters(rawUrl, {
+          armBaseUrl,
+          secretQueryParamNames,
+          secretPathTemplate: contract.pathTemplate,
+          secretPathSlotNames,
+        });
 
   const terminalExchange =
     [...exchanges].reverse().find((ex) => ex.step === "final-get") ??
@@ -157,9 +180,11 @@ export function analyzeBehavioralDiscrepancies(
       evidence: {
         initialStatus: initial.response.status,
         pollingHeaders: {
-          "azure-asyncoperation": initial.response.headers["azure-asyncoperation"],
-          location: initial.response.headers.location,
-          "operation-location": initial.response.headers["operation-location"],
+          "azure-asyncoperation": scrubDiagnosticUrl(
+            initial.response.headers["azure-asyncoperation"],
+          ),
+          location: scrubDiagnosticUrl(initial.response.headers.location),
+          "operation-location": scrubDiagnosticUrl(initial.response.headers["operation-location"]),
           "retry-after": initial.response.headers["retry-after"],
         },
         detectionSignals: observedLro.detectionSignals,
@@ -414,6 +439,7 @@ export function analyzeBehavioralDiscrepancies(
     for (let pageIdx = 0; pageIdx < pageExchanges.length; pageIdx++) {
       const pageEx = pageExchanges[pageIdx];
       if (pageIdx > 0 && (pageEx.response.status < 200 || pageEx.response.status >= 300)) {
+        const safePageUrl = scrubDiagnosticUrl(pageEx.request.url) ?? pageEx.request.url;
         discrepancies.push({
           ruleId: DISCREPANCY_RULES.STATUS_CODE_DRIFT,
           severity: "blocking",
@@ -421,11 +447,11 @@ export function analyzeBehavioralDiscrepancies(
           sourceLocation: contract.sourceLocation,
           summary: `Continuation page ${pageIdx + 1} on ${contract.operationId} failed with HTTP ${pageEx.response.status}.`,
           specExpectation: `Every nextLink continuation page must return HTTP 200 matching the paged list schema.`,
-          actualWireBehavior: `Page ${pageIdx + 1} (${pageEx.request.url}) returned HTTP ${pageEx.response.status}.`,
+          actualWireBehavior: `Page ${pageIdx + 1} (${safePageUrl}) returned HTTP ${pageEx.response.status}.`,
           evidence: {
             pageIndex: pageIdx + 1,
             status: pageEx.response.status,
-            url: pageEx.request.url,
+            url: safePageUrl,
           },
         });
         continue;

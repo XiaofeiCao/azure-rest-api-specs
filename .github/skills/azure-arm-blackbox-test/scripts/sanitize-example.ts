@@ -248,6 +248,8 @@ function selectRedactedPlaceholder(
     ["redactedplaceholder01", "a"],
     ["REDACTEDPLACEHOLDER01", "A"],
     ["RedactedSecretValue", "a"],
+    ["aaaaaaaaaaaa", "a"],
+    ["AAAAAAAAAAAA", "A"],
     ["000000000000", "0"],
     ["https://contoso.example.com/redacted", "a"],
     ["00000000-0000-0000-0000-000000000000", "0"],

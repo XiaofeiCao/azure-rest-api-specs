@@ -896,6 +896,7 @@ function validateSuppliedHttpParameter(
   jsonPath: string,
   ctx: ValidationContext,
   coerceFromWireString: boolean,
+  allowRedactedSecretBypass = true,
 ): void {
   const isParamSecret =
     Boolean(ctx.inSecretSubtree) ||
@@ -903,8 +904,9 @@ function validateSuppliedHttpParameter(
     isSecret(ctx.program, paramProp.type) ||
     SECRET_DIAGNOSTIC_NAME_RE.test(wireName) ||
     SECRET_DIAGNOSTIC_NAME_RE.test(paramProp.name);
-  // Redacted secret values in traces/examples (<redacted>) intentionally replace raw secret material.
-  if (rawVal === "<redacted>" && isParamSecret) {
+  // Redacted secret values in wire traces (<redacted>) replace raw secret material;
+  // generated examples pass allowRedactedSecretBypass=false so @pattern/@minLength/@maxLength are enforced!
+  if (allowRedactedSecretBypass && rawVal === "<redacted>" && isParamSecret) {
     return;
   }
   const paramCtx = isParamSecret ? { ...ctx, inSecretSubtree: true } : ctx;
@@ -1276,6 +1278,7 @@ export function validateExampleAgainstTypeSpec(
         `$.parameters.${wireParamName}`,
         paramValidationCtx,
         true,
+        false,
       );
     }
   }
@@ -1322,6 +1325,78 @@ export function validateExampleAgainstTypeSpec(
         severity: "error",
       });
       continue;
+    }
+
+    const exampleRespHeaders = respEntry?.headers ?? {};
+    const exampleHeadersByLower = new Map<string, string>();
+    for (const [hk, hv] of Object.entries(exampleRespHeaders)) {
+      exampleHeadersByLower.set(hk.toLowerCase(), hv);
+    }
+
+    if (matchedResp.responses.length > 0) {
+      const anyAltSatisfiesRequiredHeaders = matchedResp.responses.some((c) =>
+        Object.entries(c.headers ?? {}).every(
+          ([hWire, hProp]) => hProp.optional || exampleHeadersByLower.has(hWire.toLowerCase()),
+        ),
+      );
+      if (!anyAltSatisfiesRequiredHeaders) {
+        const missingRequired = Object.entries(matchedResp.responses[0].headers ?? {})
+          .filter(
+            ([hWire, hProp]) => !hProp.optional && !exampleHeadersByLower.has(hWire.toLowerCase()),
+          )
+          .map(([hWire]) => hWire);
+        for (const miss of missingRequired) {
+          issues.push({
+            code: "MISSING_EXAMPLE_RESPONSE_HEADER",
+            message: `Example response status "${statusKey}" on "${operationId}" omits required response header "${miss}".`,
+            path: `$.responses.${statusKey}.headers.${miss}`,
+            severity: "error",
+          });
+        }
+      }
+
+      const declaredHeadersByLower = new Map<
+        string,
+        {
+          wireName: string;
+          prop: (typeof matchedResp.responses)[number]["headers"] extends
+            | Record<string, infer P>
+            | undefined
+            ? P
+            : never;
+        }
+      >();
+      for (const c of matchedResp.responses) {
+        for (const [hWire, hProp] of Object.entries(c.headers ?? {})) {
+          if (!declaredHeadersByLower.has(hWire.toLowerCase())) {
+            declaredHeadersByLower.set(hWire.toLowerCase(), { wireName: hWire, prop: hProp });
+          }
+        }
+      }
+
+      const respHeaderCtx: ValidationContext = {
+        program: service.program,
+        metadataInfo,
+        visibility: Visibility.Read,
+        isPatchImplicitOptional: false,
+        strictEnumCase: true,
+        issues,
+        activePairs: new Set(),
+      };
+      for (const [rawKey, rawVal] of Object.entries(exampleRespHeaders)) {
+        const matchedHeader = declaredHeadersByLower.get(rawKey.toLowerCase());
+        if (matchedHeader) {
+          validateSuppliedHttpParameter(
+            rawVal,
+            matchedHeader.prop,
+            matchedHeader.wireName,
+            `$.responses.${statusKey}.headers.${matchedHeader.wireName}`,
+            respHeaderCtx,
+            true,
+            false,
+          );
+        }
+      }
     }
 
     const declaredBody = matchedResp.responses.find((c) => c.body !== undefined)?.body;

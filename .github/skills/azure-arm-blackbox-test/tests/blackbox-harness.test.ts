@@ -20,7 +20,13 @@ import {
   evaluateExampleOavCompleteness,
   generateLiveExamples,
 } from "../scripts/generate-examples.ts";
-import { mergeShardWorkDirs, updateLedgerAtomically } from "../scripts/ledger-store.ts";
+import {
+  mergeShardWorkDirs,
+  saveProbeTrace,
+  updateLedgerAtomically,
+} from "../scripts/ledger-store.ts";
+import { loadProjectedTypeSpecService } from "../scripts/typespec-loader.ts";
+import { validateExampleAgainstTypeSpec } from "../scripts/typespec-validator.ts";
 import {
   createDisposableResourceGroup,
   deleteDisposableResourceGroup,
@@ -3352,5 +3358,297 @@ op listCloudServiceNics(
       expect(finalParent.runtimeState?.pathSlotValues.concurrentSlotA).toBe("valA");
       expect(finalParent.runtimeState?.pathSlotValues.concurrentSlotB).toBe("valB");
     }
+  });
+
+  it("scrubs signed LRO/nextLink URLs & secret error payloads in diagnostics, prevents same-name trace overwrites, resolves @armProviderNamespace, validates constrained secret response headers, and handles RG delete failures", async () => {
+    const tempRoot = makeTempDir();
+    const projectDir = path.join(tempRoot, "ComputeLike.Management");
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "tspconfig.yaml"), "{}\n", "utf8");
+
+    // Namespace is named `Compute` while @armProviderNamespace("Microsoft.Compute") carries the ARM RP!
+    const tsp = `
+import "@typespec/http";
+import "@typespec/rest";
+import "@typespec/versioning";
+import "@typespec/openapi";
+import "@azure-tools/typespec-azure-core";
+import "@azure-tools/typespec-azure-resource-manager";
+
+using TypeSpec.Http;
+using TypeSpec.Rest;
+using TypeSpec.Versioning;
+using TypeSpec.OpenAPI;
+using Azure.Core;
+using Azure.ResourceManager;
+
+@armProviderNamespace("Microsoft.Compute")
+@service(#{ title: "ComputeManagementClient" })
+@versioned(Versions)
+@armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v5)
+namespace Compute;
+
+enum Versions {
+  v2025_04_01: "2025-04-01",
+}
+
+model SecretErrorDetail {
+  code: string;
+  message: string;
+  @secret
+  opaqueProof?: string;
+}
+
+@error
+model SecretErrorEnvelope {
+  error: SecretErrorDetail;
+}
+
+@secret
+@pattern("^[a-f0-9]{16}$")
+@minLength(16)
+@maxLength(16)
+scalar HexAuditDigest extends string;
+
+model DiskList {
+  @pageItems
+  value: Record<unknown>[];
+  @nextLink
+  nextLink?: string;
+}
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Compute/disks")
+@get
+@list
+@operationId("Disks_List")
+op listDisks(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @query("api-version") apiVersion: string,
+): DiskList | SecretErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Compute/disks/{diskName}/export")
+@post
+@operationId("Disks_Export")
+op exportDisk(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path diskName: string,
+  @query("api-version") apiVersion: string,
+): {
+  @statusCode _: 200;
+  @header("x-ms-audit-digest") auditDigest: HexAuditDigest;
+  @body body: { status: string };
+} | SecretErrorEnvelope;
+`;
+    fs.writeFileSync(path.join(projectDir, "main.tsp"), tsp, "utf8");
+
+    let baseUrl = "";
+    let failExport500 = false;
+    let failRgDeleteMonitor = true;
+    const rgMap = new Map<string, Record<string, unknown>>();
+
+    const server = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      const pathname = reqUrl.pathname;
+      const method = req.method ?? "GET";
+
+      const rgMatch = /^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)$/i.exec(pathname);
+      if (rgMatch) {
+        const key = `${rgMatch[1].toLowerCase()}/${rgMatch[2].toLowerCase()}`;
+        if (method === "GET") {
+          const rec = rgMap.get(key);
+          res.writeHead(rec ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(rec ?? { error: { code: "NotFound", message: "gone" } }));
+          return;
+        }
+        if (method === "PUT") {
+          let raw = "";
+          req.on("data", (c: Buffer) => (raw += String(c)));
+          req.on("end", () => {
+            const parsed = (raw ? JSON.parse(raw) : {}) as Record<string, unknown>;
+            const rec = { id: pathname, location: "eastus2", ...parsed };
+            rgMap.set(key, rec);
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(rec));
+          });
+          return;
+        }
+        if (method === "DELETE") {
+          res.writeHead(202, {
+            "Content-Type": "application/json",
+            "Azure-AsyncOperation": `${baseUrl}/rg-del-monitor`,
+          });
+          res.end();
+          return;
+        }
+      }
+
+      if (pathname === "/rg-del-monitor") {
+        if (failRgDeleteMonitor) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "Failed", error: { code: "Locked", message: "lock" } }));
+          return;
+        }
+        rgMap.clear();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "Succeeded" }));
+        return;
+      }
+
+      // Undeclared LRO with signed polling URL containing sig=RAW_POLL_SIG_SECRET!
+      if (pathname.endsWith("/export") && method === "POST") {
+        if (failExport500) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: {
+                code: "InternalError",
+                message: "Export failed",
+                opaqueProof: "RAW_ERROR_OPAQUE_SECRET_999",
+              },
+            }),
+          );
+          return;
+        }
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Azure-AsyncOperation": `${baseUrl}/export-poll?sig=RAW_POLL_SIG_SECRET`,
+          "x-ms-audit-digest": "deadbeefcafe1234",
+        });
+        res.end(
+          JSON.stringify({ status: "InProgress", properties: { provisioningState: "Updating" } }),
+        );
+        return;
+      }
+      if (pathname === "/export-poll") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "Succeeded", result: { status: "Ready" } }));
+        return;
+      }
+
+      // Paged Disks_List with signed nextLink that fails with 503 on page 2!
+      if (pathname.endsWith("/disks") && method === "GET") {
+        if (reqUrl.searchParams.get("page") === "2") {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { code: "Unavailable", message: "page2 down" } }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            value: [],
+            nextLink: `${baseUrl}${pathname}?api-version=2025-04-01&page=2&sig=RAW_NEXTLINK_SIG_SECRET`,
+          }),
+        );
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    server.keepAliveTimeout = 60_000;
+    servers.push(server);
+    baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const workDir = path.join(tempRoot, "compute-work");
+    const ledger = await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2025-04-01",
+      workDir,
+      armBaseUrl: baseUrl,
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus2",
+    });
+
+    // 1. @armProviderNamespace("Microsoft.Compute") on `namespace Compute` resolves to "Microsoft.Compute"!
+    expect(ledger.providerNamespace).toBe("Microsoft.Compute");
+
+    await createDisposableResourceGroup({ workDir, bearerToken: MOCK_TOKEN });
+
+    // 2. Signed LRO polling URL is scrubbed in LRO-UNDECLARED discrepancy evidence!
+    const exportOk = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "Disks_Export", pollIntervalMs: 1 },
+    });
+    const exportTraceText = JSON.stringify(exportOk.trace);
+    expect(exportTraceText).not.toContain("RAW_POLL_SIG_SECRET");
+
+    // 3. Constrained @secret response header (HexAuditDigest: ^[a-f0-9]{16}$) is sanitized to valid 16-char hex
+    // AND validateExampleAgainstTypeSpec rejects invalid `<redacted>` header values!
+    const exArtifacts = await generateLiveExamples({ workDir, validateWithTypeSpec: true });
+    const exportEx = exArtifacts.find((a) => a.operationId === "Disks_Export")!;
+    expect(exportEx.schemaValid).toBe(true);
+    const exportExJson = JSON.parse(fs.readFileSync(exportEx.scratchPath, "utf8")) as {
+      responses: Record<string, { headers?: Record<string, string> }>;
+    };
+    const sanitizedDigest = exportExJson.responses["200"]?.headers?.["x-ms-audit-digest"] ?? "";
+    expect(sanitizedDigest).not.toBe("deadbeefcafe1234");
+    expect(sanitizedDigest).toMatch(/^[a-f0-9]{16}$/);
+
+    const loadedSvc = await loadProjectedTypeSpecService(projectDir, "2025-04-01");
+    const tamperedDoc = structuredClone(exportExJson) as Parameters<
+      typeof validateExampleAgainstTypeSpec
+    >[2];
+    tamperedDoc.responses!["200"].headers!["x-ms-audit-digest"] = "<redacted>";
+    const headerIssues = validateExampleAgainstTypeSpec(loadedSvc, "Disks_Export", tamperedDoc);
+    expect(headerIssues.length).toBeGreaterThan(0);
+
+    // 4. Signed nextLink URL is scrubbed in continuation-page failure discrepancy & failureReason!
+    const listFail = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "Disks_List" },
+    });
+    expect(JSON.stringify(listFail.trace)).not.toContain("RAW_NEXTLINK_SIG_SECRET");
+
+    // 5. @secret error field `error.opaqueProof` is scrubbed in failureReason & ledger!
+    failExport500 = true;
+    const export500 = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: { operationId: "Disks_Export", scenario: "err500" },
+    });
+    expect(export500.trace.failureReason ?? "").not.toContain("RAW_ERROR_OPAQUE_SECRET_999");
+    const rawLedgerText = fs.readFileSync(path.join(workDir, "coverage-ledger.json"), "utf8");
+    expect(rawLedgerText).not.toContain("RAW_ERROR_OPAQUE_SECRET_999");
+
+    // 6. Same-sequence & same-(operationId, scenario) collision in saveProbeTrace allocates next sequence instead of overwriting!
+    const firstSaved = saveProbeTrace(workDir, { ...export500.trace, sequence: 99 });
+    const secondSaved = saveProbeTrace(workDir, { ...export500.trace, sequence: 99 });
+    expect(firstSaved).not.toBe(secondSaved);
+    expect(fs.existsSync(firstSaved)).toBe(true);
+    expect(fs.existsSync(secondSaved)).toBe(true);
+
+    // 7. Async RG delete monitor failure records cleanup_failed instead of hanging forever!
+    await expect(
+      deleteDisposableResourceGroup({
+        workDir,
+        wait: true,
+        pollIntervalMs: 1,
+        maxPollAttempts: 5,
+        bearerToken: MOCK_TOKEN,
+      }),
+    ).rejects.toThrow(/failed asynchronously/);
+    const afterFailLedger = JSON.parse(
+      fs.readFileSync(path.join(workDir, "coverage-ledger.json"), "utf8"),
+    ) as CoverageLedger;
+    expect(afterFailLedger.disposableResourceGroup?.cleanupStatus).toBe("cleanup_failed");
+
+    // Retry deletion when monitor succeeds -> deleted!
+    failRgDeleteMonitor = false;
+    const okDel = await deleteDisposableResourceGroup({
+      workDir,
+      wait: true,
+      pollIntervalMs: 1,
+      maxPollAttempts: 5,
+      bearerToken: MOCK_TOKEN,
+    });
+    expect(okDel.cleanupStatus).toBe("deleted");
   });
 });
