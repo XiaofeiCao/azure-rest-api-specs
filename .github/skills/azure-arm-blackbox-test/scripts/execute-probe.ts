@@ -18,7 +18,12 @@ import {
   verifyLiveDisposableRgOwnership,
   type SafetyGuardContext,
 } from "./auth-and-http.ts";
-import { loadLedger, nextTraceSequence, saveLedger, saveProbeTrace } from "./ledger-store.ts";
+import {
+  loadLedger,
+  nextTraceSequence,
+  saveProbeTrace,
+  updateLedgerAtomically,
+} from "./ledger-store.ts";
 import { sanitizeUrlSecretParameters } from "./sanitize-example.ts";
 import type {
   CoverageLedger,
@@ -497,6 +502,13 @@ function detectInitialLroSignals(
   const headers = initial.response.headers;
   const provState = extractProvisioningState(initial.response.body);
 
+  // On HTTP 200 with an already-terminal provisioningState (e.g. "Succeeded" on idempotent NRP PUT updates),
+  // some ARM RPs attach a stale/ephemeral Azure-AsyncOperation header whose URL immediately returns 404.
+  // Do not treat an already-terminal HTTP 200 response as an active in-flight LRO.
+  if (status === 200 && provState !== undefined && !isNonTerminalProvisioningState(provState)) {
+    return { signals };
+  }
+
   if (status === 202) {
     signals.push("http-202-accepted");
   }
@@ -569,12 +581,14 @@ export async function executeOperationProbe(
     );
   }
 
-  const token = getArmBearerToken({
-    explicitToken: options.bearerToken,
-    subscriptionId: ledger.subscriptionId,
-    armBaseUrl: ledger.armBaseUrl,
-    tokenResource: ledger.armTokenResource,
-  });
+  const refreshBearerToken = (): string =>
+    getArmBearerToken({
+      explicitToken: options.bearerToken,
+      subscriptionId: ledger.subscriptionId,
+      armBaseUrl: ledger.armBaseUrl,
+      tokenResource: ledger.armTokenResource,
+    });
+  const token = refreshBearerToken();
 
   if (!ledger.runId) {
     ledger.runId = crypto.randomBytes(4).toString("hex");
@@ -710,8 +724,8 @@ export async function executeOperationProbe(
         (f) => f.resourceId.toLowerCase() === identity.resourceId.toLowerCase(),
       )
     ) {
-      ledger.provisionedFixtures.push({
-        kind: "target-rp-resource",
+      const newFixture = {
+        kind: "target-rp-resource" as const,
         name: identity.name,
         resourceId: identity.resourceId,
         provisionedAt: new Date().toISOString(),
@@ -722,18 +736,31 @@ export async function executeOperationProbe(
           location: identity.location,
           resourceGroupName: identity.resourceGroupName,
         },
-      });
+      };
       ownedTargetResources.push(identity);
-      // Persist newly created target-RP resource ownership immediately before LRO polling so interrupted runs can still purge (#4267)!
-      saveLedger(options.workDir, ledger);
+      // Persist newly created target-RP resource ownership atomically before LRO polling so interrupted/concurrent runs never clobber (#4267)!
+      updateLedgerAtomically(options.workDir, (locked) => {
+        if (
+          !locked.provisionedFixtures.some(
+            (f) => f.resourceId.toLowerCase() === identity.resourceId.toLowerCase(),
+          )
+        ) {
+          locked.provisionedFixtures.push(newFixture);
+        }
+      });
     }
   }
 
-  const shouldPoll = input.pollLro !== false && !expectError && method !== "GET";
-  const maxPollAttempts = input.maxPollAttempts ?? 45;
-  const defaultPollIntervalMs = input.pollIntervalMs ?? 2000;
-  const maxPollDurationMs = input.maxPollDurationMs ?? 15 * 60_000;
-  const pollDeadlineMs = Date.now() + maxPollDurationMs;
+  const shouldPoll =
+    input.pollLro !== false &&
+    method !== "GET" &&
+    (!expectError || initialExchange.response.status === 202);
+  const maxPollAttempts = input.maxPollAttempts ?? Number.POSITIVE_INFINITY;
+  const defaultPollIntervalMs = input.pollIntervalMs ?? 5000;
+  const maxPollDurationMs = input.maxPollDurationMs ?? Number.POSITIVE_INFINITY;
+  const pollDeadlineMs = Number.isFinite(maxPollDurationMs)
+    ? Date.now() + maxPollDurationMs
+    : Number.POSITIVE_INFINITY;
 
   const lroInit =
     initialExchange.response.status >= 200 &&
@@ -784,7 +811,7 @@ export async function executeOperationProbe(
             step: "poll",
             method: "GET",
             url: currentPollUrl,
-            bearerToken: token,
+            bearerToken: refreshBearerToken(),
             extraSensitiveHeaders: secretHeaderNames,
             safetyContext,
             onBeforeHeaderRedaction: captureForValidation,
@@ -894,7 +921,7 @@ export async function executeOperationProbe(
               step: "final-get",
               method: "GET",
               url: targetUrl,
-              bearerToken: token,
+              bearerToken: refreshBearerToken(),
               extraSensitiveHeaders: secretHeaderNames,
               safetyContext,
               onBeforeHeaderRedaction: captureForValidation,
@@ -926,7 +953,7 @@ export async function executeOperationProbe(
                 step: "final-get",
                 method: "GET",
                 url: locUrl,
-                bearerToken: token,
+                bearerToken: refreshBearerToken(),
                 extraSensitiveHeaders: secretHeaderNames,
                 safetyContext,
                 onBeforeHeaderRedaction: captureForValidation,
@@ -946,7 +973,7 @@ export async function executeOperationProbe(
                 step: "final-get",
                 method: "GET",
                 url: locUrl,
-                bearerToken: token,
+                bearerToken: refreshBearerToken(),
                 extraSensitiveHeaders: secretHeaderNames,
                 safetyContext,
                 onBeforeHeaderRedaction: captureForValidation,
@@ -1006,7 +1033,7 @@ export async function executeOperationProbe(
         step: "next-page",
         method: "GET",
         url: resolvedNext,
-        bearerToken: token,
+        bearerToken: refreshBearerToken(),
         extraSensitiveHeaders: secretHeaderNames,
         safetyContext,
         onBeforeHeaderRedaction: captureForValidation,
@@ -1137,10 +1164,21 @@ export async function executeOperationProbe(
   const isImmediateFailedWrite = isFailedOrCanceledState(initialWriteTerminalState);
 
   const lroCompletedOk = !observedLro.detected || observedLro.completionStatus === "succeeded";
+  const isAsyncExpectedFailure =
+    initialExchange.response.status === 202 &&
+    observedLro.detected &&
+    observedLro.completionStatus === "failed" &&
+    exchanges.some(
+      (ex) =>
+        ex.step === "poll" &&
+        ((ex.response.status >= 400 && ex.response.status < 500) ||
+          isFailedOrCanceledState(extractAsyncMonitorStatus(ex.response.body)) ||
+          isFailedOrCanceledState(extractProvisioningState(ex.response.body))),
+    );
   const probeSucceeded = expectError
     ? followUpException === undefined &&
-      initialExchange.response.status >= 400 &&
-      initialExchange.response.status < 500
+      ((initialExchange.response.status >= 400 && initialExchange.response.status < 500) ||
+        isAsyncExpectedFailure)
     : followUpException === undefined &&
       isInitial2xx &&
       !isImmediateFailedWrite &&
@@ -1160,7 +1198,11 @@ export async function executeOperationProbe(
       `HTTP ${initialExchange.response.status}: ${JSON.stringify(initialExchange.response.body ?? initialExchange.response.rawTextSnippet ?? "").slice(0, 240)}`)
     : undefined;
 
-  // Record observed path slots, PUT bodies, and List child item names into runtimeState on positive success.
+  // Record observed path slots, PUT bodies, and List child item names to merge atomically under ledger lock.
+  const newPathSlotEntries: Record<string, string> = {};
+  let newPutBodyRecord: Record<string, unknown> | undefined;
+  let newListDiscoveredNames: string[] | undefined;
+
   if (!expectError && probeSucceeded) {
     const boundSlots = extractPathSlotsFromUrl(contract.pathTemplate, targetUrl, ledger.armBaseUrl);
     for (const [k, v] of Object.entries(boundSlots)) {
@@ -1171,6 +1213,7 @@ export async function executeOperationProbe(
         lowerK !== "resourcegroup" &&
         lowerK !== "scope"
       ) {
+        newPathSlotEntries[k] = v;
         runtimeState.pathSlotValues[k] = v;
       }
     }
@@ -1181,9 +1224,9 @@ export async function executeOperationProbe(
       typeof input.body === "object" &&
       !Array.isArray(input.body)
     ) {
-      const bodyRecord = input.body as Record<string, unknown>;
-      runtimeState.putBodiesByResourceType[`path:${normalizedTargetPath}`] = bodyRecord;
-      runtimeState.putBodiesByResourceType[contract.resourceType] = bodyRecord;
+      newPutBodyRecord = input.body as Record<string, unknown>;
+      runtimeState.putBodiesByResourceType[`path:${normalizedTargetPath}`] = newPutBodyRecord;
+      runtimeState.putBodiesByResourceType[contract.resourceType] = newPutBodyRecord;
     }
 
     if (method === "GET") {
@@ -1216,6 +1259,7 @@ export async function executeOperationProbe(
         }
       }
       if (discoveredNames.length > 0) {
+        newListDiscoveredNames = discoveredNames;
         runtimeState.listItemNamesByResourceType[contract.resourceType] = discoveredNames;
       }
     }
@@ -1259,27 +1303,41 @@ export async function executeOperationProbe(
 
   const traceFile = saveProbeTrace(options.workDir, trace);
 
-  // Update coverage entry in ledger.
-  const cov = ledger.coverage[contract.operationId];
-  cov.attempts += 1;
-  cov.lastHttpStatus = initialExchange.response.status;
-  cov.traceFiles.push(traceFile);
-  cov.discrepancyCount += discrepancies.length;
-
-  if (probeSucceeded) {
-    // Only mark an operation covered once at least one non-negative scenario completes cleanly (#19–#22).
-    // Negative pre-checks (`expectError: true`) retain their discrepancies in `discrepancyCount` & `traceFiles`
-    // while keeping `cov.status` as `"pending"` until a positive probe succeeds!
-    if (!expectError) {
-      cov.status = cov.discrepancyCount > 0 ? "passed_with_mismatch" : "passed";
-      cov.blockerReason = undefined;
+  // Atomically merge runtimeState & coverage entry into the latest ledger under lock so concurrent probes never clobber!
+  updateLedgerAtomically(options.workDir, (locked) => {
+    const lockedRuntime = ensureRuntimeState(locked);
+    Object.assign(lockedRuntime.pathSlotValues, newPathSlotEntries);
+    if (newPutBodyRecord) {
+      lockedRuntime.putBodiesByResourceType[`path:${normalizedTargetPath}`] = newPutBodyRecord;
+      lockedRuntime.putBodiesByResourceType[contract.resourceType] = newPutBodyRecord;
     }
-  } else if (!expectError && cov.status !== "passed" && cov.status !== "passed_with_mismatch") {
-    cov.status = "failed_service_error";
-    cov.blockerReason = failureReason;
-  }
+    if (newListDiscoveredNames) {
+      lockedRuntime.listItemNamesByResourceType[contract.resourceType] = newListDiscoveredNames;
+    }
 
-  saveLedger(options.workDir, ledger);
+    const cov = locked.coverage[contract.operationId];
+    if (!cov) {
+      return;
+    }
+    cov.attempts += 1;
+    cov.lastHttpStatus = initialExchange.response.status;
+    cov.traceFiles.push(traceFile);
+    cov.discrepancyCount += discrepancies.length;
+
+    if (probeSucceeded) {
+      // Only mark an operation covered once at least one non-negative scenario completes cleanly (#19–#22).
+      // Negative pre-checks (`expectError: true`) retain their discrepancies in `discrepancyCount` & `traceFiles`
+      // while keeping `cov.status` as `"pending"` until a positive probe succeeds!
+      if (!expectError) {
+        cov.status = cov.discrepancyCount > 0 ? "passed_with_mismatch" : "passed";
+        cov.blockerReason = undefined;
+      }
+    } else if (!expectError && cov.status !== "passed" && cov.status !== "passed_with_mismatch") {
+      cov.status = "failed_service_error";
+      cov.blockerReason = failureReason;
+    }
+  });
+
   if (followUpException !== undefined) {
     if (followUpException instanceof Error) {
       throw followUpException;
@@ -1289,4 +1347,92 @@ export async function executeOperationProbe(
     );
   }
   return { trace, traceFile };
+}
+
+export interface ProbeBatchSummaryItem {
+  operationId: string;
+  action: "probe" | "mark-blocked";
+  scenario?: string;
+  probeSucceeded?: boolean;
+  initialStatus?: number;
+  discrepancyCount?: number;
+  failureReason?: string;
+  traceFile?: string;
+}
+
+export async function executeProbeBatch(options: {
+  workDir: string;
+  items: Array<
+    | ProbeRequestInput
+    | {
+        markBlocked: {
+          operationIds: string[];
+          reason: string;
+        };
+      }
+  >;
+  continueOnError?: boolean;
+  bearerToken?: string;
+}): Promise<ProbeBatchSummaryItem[]> {
+  const results: ProbeBatchSummaryItem[] = [];
+  for (const item of options.items) {
+    if ("markBlocked" in item) {
+      const { operationIds, reason } = item.markBlocked;
+      updateLedgerAtomically(options.workDir, (locked) => {
+        for (const opId of operationIds) {
+          const cov = locked.coverage[opId];
+          if (!cov) {
+            throw new Error(`Unknown operationId "${opId}" in markBlocked batch item.`);
+          }
+          if (cov.status !== "passed" && cov.status !== "passed_with_mismatch") {
+            cov.status = "blocked";
+            cov.blockerReason = reason;
+          }
+        }
+      });
+      for (const opId of operationIds) {
+        results.push({
+          operationId: opId,
+          action: "mark-blocked",
+          probeSucceeded: true,
+          failureReason: reason,
+        });
+      }
+      continue;
+    }
+
+    try {
+      const { trace, traceFile } = await executeOperationProbe({
+        workDir: options.workDir,
+        input: item,
+        bearerToken: options.bearerToken,
+      });
+      results.push({
+        operationId: trace.operationId,
+        action: "probe",
+        scenario: trace.scenario,
+        probeSucceeded: trace.probeSucceeded,
+        initialStatus: trace.exchanges[0]?.response.status,
+        discrepancyCount: trace.discrepancies.length,
+        failureReason: trace.failureReason,
+        traceFile,
+      });
+      if (!trace.probeSucceeded && !options.continueOnError) {
+        break;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      results.push({
+        operationId: item.operationId,
+        action: "probe",
+        scenario: item.scenario,
+        probeSucceeded: false,
+        failureReason: msg,
+      });
+      if (!options.continueOnError) {
+        throw err;
+      }
+    }
+  }
+  return results;
 }

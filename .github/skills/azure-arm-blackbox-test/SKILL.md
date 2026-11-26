@@ -27,75 +27,112 @@ All CLI commands run from the repository root using Node 24's native TypeScript 
 node .github/skills/azure-arm-blackbox-test/scripts/cli.ts <subcommand> [options]
 ```
 
-### Step 1: Isolate Disposable Test Resource Group
+### Step 1: Compile TypeSpec, Build Two-Layer DAG, and Choose Single vs. Sharded Execution
 
-1. Resolve the active Azure subscription (`az account show --query "{id:id, name:name}" -o json`), pick an isolated scratch `--work-dir` (for example under session artifacts or `$TEMP/arm-blackbox-<service>`), and create the disposable `rg-arm-blackbox-*` Resource Group upfront:
-
-   ```bash
-   node .github/skills/azure-arm-blackbox-test/scripts/cli.ts rg create \
-     --work-dir <work-dir> \
-     --subscription-id <subscription-id> \
-     --location <location> \
-     --service-hint <service>
-   ```
-
-   _(Optional Canary / EUAP / Dogfood / Sovereign cloud target: pass `--arm-base-url <https-url>` such as `https://eastus2euap.management.azure.com` or `https://api-dogfood.resources.windows-int.net`, plus optional `--arm-token-resource <audience>` or `--allowed-arm-origins <csv>` when custom Entra audiences or companion LRO polling hosts are needed. Running `discover` before `rg create` is also supported.)_
-
-### Step 2: Build Two-Layer Execution DAG (TypeSpec Base DAG + Cross-RP Fixture Weaving)
-
-1. **DAG Layer 1 — Compile TypeSpec & Build Base Intra-Service DAG (`discover`)**:
+1. **Resolve Subscription & Run `discover` First**:
+   Resolve the active Azure subscription (`az account show --query "{id:id, name:name}" -o json`), pick an isolated scratch `--work-dir` (for example under session artifacts or `$TEMP/arm-blackbox-<service>`), and compile the TypeSpec inventory & topological DAG:
 
    ```bash
    node .github/skills/azure-arm-blackbox-test/scripts/cli.ts discover \
      --spec specification/<service>/resource-manager \
      --api-version <target-api-version> \
+     --subscription-id <subscription-id> \
+     --location <location> \
      --check-live-provider \
      --work-dir <work-dir>
    ```
 
-   Inspect the JSON output and `<work-dir>/coverage-ledger.json`:
-   - Confirm `providerLiveMetadata.targetVersionSupportedOnArm` is `true` (if `false`, check deployed `apiVersions` in `providerLiveMetadata`).
-   - Review `executionOrder` (top-down parent-to-child create/read/update/action, bottom-up delete, soft-delete purge) and `externalDependencies`.
+   _(Optional Canary / EUAP / Dogfood / Sovereign cloud target: pass `--arm-base-url <https-url>`, `--arm-token-resource <audience>`, or `--allowed-arm-origins <csv>`. Optional `--resource-filter <csv>` narrows discovery while automatically retaining transitive intra-RP `create`/`delete` prerequisites ONLY when the user explicitly asked for a subset.)_
 
-2. **DAG Layer 2 — Weave External Cross-RP Fixtures (`fixture`)**:
-   When operations in `executionOrder` require cross-RP dependencies (`managed-identity`, `vnet-subnet`, `private-endpoint`, `storage-account`, `log-analytics`), weave them into the lifecycle via `fixture` (see [references/fixture-and-lifecycle-playbook.md](references/fixture-and-lifecycle-playbook.md)):
+   Inspect the JSON output and `<work-dir>/coverage-ledger.json`:
+   - Confirm `providerLiveMetadata.targetVersionSupportedOnArm` is `true`.
+   - Review `executionOrder` and `executionGraph` (`{ nodes, edges }` capturing parent-before-child, intra-RP `SubResource` prerequisite edges, and reverse bottom-up delete order) plus `externalDependencies` (self-RP leaf noise is pre-filtered; cross-RP host scopes and root external fixtures are listed).
+
+2. **Scale Branch — Single-RG (`<= 60` ops) vs. Sharded Parallel Execution (`> 60` ops)**:
+   - **Small/Medium Specs (`totalOperations <= 60`)**: Create one disposable Resource Group directly in `<work-dir>`:
+     ```bash
+     node .github/skills/azure-arm-blackbox-test/scripts/cli.ts rg create \
+       --work-dir <work-dir> \
+       --subscription-id <subscription-id> \
+       --location <location> \
+       --service-hint <service>
+     ```
+   - **Large/Monolithic Specs (`totalOperations > 60`, e.g. `Microsoft.Network` with `800+` operations)**: Never attempt 800+ sequential cold probes in a single agent turn. Partition `<work-dir>` into balanced, self-contained shards (`--max-ops-per-shard 140` by default; prerequisite `create`/`delete` contracts are automatically included in each shard):
+     ```bash
+     node .github/skills/azure-arm-blackbox-test/scripts/cli.ts partition-shards \
+       --work-dir <work-dir>
+     ```
+     Delegate shards in parallel across subagents (each shard worker runs `rg create --work-dir <shard-dir>`, executes Step 2b–Step 3 using `probe-batch` until `cli.ts status --work-dir <shard-dir>` shows `pending === 0`, runs `generate-examples --work-dir <shard-dir>`, and runs `rg delete --work-dir <shard-dir> --wait`). Once all shards complete, merge them back into `<work-dir>`:
+     ```bash
+     node .github/skills/azure-arm-blackbox-test/scripts/cli.ts merge-shards \
+       --work-dir <work-dir>
+     ```
+
+3. **DAG Layer 2 — Weave External Cross-RP Fixtures (`fixture`)**:
+   When operations require cross-RP dependencies (`managed-identity`, `vnet-subnet`, `private-endpoint`, `storage-account`, `log-analytics`, or any arbitrary cross-RP resource via `--kind custom`), provision them inside the disposable RG via `fixture` (never via raw `az rest` or `az <service>`):
 
    ```bash
+   # Built-in cross-RP fixture:
    node .github/skills/azure-arm-blackbox-test/scripts/cli.ts fixture \
      --work-dir <work-dir> \
      --kind managed-identity
+
+   # Arbitrary cross-RP fixture inside the disposable RG (e.g. Key Vault, Compute VM, EventHub):
+   node .github/skills/azure-arm-blackbox-test/scripts/cli.ts fixture \
+     --work-dir <work-dir> \
+     --kind custom \
+     --resource-path "providers/Microsoft.KeyVault/vaults/bbxkv01" \
+     --api-version 2023-07-01 \
+     --body-file <work-dir>/requests/kv-fixture.json
    ```
 
-   _(Note: Provision `private-endpoint` fixtures mid-loop after the parent target RP resource is created so you can pass `--target-resource-id <storeId> --group-ids <groupId>`.)_
+   _(Provision `private-endpoint` fixtures mid-loop after the parent target RP resource is created so you can pass `--target-resource-id <resourceId> --group-ids <groupId>`.)_
 
-### Step 3: Execute Stateful Lifecycle Probes Toward 100% Coverage
+### Step 2: Execute Stateful Lifecycle Probes Until `pending === 0`
 
-Iterate through `executionOrder` in `coverage-ledger.json` using `probe`:
+Drive every operation in `executionOrder` using **warm batch execution (`probe-batch`)** for throughput and `probe` for targeted interactive retries:
 
 ```bash
-node .github/skills/azure-arm-blackbox-test/scripts/cli.ts probe \
+# Warm batch execution: compiles TypeSpec ONCE in-memory for 10-50+ operations!
+node .github/skills/azure-arm-blackbox-test/scripts/cli.ts probe-batch \
   --work-dir <work-dir> \
-  --request-file <work-dir>/requests/<op>.json
+  --batch-file <work-dir>/requests/batch-01.json
+
+# Fast zero-body batch for preflight/GET/LIST operations:
+node .github/skills/azure-arm-blackbox-test/scripts/cli.ts probe-batch \
+  --work-dir <work-dir> \
+  --operations Operations_List,Usages_List,VirtualNetworks_ListAll
+
+# Inspect live coverage counts and next ready pending operations at any time:
+node .github/skills/azure-arm-blackbox-test/scripts/cli.ts status \
+  --work-dir <work-dir>
 ```
 
 Follow the [lifecycle playbook](references/fixture-and-lifecycle-playbook.md):
 
-1. **Preflight discovery ops**: Run `Operations_List`, `CheckNameAvailability`, SKU/quota list operations first.
-2. **Negative error-envelope probe**: Before creating the parent resource, send one `GET` for the non-existent resource with `"expectError": true` and `"scenario": "not-found"` to validate the `404` OData v4 `{ error: { code, message } }` contract (`ERROR-ENVELOPE-DRIFT`).
-3. **Parent resource lifecycle**:
-   - `PUT` (`scenario: "create"` or `"min"` / `"max"`): Omit `pathOrUrl` to let `probe` deterministically interpolate `contract.pathTemplate` from ledger context (`{subscriptionId}`, `{resourceGroupName}`, `{location}`, and `@pattern`-valid resource names) and automatically poll LRO headers (`Azure-AsyncOperation`, `Location`, `Operation-Location`) or headerless non-terminal `provisioningState` transitions! Pass `pathParams` only when semantic overrides are needed (e.g., `key$label` or `/{scope}`).
-   - `GET`: `probe` automatically reuses the created resource name and auto-attaches the saved `priorPutBody` from `PUT` so `ROUNDTRIP-MUTABILITY-DRIFT` is checked automatically without manual copy-paste.
-   - `LIST` (by Resource Group and by Subscription): Automatically traverses all `nextLink` continuation pages, validates every page, and harvests child item names (such as server-assigned `privateEndpointConnectionName`) for subsequent child probes.
-   - `PATCH`: Test mutable tags/properties update and LRO behavior.
-   - `POST` actions (e.g., `listKeys`, `regenerateKey`, custom actions): Verifies sync vs LRO behavior and `final-state-via` payload delivery (`LRO-FINAL-STATE-DRIFT`).
-4. **Child & extension resources**: Provision any dependent fixtures (such as a `private-endpoint` targeting the live parent resource so `PrivateEndpointConnections_List/Get/Put/Delete` can be exercised with real service state!), then run child `PUT` -> `GET` -> `LIST` -> `PATCH` -> `POST` -> `DELETE`.
-5. **Parent `DELETE` & soft-deleted resource operations**: Delete child resources bottom-up, delete the parent resource, and then immediately exercise any `deleted*` operations (`ListDeleted`, `GetDeleted`, `PurgeDeleted`) while the soft-deleted entry exists!
-6. **Adaptive 4xx Retry Loop**:
-   - If a probe returns `400`/`409`/`422` because of a missing domain field, invalid SKU/location combo, or naming rule, read the exact ARM error message from the probe output, adjust the request JSON payload, and re-run `probe` to maximize coverage.
-   - Note that if `requestSchemaErrorCount` was `0` on that `400`, `SCHEMA-REQUEST-REJECTED` is recorded automatically because the TypeSpec request model allowed a payload that the live service rejected!
-   - Only use `mark-blocked` when an operation is genuinely gated by subscription quota, private feature flag (`FeatureNotRegistered`), or unsupported cloud stamp capability.
+1. **Preflight discovery ops**: Run provider/subscription/location discovery operations (`Operations_List`, `CheckNameAvailability`, `CheckDnsNameAvailability`, SKU/usage/service-tag lists — passing `--query '<json>'` or `query` in batch JSON when required query parameters exist).
+2. **Negative error-envelope probe**: Before creating a parent resource, send one `GET` for the non-existent resource with `"expectError": true` and `"scenario": "not-found"` to validate the `404` OData v4 `{ error: { code, message } }` contract (`ERROR-ENVELOPE-DRIFT`). (`expectError: true` also polls `202` LROs when an invalid action fails asynchronously.)
+3. **Prerequisite & Parent Resource Lifecycle (`executionGraph` topological order)**:
+   - Follow `intraRpDependencies` and `executionGraph`: create prerequisite intra-RP resources first (for example `VirtualNetworks` + `Subnets` + `PublicIPAddresses` + `NetworkSecurityGroups` before `NetworkInterfaces`, `LoadBalancers`, `NatGateways`, `BastionHosts`, or `AzureFirewalls`). Do **not** skip long-running resources—LRO polling is uncapped by default with automatic ARM token refresh.
+   - `PUT`: Omit `pathOrUrl` to let `probe` deterministically interpolate `contract.pathTemplate` from ledger context and poll LRO headers (`Azure-AsyncOperation`, `Location`, `Operation-Location`) to terminal completion.
+   - `GET`, `LIST` (RG + Subscription), `PATCH`, `POST` actions: Batch ready `GET`/`LIST`/`PATCH`/`POST` operations in `probe-batch` after parent creation succeeds.
+4. **Child & Extension Resources**: Provision any dependent fixtures (`private-endpoint` or `--kind custom`), then execute child `PUT` -> `GET` -> `LIST` -> `PATCH` -> `POST` -> `DELETE`.
+5. **Bottom-Up `DELETE` & Soft-Deleted Operations**: Delete dependent/child resources before prerequisite/parent resources (`executionOrder` automatically reverses topological tiers on `DELETE`), then immediately exercise `deleted*` operations (`ListDeleted`, `GetDeleted`, `PurgeDeleted`).
+6. **Adaptive `4xx` Retry Loop & Hard `pending === 0` Completion Gate**:
+   - **Hard Gate**: You MUST reach `pending === 0` in `cli.ts status --work-dir <work-dir>` before tearing down the RG or concluding. Never leave operations `pending` due to time estimates or context budgeting.
+   - If a probe returns `400`/`409`/`422` due to missing domain fields, SKU/location combos, or naming rules, read the exact ARM error message, adjust the request payload, and re-probe. (`SCHEMA-REQUEST-REJECTED` is recorded automatically when `requestSchemaErrorCount === 0`.)
+   - Use `mark-blocked` **only** after live evidence proves an external blocker:
+     1. A live `4xx` response proving subscription quota exhaustion (`*LimitReached`, `QuotaExceeded`), unregistered feature/allowlist (`FeatureNotRegistered`, `SubscriptionNotRegisteredForFeature`), physical/carrier/BYOIP/cross-tenant ownership requirement, or unsupported region/SKU across fallback regions; OR
+     2. A non-RG scope guardrail (`Tenant`, `ManagementGroup`, cross-subscription, or cross-RP host resource that cannot be created inside the disposable RG).
+   - When a parent resource's `CreateOrUpdate` is live-verified as externally blocked after retry, mark its dependent child operations blocked in one atomic call citing the exact live ARM error code:
+     ```bash
+     node .github/skills/azure-arm-blackbox-test/scripts/cli.ts mark-blocked \
+       --work-dir <work-dir> \
+       --resource-type Microsoft.Network/expressRouteDirectPorts \
+       --reason "Parent ExpressRouteDirectPorts_CreateOrUpdate blocked by live 400 InvalidPeeringLocation/physical port requirement"
+     ```
 
-### Step 4: Generate Sanitized Real-Life TypeSpec Examples
+### Step 3: Generate Sanitized Real-Life TypeSpec Examples
 
 Run `generate-examples` to convert verified live traces into TypeSpec example JSON files and validate them directly against the projected TypeSpec `HttpOperation` models:
 
@@ -108,16 +145,17 @@ node .github/skills/azure-arm-blackbox-test/scripts/cli.ts generate-examples \
 - Pass `--write-to-spec` **only** when the user asked to promote examples into `<typespec-project>/examples/<api-version>/*.json`. `--write-to-spec` writes **only** examples that are both TypeSpec-valid (`schemaValid: true`) and OAV-complete (`oavComplete: true` — covering all declared `2xx` status codes for `OAV111` and required `Location` / `Azure-AsyncOperation` headers on `202` LROs), and reports any skipped wire-subset operations.
 - Consult [references/example-sanitization-and-wiring.md](references/example-sanitization-and-wiring.md) for secret redaction (`SEC-SECRET-DETECT`), PII scrubbing, pure wire-truth LRO stitching, and `--write-to-spec` OAV-completeness gating.
 
-### Step 5: Tear Down Disposable RG and Render Final Report
+### Step 4: Tear Down Disposable RG(s) and Render Final Report
 
-1. Always delete the disposable Resource Group before concluding:
+1. Confirm `cli.ts status --work-dir <work-dir>` shows `pending: 0`, then delete the disposable Resource Group (`rg delete` blocks teardown if any operation is still `pending`, unless `--allow-pending` is passed for emergency abort cleanup):
 
    ```bash
    node .github/skills/azure-arm-blackbox-test/scripts/cli.ts rg delete \
-     --work-dir <work-dir>
+     --work-dir <work-dir> \
+     --wait
    ```
 
-   _(Add `--wait` when synchronous confirmation of full RG deletion is desired.)_
+   _(In sharded mode, each shard worker already ran `rg delete --work-dir <shard-dir> --wait` before `merge-shards`; verify `az group list --query "[?starts_with(name, 'rg-arm-blackbox-')]"` returns `[]`.)_
 
 2. Generate `<work-dir>/blackbox-report.json`, `<work-dir>/blackbox-report.md`, and the self-contained local interactive HTML dashboard `<work-dir>/report-html/index.html` (with `assets/{styles.css,app.js,portal-data.js,portal-data.json}` — works offline via `file://` or any local HTTP server; pass repeatable `--extra-work-dir <dir>` to combine multiple service runs):
 

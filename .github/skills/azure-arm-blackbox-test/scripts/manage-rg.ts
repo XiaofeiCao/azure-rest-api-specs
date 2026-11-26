@@ -21,7 +21,7 @@ import {
   validateAndNormalizeArmBaseUrl,
   verifyLiveDisposableRgOwnership,
 } from "./auth-and-http.ts";
-import { getLedgerPath, loadLedger, saveLedger } from "./ledger-store.ts";
+import { getLedgerPath, loadLedger, saveLedger, updateLedgerAtomically } from "./ledger-store.ts";
 import type { CoverageLedger, ExternalDependencyKind, ProvisionedFixture } from "./types.ts";
 
 const ARM_RESOURCES_API_VERSION = "2024-03-01";
@@ -359,14 +359,20 @@ export async function deleteDisposableResourceGroup(options: {
 
   if (options.wait) {
     const pollIntervalMs = options.pollIntervalMs ?? 5000;
-    const maxAttempts = options.maxPollAttempts ?? 60;
+    const maxAttempts = options.maxPollAttempts ?? Number.POSITIVE_INFINITY;
     for (let i = 0; i < maxAttempts; i++) {
       await delay(pollIntervalMs);
+      const refreshedToken = getArmBearerToken({
+        explicitToken: options.bearerToken,
+        subscriptionId: ledger.subscriptionId,
+        armBaseUrl: ledger.armBaseUrl,
+        tokenResource: ledger.armTokenResource,
+      });
       const check = await sendRawHttpExchange({
         step: "poll",
         method: "GET",
         url,
-        bearerToken: token,
+        bearerToken: refreshedToken,
         safetyContext: {
           trustedArmBaseUrl: ledger.armBaseUrl,
           allowedArmOrigins: ledger.allowedArmOrigins,
@@ -394,6 +400,7 @@ async function putArmFixtureAndWait(options: {
   resourcePathWithQuery: string;
   body: unknown;
   bearerToken: string;
+  refreshBearerToken?: () => string;
   disposableRgName: string;
   disposableRgCleanupStatus: string;
   expectedRunId: string;
@@ -433,14 +440,18 @@ async function putArmFixtureAndWait(options: {
     initial.response.headers["operation-location"] ??
     initial.response.headers.location;
   const initialProvState = extractProvisioningState(initial.response.body);
+  const isAlreadyTerminal200 =
+    initial.response.status === 200 &&
+    initialProvState !== undefined &&
+    !isNonTerminalProvisioningState(initialProvState);
   const needsPoll =
-    Boolean(asyncHeader) ||
-    initial.response.status === 202 ||
-    isNonTerminalProvisioningState(initialProvState);
+    !isAlreadyTerminal200 &&
+    (Boolean(asyncHeader) ||
+      initial.response.status === 202 ||
+      isNonTerminalProvisioningState(initialProvState));
 
   const pollIntervalMs = options.pollIntervalMs ?? 3000;
-  const maxAttempts = options.maxPollAttempts ?? 40;
-  const pollDeadlineMs = Date.now() + 15 * 60_000;
+  const maxAttempts = options.maxPollAttempts ?? Number.POSITIVE_INFINITY;
 
   if (needsPoll) {
     const pollUrl = asyncHeader
@@ -451,19 +462,17 @@ async function putArmFixtureAndWait(options: {
 
     for (let i = 0; i < maxAttempts; i++) {
       const waitMs = parseRetryAfterMs(lastWaitHeaders, pollIntervalMs);
-      if (Date.now() + waitMs > pollDeadlineMs) {
-        throw new Error(
-          `Fixture LRO polling exceeded 15-minute deadline while honoring Retry-After (${waitMs}ms) (${options.resourcePathWithQuery}).`,
-        );
-      }
       if (waitMs > 0) {
         await delay(waitMs);
       }
+      const activeToken = options.refreshBearerToken
+        ? options.refreshBearerToken()
+        : options.bearerToken;
       const poll = await sendRawHttpExchange({
         step: "poll",
         method: "GET",
         url: pollUrl,
-        bearerToken: options.bearerToken,
+        bearerToken: activeToken,
         safetyContext,
       });
       lastWaitHeaders = poll.response.headers;
@@ -545,7 +554,11 @@ export async function provisionExternalFixture(options: {
   name?: string;
   targetPrivateLinkResourceId?: string;
   groupIds?: string[];
+  customResourcePath?: string;
+  customApiVersion?: string;
+  customBody?: Record<string, unknown>;
   pollIntervalMs?: number;
+  maxPollAttempts?: number;
   bearerToken?: string;
 }): Promise<ProvisionedFixture> {
   const ledger = loadLedger(options.workDir);
@@ -603,6 +616,7 @@ export async function provisionExternalFixture(options: {
       expectedRunId,
       verifiedRgRunIdTag,
       pollIntervalMs: options.pollIntervalMs,
+      maxPollAttempts: options.maxPollAttempts,
     });
     fixture = {
       kind: "managed-identity",
@@ -731,8 +745,9 @@ export async function provisionExternalFixture(options: {
       provisionedAt: new Date().toISOString(),
       metadata: { subnetId, targetPrivateLinkResourceId: options.targetPrivateLinkResourceId },
     };
-    freshLedger.provisionedFixtures.push(fixture);
-    saveLedger(options.workDir, freshLedger);
+    updateLedgerAtomically(options.workDir, (locked) => {
+      locked.provisionedFixtures.push(fixture);
+    });
     return fixture;
   } else if (options.kind === "storage-account") {
     const name = (options.name ?? `bbxst${rand}${crypto.randomBytes(2).toString("hex")}`)
@@ -792,13 +807,85 @@ export async function provisionExternalFixture(options: {
       resourceId: typeof body.id === "string" ? body.id : resourcePath,
       provisionedAt: new Date().toISOString(),
     };
+  } else if (
+    options.kind === "custom" ||
+    options.kind === "generic-arm-resource" ||
+    options.kind === "key-vault"
+  ) {
+    if (!options.customResourcePath || !options.customApiVersion) {
+      throw new Error(
+        `Fixture kind "${options.kind}" requires --resource-path (e.g. "providers/Microsoft.KeyVault/vaults/mykv") and --api-version.`,
+      );
+    }
+    const cleanRelOrAbs = options.customResourcePath
+      .trim()
+      .replace(/\?.*$/, "")
+      .replace(/\/+$/, "");
+    let fullResourcePath: string;
+    if (/^\/?providers\/[^/]+\/.+/i.test(cleanRelOrAbs)) {
+      fullResourcePath = `${rgPrefix}/${cleanRelOrAbs.replace(/^\/+/, "")}`;
+    } else if (/^\/subscriptions\//i.test(cleanRelOrAbs)) {
+      const m = /^\/subscriptions\/([^/]+)\/resourcegroups\/([^/]+)\/(providers\/.+)$/i.exec(
+        cleanRelOrAbs,
+      );
+      if (
+        !m ||
+        m[1].toLowerCase() !== sub.toLowerCase() ||
+        m[2].toLowerCase() !== rg.toLowerCase()
+      ) {
+        throw new Error(
+          `Blocked custom fixture "${options.customResourcePath}": must reside inside subscription "${sub}" and disposable Resource Group "${rg}".`,
+        );
+      }
+      fullResourcePath = `${rgPrefix}/${m[3]}`;
+    } else {
+      throw new Error(
+        `Invalid --resource-path "${options.customResourcePath}": expected "providers/<Namespace>/<type>/<name>" or full path inside disposable RG "${rg}".`,
+      );
+    }
+    const refreshBearerToken = () =>
+      getArmBearerToken({
+        explicitToken: options.bearerToken,
+        subscriptionId: sub,
+        armBaseUrl: ledger.armBaseUrl,
+        tokenResource: ledger.armTokenResource,
+      });
+    const effectiveBody =
+      options.customBody && typeof options.customBody === "object"
+        ? "location" in options.customBody
+          ? options.customBody
+          : { location, ...options.customBody }
+        : { location, properties: {} };
+    const body = await putArmFixtureAndWait({
+      armBaseUrl: ledger.armBaseUrl,
+      allowedArmOrigins: ledger.allowedArmOrigins,
+      subscriptionId: sub,
+      resourcePathWithQuery: `${fullResourcePath}?api-version=${encodeURIComponent(options.customApiVersion.trim())}`,
+      body: effectiveBody,
+      bearerToken: token,
+      refreshBearerToken,
+      disposableRgName: rg,
+      disposableRgCleanupStatus: ledger.disposableResourceGroup.cleanupStatus,
+      expectedRunId,
+      verifiedRgRunIdTag,
+      pollIntervalMs: options.pollIntervalMs,
+      maxPollAttempts: options.maxPollAttempts,
+    });
+    const derivedName = options.name ?? fullResourcePath.split("/").pop() ?? `bbx-custom-${rand}`;
+    fixture = {
+      kind: options.kind,
+      name: derivedName,
+      resourceId: typeof body.id === "string" ? body.id : fullResourcePath,
+      provisionedAt: new Date().toISOString(),
+    };
   } else {
     throw new Error(
-      `Unsupported automatic external fixture kind "${options.kind}". Provision custom cross-RP fixtures using raw ARM PUT inside "${rg}".`,
+      `Unsupported external fixture kind "${String(options.kind)}". Use --kind custom --resource-path "providers/<RP>/<type>/<name>" --api-version <ver> --body-json '<json>'.`,
     );
   }
 
-  ledger.provisionedFixtures.push(fixture);
-  saveLedger(options.workDir, ledger);
+  updateLedgerAtomically(options.workDir, (locked) => {
+    locked.provisionedFixtures.push(fixture);
+  });
   return fixture;
 }

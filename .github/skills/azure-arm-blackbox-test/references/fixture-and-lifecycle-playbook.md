@@ -16,6 +16,7 @@ Achieving 100% operation coverage on an ARM service requires executing operation
      - `--kind vnet-subnet`: Creates `Microsoft.Network/virtualNetworks` (`10.42.0.0/16`, `default` subnet with `privateEndpointNetworkPolicies: "Disabled"`).
      - `--kind storage-account`: Creates `Microsoft.Storage/storageAccounts` (`Standard_LRS`, `StorageV2`, `allowBlobPublicAccess: false`).
      - `--kind log-analytics`: Creates `Microsoft.OperationalInsights/workspaces` (`PerGB2018`).
+     - `--kind custom --resource-path "providers/<RP>/<type>/<name>" --api-version <ver> --body-file <json>`: Safely provisions any other cross-RP prerequisite (Key Vault, Compute VM, EventHub, ServiceBus, etc.) inside the disposable RG with full RG-ownership and cross-scope Resource ID guardrails.
 3. **Negative Pre-Create Check (`expectError: true`)**:
    - Call parent `GET` before `PUT` to elicit a safe `404 ResourceNotFound` and verify the RP's error envelope without risking mutation.
 4. **Parent Resource Lifecycle (`depth = 1`)**:
@@ -61,9 +62,7 @@ Pass `--request-file <file.json>` to `cli.ts probe`. `pathOrUrl` is optional—w
       "softDeleteRetentionInDays": 1
     }
   },
-  "pollLro": true,
-  "maxPollAttempts": 60,
-  "pollIntervalMs": 3000
+  "pollLro": true
 }
 ```
 

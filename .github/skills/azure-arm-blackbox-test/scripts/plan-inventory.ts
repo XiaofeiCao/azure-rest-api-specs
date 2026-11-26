@@ -7,6 +7,7 @@ import {
   getUnionAsEnum,
 } from "@azure-tools/typespec-azure-core";
 import {
+  getDiscriminator,
   getDoc,
   getFormat,
   getMaxLength,
@@ -56,6 +57,9 @@ import {
 import type {
   ArmOperationScope,
   CoverageLedger,
+  ExecutionDag,
+  ExecutionDagEdge,
+  ExecutionDagNode,
   ExternalDependencyHint,
   HttpMethod,
   LifecyclePhase,
@@ -66,6 +70,7 @@ import type {
   ProviderLiveMetadata,
   SecretCycleRule,
   SecretStringConstraint,
+  ShardPartitionManifest,
 } from "./types.ts";
 
 const SECRET_PROPERTY_NAME_RE =
@@ -80,6 +85,7 @@ export interface DiscoverInventoryOptions {
   allowedArmOrigins?: string[];
   subscriptionId?: string;
   location?: string;
+  resourceFilter?: string | string[];
   checkLiveProvider?: boolean;
   reset?: boolean;
   bearerToken?: string;
@@ -186,31 +192,63 @@ function extractProviderAndResource(
   };
 }
 
+function hasResourceInstanceSegmentInRoute(cleanPath: string): boolean {
+  const providerIdx = cleanPath.toLowerCase().lastIndexOf("/providers/");
+  if (providerIdx === -1) {
+    return false;
+  }
+  const afterProviders = cleanPath.slice(providerIdx + "/providers/".length);
+  const segments = afterProviders.split("/").filter(Boolean).slice(1);
+  for (let i = 0; i < segments.length; i++) {
+    if (
+      segments[i].toLowerCase() === "locations" &&
+      i + 1 < segments.length &&
+      segments[i + 1].startsWith("{")
+    ) {
+      i++;
+      continue;
+    }
+    if (segments[i].startsWith("{")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function classifyPhase(
   method: HttpMethod,
   pathTemplate: string,
   operationId: string,
   pageable: PageableContract | undefined,
 ): LifecyclePhase {
-  const lowerPath = pathTemplate.toLowerCase();
+  const cleanPath = pathTemplate.split("?")[0].replace(/\/+$/, "");
+  const lowerPath = cleanPath.toLowerCase();
   const lowerOp = operationId.toLowerCase();
-
-  if (
-    lowerPath.endsWith("/operations") ||
-    lowerPath.endsWith("/checknameavailability") ||
-    lowerOp.includes("checknameavailability") ||
-    lowerOp.startsWith("operations_") ||
-    lowerOp.includes("listskus") ||
-    lowerOp.includes("usages")
-  ) {
-    return "preflight-discovery";
-  }
 
   if (lowerPath.includes("/deleted") || lowerOp.includes("deleted")) {
     return "deleted-resource";
   }
 
-  const cleanPath = pathTemplate.split("?")[0].replace(/\/+$/, "");
+  const hasInstanceKey = hasResourceInstanceSegmentInRoute(cleanPath);
+  if (!hasInstanceKey) {
+    if (method === "POST" && /\/check[a-z0-9]*(?:availability|visibility)$/i.test(lowerPath)) {
+      return "preflight-discovery";
+    }
+    if (
+      method === "GET" &&
+      (lowerPath.endsWith("/operations") ||
+        lowerOp.startsWith("operations_") ||
+        /(?:^|\/)(?:usages|skus|quotas|capabilities|servicetags|servicetagdetails|bgpservicecommunities|expressrouteportslocations|expressrouteserviceproviders|available[a-z0-9_]*|[a-z0-9_]*available[a-z0-9_]*|check[a-z0-9]*(?:availability|visibility))(?:\/default|\/dafault)?$/i.test(
+          lowerPath,
+        ) ||
+        /(?:check[a-z0-9]*(?:availability|visibility)|listskus|skus_list|quotas_list|capabilities_list|usages_list|^available|listavailable|servicetag)/i.test(
+          lowerOp,
+        ))
+    ) {
+      return "preflight-discovery";
+    }
+  }
+
   const endsWithParam = cleanPath.endsWith("}");
 
   if (method === "PUT") {
@@ -265,16 +303,44 @@ function describeTypeSpecType(type: Type): {
   return { typeName: type.kind.toLowerCase() };
 }
 
+function modelLooksLikeArmSubResourceRef(program: Program, candidate: Type): boolean {
+  const unwrapped =
+    candidate.kind === "Model" && isArrayModelType(program, candidate)
+      ? candidate.indexer.value
+      : candidate;
+  if (unwrapped.kind !== "Model" || isRecordModelType(program, unwrapped)) {
+    return false;
+  }
+  for (const p of walkPropertiesInherited(unwrapped)) {
+    const wire = resolveEncodedName(program, p, "application/json");
+    if (wire === "id" && !isReadonlyProperty(program, p)) {
+      return true;
+    }
+  }
+  return /^(SubResource|SubResourceModel|WritableSubResource)$/i.test(unwrapped.name ?? "");
+}
+
 function detectExternalDependencyFromTypeSpec(
   program: Program,
   propertyPath: string,
+  wireName: string,
   propType: Type,
   description: string,
 ): ExternalDependencyHint | undefined {
   const lowerPath = propertyPath.toLowerCase();
+  const lowerLeaf = wireName.toLowerCase();
+  const unwrappedType =
+    propType.kind === "Model" && isArrayModelType(program, propType)
+      ? propType.indexer.value
+      : propType;
   const armIdConfig =
-    propType.kind === "Scalar" ? getArmResourceIdentifierConfig(program, propType) : undefined;
-  const armAllowed = armIdConfig?.allowedResources?.[0]?.type;
+    unwrappedType.kind === "Scalar"
+      ? getArmResourceIdentifierConfig(program, unwrappedType)
+      : undefined;
+  const allowedTypes = (armIdConfig?.allowedResources ?? [])
+    .map((r) => r.type)
+    .filter((t): t is string => Boolean(t));
+  const armAllowedPrimary = allowedTypes[0];
 
   if (lowerPath === "identity" || lowerPath.endsWith(".userassignedidentities")) {
     return {
@@ -286,9 +352,9 @@ function detectExternalDependencyFromTypeSpec(
     };
   }
   if (
-    lowerPath.includes("subnetid") ||
-    lowerPath.includes("virtualnetwork") ||
-    armAllowed?.toLowerCase().startsWith("microsoft.network/virtualnetworks")
+    lowerLeaf === "subnetid" ||
+    lowerLeaf === "virtualnetworkid" ||
+    allowedTypes.some((t) => t.toLowerCase().startsWith("microsoft.network/virtualnetworks"))
   ) {
     return {
       propertyPath,
@@ -299,8 +365,9 @@ function detectExternalDependencyFromTypeSpec(
     };
   }
   if (
-    lowerPath.includes("privateendpoint") ||
-    armAllowed?.toLowerCase().startsWith("microsoft.network/privateendpoints")
+    lowerLeaf === "privateendpoint" ||
+    lowerLeaf === "privateendpointconnections" ||
+    allowedTypes.some((t) => t.toLowerCase().startsWith("microsoft.network/privateendpoints"))
   ) {
     return {
       propertyPath,
@@ -311,10 +378,10 @@ function detectExternalDependencyFromTypeSpec(
     };
   }
   if (
-    lowerPath.includes("keyvault") ||
-    lowerPath.includes("vaulturi") ||
-    lowerPath.includes("keyidentifier") ||
-    armAllowed?.toLowerCase().startsWith("microsoft.keyvault/")
+    lowerLeaf.includes("keyvault") ||
+    lowerLeaf === "vaulturi" ||
+    lowerLeaf === "keyidentifier" ||
+    allowedTypes.some((t) => t.toLowerCase().startsWith("microsoft.keyvault/"))
   ) {
     return {
       propertyPath,
@@ -325,8 +392,9 @@ function detectExternalDependencyFromTypeSpec(
     };
   }
   if (
-    lowerPath.includes("storageaccount") ||
-    armAllowed?.toLowerCase().startsWith("microsoft.storage/")
+    lowerLeaf.includes("storageaccount") ||
+    lowerLeaf === "storageid" ||
+    allowedTypes.some((t) => t.toLowerCase().startsWith("microsoft.storage/"))
   ) {
     return {
       propertyPath,
@@ -337,9 +405,9 @@ function detectExternalDependencyFromTypeSpec(
     };
   }
   if (
-    lowerPath.includes("workspaceid") ||
-    lowerPath.includes("workspaceresourceid") ||
-    armAllowed?.toLowerCase().startsWith("microsoft.operationalinsights/")
+    lowerLeaf === "workspaceid" ||
+    lowerLeaf === "workspaceresourceid" ||
+    allowedTypes.some((t) => t.toLowerCase().startsWith("microsoft.operationalinsights/"))
   ) {
     return {
       propertyPath,
@@ -349,10 +417,10 @@ function detectExternalDependencyFromTypeSpec(
       description,
     };
   }
-  if ((lowerPath.endsWith("resourceid") || Boolean(armIdConfig)) && !lowerPath.includes("parent")) {
+  if ((lowerLeaf.endsWith("resourceid") || Boolean(armIdConfig)) && !lowerLeaf.includes("parent")) {
     return {
       propertyPath,
-      providerNamespace: armAllowed?.split("/")[0],
+      providerNamespace: armAllowedPrimary?.split("/")[0],
       kind: "generic-arm-resource",
       required: false,
       description,
@@ -440,6 +508,86 @@ function recordCycleRuleIfRecurring(
   return true;
 }
 
+const subtreeSecretCacheByProgram = new WeakMap<Program, Map<Type, boolean>>();
+
+function typeSubtreeHasSecrets(program: Program, rootType: Type | undefined): boolean {
+  if (!rootType) {
+    return false;
+  }
+  let cache = subtreeSecretCacheByProgram.get(program);
+  if (!cache) {
+    cache = new Map<Type, boolean>();
+    subtreeSecretCacheByProgram.set(program, cache);
+  }
+  const cached = cache.get(rootType);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  // Strongly-connected / cycle-safe reachability check over the finite TypeSpec type graph.
+  const inProgress = new Set<Type>();
+  function check(t: Type | undefined): boolean {
+    if (!t) {
+      return false;
+    }
+    const known = cache!.get(t);
+    if (known !== undefined) {
+      return known;
+    }
+    if (isSecret(program, t)) {
+      cache!.set(t, true);
+      return true;
+    }
+    if (inProgress.has(t)) {
+      return false;
+    }
+    inProgress.add(t);
+    let found = false;
+    if (t.kind === "Model") {
+      if (isArrayModelType(program, t) || isRecordModelType(program, t)) {
+        found = isSecret(program, t.indexer.value) || check(t.indexer.value);
+      } else {
+        for (const prop of walkPropertiesInherited(t)) {
+          const wireName = resolveEncodedName(program, prop, "application/json");
+          if (
+            isSecret(program, prop) ||
+            isSecret(program, prop.type) ||
+            SECRET_PROPERTY_NAME_RE.test(wireName) ||
+            SECRET_PROPERTY_NAME_RE.test(prop.name) ||
+            check(prop.type)
+          ) {
+            found = true;
+            break;
+          }
+        }
+        if (!found && getDiscriminator(program, t) !== undefined) {
+          for (const derived of t.derivedModels) {
+            if (check(derived)) {
+              found = true;
+              break;
+            }
+          }
+        }
+      }
+    } else if (t.kind === "Union") {
+      for (const v of t.variants.values()) {
+        if (check(v.type)) {
+          found = true;
+          break;
+        }
+      }
+    }
+    inProgress.delete(t);
+    // Only cache `false` when no active cycle dependency could flip the result; always cache `true`.
+    if (found || inProgress.size === 0) {
+      cache!.set(t, found);
+    }
+    return found;
+  }
+
+  return check(rootType);
+}
+
 function collectTypeSpecBodyMetadata(
   program: Program,
   metadataInfo: MetadataInfo,
@@ -455,6 +603,8 @@ function collectTypeSpecBodyMetadata(
     secretConstraints: new Map<string, SecretStringConstraint>(),
     cycleRules: new Map<string, SecretCycleRule>(),
     externalDeps: new Map<string, ExternalDependencyHint>(),
+    intraRpCandidateTokens: new Set<string>(),
+    minNonSecretDepth: new Map<Type, number>(),
   },
   requiredInParent = false,
 ): {
@@ -464,12 +614,25 @@ function collectTypeSpecBodyMetadata(
   secretConstraints: Map<string, SecretStringConstraint>;
   cycleRules: Map<string, SecretCycleRule>;
   externalDeps: Map<string, ExternalDependencyHint>;
+  intraRpCandidateTokens: Set<string>;
+  minNonSecretDepth: Map<Type, number>;
 } {
   if (!type) {
     return result;
   }
   if (recordCycleRuleIfRecurring(ancestorPaths, type, prefix, result.cycleRules)) {
     return result;
+  }
+  const hasSecrets = typeSubtreeHasSecrets(program, type);
+  if (!hasSecrets) {
+    if (depth > 7) {
+      return result;
+    }
+    const prevDepth = result.minNonSecretDepth.get(type);
+    if (prevDepth !== undefined && prevDepth <= depth) {
+      return result;
+    }
+    result.minNonSecretDepth.set(type, depth);
   }
   const branchAncestors = new Map(ancestorPaths);
   branchAncestors.set(type, prefix);
@@ -552,12 +715,59 @@ function collectTypeSpecBodyMetadata(
 
       const isPropRequired = !prop.optional && !metadataInfo.isOptional(prop, reqVisibility);
       const doc = getDoc(program, prop) ?? "";
-      const depHint = detectExternalDependencyFromTypeSpec(program, propPath, prop.type, doc);
-      if (depHint && !result.externalDeps.has(propPath)) {
-        result.externalDeps.set(propPath, {
-          ...depHint,
-          required: requiredInParent && isPropRequired,
-        });
+      const hasAncestorDep = [...result.externalDeps.keys()].some(
+        (existingPath) =>
+          propPath.startsWith(`${existingPath}.`) || propPath.startsWith(`${existingPath}[]`),
+      );
+      if (
+        !hasAncestorDep &&
+        (visibleInReq || wireName.toLowerCase() === "privateendpointconnections")
+      ) {
+        const depHint = detectExternalDependencyFromTypeSpec(
+          program,
+          propPath,
+          wireName,
+          prop.type,
+          doc,
+        );
+        if (depHint && !result.externalDeps.has(propPath)) {
+          result.externalDeps.set(propPath, {
+            ...depHint,
+            required: visibleInReq && !readOnly && requiredInParent && isPropRequired,
+          });
+        }
+      }
+
+      if (visibleInReq && !readOnly) {
+        const unwrappedPropType =
+          prop.type.kind === "Model" && isArrayModelType(program, prop.type)
+            ? prop.type.indexer.value
+            : prop.type;
+        const armIdCfg =
+          unwrappedPropType.kind === "Scalar"
+            ? getArmResourceIdentifierConfig(program, unwrappedPropType)
+            : undefined;
+        for (const allowed of armIdCfg?.allowedResources ?? []) {
+          if (allowed.type) {
+            result.intraRpCandidateTokens.add(`type:${allowed.type.toLowerCase()}`);
+          }
+        }
+        if (modelLooksLikeArmSubResourceRef(program, prop.type)) {
+          result.intraRpCandidateTokens.add(`alias:${wireName.toLowerCase()}`);
+          if (
+            unwrappedPropType.kind === "Model" &&
+            unwrappedPropType.name &&
+            !/^(SubResource|SubResourceModel|WritableSubResource)$/i.test(unwrappedPropType.name)
+          ) {
+            result.intraRpCandidateTokens.add(`alias:${unwrappedPropType.name.toLowerCase()}`);
+          }
+        } else if (
+          unwrappedPropType.kind === "Scalar" &&
+          /id|ids$/i.test(wireName) &&
+          !/^parent/i.test(wireName)
+        ) {
+          result.intraRpCandidateTokens.add(`alias:${wireName.toLowerCase()}`);
+        }
       }
 
       if (visibleInReq || visibleInRead) {
@@ -575,19 +785,22 @@ function collectTypeSpecBodyMetadata(
       }
     }
 
-    // Also traverse derived models at the same payload path so discriminated subtype-only @secret properties are discovered (#4008)!
-    for (const derived of type.derivedModels) {
-      collectTypeSpecBodyMetadata(
-        program,
-        metadataInfo,
-        reqVisibility,
-        derived,
-        prefix,
-        depth,
-        branchAncestors,
-        result,
-        false,
-      );
+    // Traverse derived models ONLY on @discriminator hierarchies so non-polymorphic base models
+    // (e.g. SubResourceModel in Microsoft.Network with 60+ subclasses) never trigger O(k!) explosion!
+    if (getDiscriminator(program, type) !== undefined) {
+      for (const derived of type.derivedModels) {
+        collectTypeSpecBodyMetadata(
+          program,
+          metadataInfo,
+          reqVisibility,
+          derived,
+          prefix,
+          depth,
+          branchAncestors,
+          result,
+          false,
+        );
+      }
     }
   } else if (type.kind === "Union") {
     for (const variant of type.variants.values()) {
@@ -636,6 +849,9 @@ function collectTypeSpecResponseSecrets(
     if (recordCycleRuleIfRecurring(ancestorPaths, type, prefix, cycleRules)) {
       return;
     }
+    if (!typeSubtreeHasSecrets(program, type)) {
+      return;
+    }
     const branchAncestors = new Map(ancestorPaths);
     branchAncestors.set(type, prefix);
 
@@ -673,8 +889,10 @@ function collectTypeSpecResponseSecrets(
         }
         walk(prop.type, propPath, depth + 1, branchAncestors);
       }
-      for (const derived of type.derivedModels) {
-        walk(derived, prefix, depth, branchAncestors);
+      if (getDiscriminator(program, type) !== undefined) {
+        for (const derived of type.derivedModels) {
+          walk(derived, prefix, depth, branchAncestors);
+        }
       }
     } else if (type.kind === "Union") {
       for (const variant of type.variants.values()) {
@@ -845,7 +1063,176 @@ const PHASE_PRIORITY: Record<LifecyclePhase, number> = {
   "deleted-resource": 10,
 };
 
-export function computeTopologicalExecutionOrder(operations: OperationContract[]): string[] {
+function buildAliasVariantsForCollection(collectionSeg: string): string[] {
+  const lower = collectionSeg.toLowerCase();
+  const variants = new Set<string>([lower, `${lower}id`, `${lower}ids`]);
+  let singular = lower;
+  if (lower.endsWith("ies") && lower.length > 3) {
+    singular = `${lower.slice(0, -3)}y`;
+  } else if (/(?:ses|xes|ches|shes)$/.test(lower)) {
+    singular = lower.slice(0, -2);
+  } else if (lower.endsWith("s") && !lower.endsWith("ss") && lower.length > 2) {
+    singular = lower.slice(0, -1);
+  }
+  variants.add(singular);
+  variants.add(`${singular}id`);
+  variants.add(`${singular}ids`);
+  return [...variants];
+}
+
+function resolveIntraRpResourceDependencies(
+  operations: OperationContract[],
+  rawCandidateTokensByOp: Map<string, Set<string>>,
+  providerNamespace: string,
+): Map<string, Set<string>> {
+  const creatableResourceTypes = new Map<string, { resourceType: string; depth: number }>();
+  for (const op of operations) {
+    if (op.phase === "create" && op.depth >= 1) {
+      const key = op.resourceType.toLowerCase();
+      const prev = creatableResourceTypes.get(key);
+      if (!prev || op.depth < prev.depth) {
+        creatableResourceTypes.set(key, { resourceType: op.resourceType, depth: op.depth });
+      }
+    }
+  }
+
+  const aliasToResourceType = new Map<string, { resourceType: string; depth: number }>();
+  for (const entry of creatableResourceTypes.values()) {
+    const leaf = entry.resourceType.split("/").pop()!;
+    for (const alias of buildAliasVariantsForCollection(leaf)) {
+      const existing = aliasToResourceType.get(alias);
+      if (!existing || entry.depth < existing.depth) {
+        aliasToResourceType.set(alias, entry);
+      }
+    }
+  }
+
+  // Map resourceType -> set of prerequisite intra-RP resourceTypes.
+  const depsByResourceType = new Map<string, Set<string>>();
+  for (const op of operations) {
+    if (!depsByResourceType.has(op.resourceType)) {
+      depsByResourceType.set(op.resourceType, new Set());
+    }
+    // Structural parent-child dependency: Microsoft.Foo/parents/children depends on Microsoft.Foo/parents.
+    const parts = op.resourceType.split("/");
+    if (parts.length >= 3) {
+      const parentType = parts.slice(0, -1).join("/");
+      const matchedParent = creatableResourceTypes.get(parentType.toLowerCase());
+      if (matchedParent && matchedParent.resourceType !== op.resourceType) {
+        depsByResourceType.get(op.resourceType)!.add(matchedParent.resourceType);
+      }
+    }
+  }
+
+  const nsPrefix = `${providerNamespace.toLowerCase()}/`;
+  for (const op of operations) {
+    if (op.phase !== "create") {
+      continue;
+    }
+    const tokens = rawCandidateTokensByOp.get(op.operationId);
+    if (!tokens || tokens.size === 0) {
+      continue;
+    }
+    const opDeps = new Set<string>();
+    const ownLower = op.resourceType.toLowerCase();
+    for (const token of tokens) {
+      let resolvedTarget: string | undefined;
+      if (token.startsWith("type:")) {
+        const tLower = token.slice("type:".length);
+        if (tLower.startsWith(nsPrefix)) {
+          resolvedTarget = creatableResourceTypes.get(tLower)?.resourceType;
+        }
+      } else if (token.startsWith("alias:")) {
+        const alias = token.slice("alias:".length);
+        resolvedTarget = aliasToResourceType.get(alias)?.resourceType;
+      }
+      if (!resolvedTarget) {
+        continue;
+      }
+      const targetLower = resolvedTarget.toLowerCase();
+      // Ignore self-references and inline child-collection properties (e.g. VirtualNetwork.properties.subnets).
+      if (targetLower === ownLower || targetLower.startsWith(`${ownLower}/`)) {
+        continue;
+      }
+      opDeps.add(resolvedTarget);
+      depsByResourceType.get(op.resourceType)?.add(resolvedTarget);
+    }
+    if (opDeps.size > 0) {
+      op.intraRpDependencies = [...opDeps].sort();
+    }
+  }
+
+  return depsByResourceType;
+}
+
+function computeResourceTopoTiers(
+  operations: OperationContract[],
+  depsByResourceType: Map<string, Set<string>>,
+): Map<string, number> {
+  const allTypes = new Set<string>(operations.map((o) => o.resourceType));
+  const minDepthByType = new Map<string, number>();
+  for (const op of operations) {
+    const prev = minDepthByType.get(op.resourceType);
+    if (prev === undefined || op.depth < prev) {
+      minDepthByType.set(op.resourceType, op.depth);
+    }
+  }
+
+  const remaining = new Set<string>(allTypes);
+  const tiers = new Map<string, number>();
+
+  while (remaining.size > 0) {
+    const ready: string[] = [];
+    for (const rt of remaining) {
+      const deps = depsByResourceType.get(rt);
+      const hasUnplacedDep = deps ? [...deps].some((d) => remaining.has(d)) : false;
+      if (!hasUnplacedDep) {
+        ready.push(rt);
+      }
+    }
+
+    if (ready.length === 0) {
+      // Deterministic cycle-breaker: pick shallowest depth, then fewest unplaced deps, then alphabetical.
+      const fallback = [...remaining].sort((a, b) => {
+        const dDiff = (minDepthByType.get(a) ?? 1) - (minDepthByType.get(b) ?? 1);
+        if (dDiff !== 0) return dDiff;
+        const aUnplaced = [...(depsByResourceType.get(a) ?? [])].filter((d) =>
+          remaining.has(d),
+        ).length;
+        const bUnplaced = [...(depsByResourceType.get(b) ?? [])].filter((d) =>
+          remaining.has(d),
+        ).length;
+        if (aUnplaced !== bUnplaced) return aUnplaced - bUnplaced;
+        return a.localeCompare(b);
+      })[0];
+      ready.push(fallback);
+    }
+
+    ready.sort((a, b) => a.localeCompare(b));
+    for (const rt of ready) {
+      let maxDepTier = -1;
+      for (const dep of depsByResourceType.get(rt) ?? []) {
+        const depTier = tiers.get(dep);
+        if (depTier !== undefined && depTier > maxDepTier) {
+          maxDepTier = depTier;
+        }
+      }
+      tiers.set(rt, maxDepTier + 1);
+      remaining.delete(rt);
+    }
+  }
+
+  return tiers;
+}
+
+export function computeTopologicalExecutionOrder(
+  operations: OperationContract[],
+  depsByResourceType?: Map<string, Set<string>>,
+): string[] {
+  const effectiveDeps =
+    depsByResourceType ?? resolveIntraRpResourceDependencies(operations, new Map(), "");
+  const tiers = computeResourceTopoTiers(operations, effectiveDeps);
+
   return [...operations]
     .sort((a, b) => {
       const aIsPreflight = a.phase === "preflight-discovery" ? 0 : 1;
@@ -866,12 +1253,24 @@ export function computeTopologicalExecutionOrder(operations: OperationContract[]
         return aIsDelete - bIsDelete;
       }
 
-      // For delete operations, delete deeper child resources BEFORE parent resources!
-      if (a.phase === "delete" && b.phase === "delete" && a.depth !== b.depth) {
-        return b.depth - a.depth;
+      const aTier = tiers.get(a.resourceType) ?? a.depth;
+      const bTier = tiers.get(b.resourceType) ?? b.depth;
+
+      // For delete operations, delete dependent & deeper child resources BEFORE prerequisite/parent resources!
+      if (a.phase === "delete" && b.phase === "delete") {
+        if (aTier !== bTier) {
+          return bTier - aTier;
+        }
+        if (a.depth !== b.depth) {
+          return b.depth - a.depth;
+        }
+        return a.operationId.localeCompare(b.operationId);
       }
 
-      // For positive lifecycle operations, create/read/update/action parent resources BEFORE children!
+      // For positive lifecycle operations, create/read/update/action prerequisite & parent resources BEFORE dependents/children!
+      if (aTier !== bTier) {
+        return aTier - bTier;
+      }
       if (a.depth !== b.depth) {
         return a.depth - b.depth;
       }
@@ -884,6 +1283,117 @@ export function computeTopologicalExecutionOrder(operations: OperationContract[]
       return a.operationId.localeCompare(b.operationId);
     })
     .map((op) => op.operationId);
+}
+
+function buildExecutionDag(
+  operationsMap: Record<string, OperationContract>,
+  executionOrder: string[],
+  depsByResourceType: Map<string, Set<string>>,
+  externalDeps: ExternalDependencyHint[],
+): ExecutionDag {
+  const allOps = Object.values(operationsMap);
+  const tiers = computeResourceTopoTiers(allOps, depsByResourceType);
+  const nodes: ExecutionDagNode[] = [];
+  const edges: ExecutionDagEdge[] = [];
+  const edgeKeys = new Set<string>();
+  const addEdge = (from: string, to: string, reason: ExecutionDagEdge["reason"]): void => {
+    if (!from || !to || from === to) return;
+    const k = `${from}=>${to}:${reason}`;
+    if (!edgeKeys.has(k)) {
+      edgeKeys.add(k);
+      edges.push({ from, to, reason });
+    }
+  };
+
+  const fixtureKinds = new Set(externalDeps.map((d) => d.kind));
+  for (const kind of fixtureKinds) {
+    nodes.push({
+      id: `fixture:${kind}`,
+      kind: "external-fixture",
+      fixtureKind: kind,
+      phase: "external-fixture",
+      topoTier: kind === "private-endpoint" ? 1 : 0,
+    });
+  }
+
+  const createOpByResourceType = new Map<string, string>();
+  const deleteOpByResourceType = new Map<string, string>();
+  for (const opId of executionOrder) {
+    const op = operationsMap[opId];
+    if (!op) continue;
+    if (op.phase === "create" && !createOpByResourceType.has(op.resourceType)) {
+      createOpByResourceType.set(op.resourceType, opId);
+    }
+    if (op.phase === "delete" && !deleteOpByResourceType.has(op.resourceType)) {
+      deleteOpByResourceType.set(op.resourceType, opId);
+    }
+    nodes.push({
+      id: opId,
+      kind: "operation",
+      operationId: opId,
+      resourceType: op.resourceType,
+      phase: op.phase,
+      topoTier: tiers.get(op.resourceType) ?? op.depth,
+    });
+  }
+
+  for (const op of allOps) {
+    const resCreate = createOpByResourceType.get(op.resourceType);
+    const resDelete = deleteOpByResourceType.get(op.resourceType);
+    if (
+      resCreate &&
+      op.phase !== "preflight-discovery" &&
+      op.phase !== "create" &&
+      op.phase !== "deleted-resource"
+    ) {
+      addEdge(resCreate, op.operationId, "create-before-lifecycle");
+    }
+    if (
+      resDelete &&
+      op.phase !== "preflight-discovery" &&
+      op.phase !== "delete" &&
+      op.phase !== "deleted-resource"
+    ) {
+      addEdge(op.operationId, resDelete, "lifecycle-before-delete");
+    }
+    for (const ext of op.externalDependencies) {
+      const fixId = `fixture:${ext.kind}`;
+      if (ext.kind === "private-endpoint" && resCreate) {
+        addEdge(resCreate, fixId, "external-fixture-prereq");
+        addEdge(fixId, op.operationId, "external-fixture-prereq");
+      } else {
+        addEdge(fixId, op.operationId, "external-fixture-prereq");
+      }
+    }
+  }
+
+  for (const [rt, prereqs] of depsByResourceType.entries()) {
+    const depCreate = createOpByResourceType.get(rt);
+    const depDelete = deleteOpByResourceType.get(rt);
+    for (const prereqRt of prereqs) {
+      const isParentChild = rt.toLowerCase().startsWith(`${prereqRt.toLowerCase()}/`);
+      const prereqCreate = createOpByResourceType.get(prereqRt);
+      const prereqDelete = deleteOpByResourceType.get(prereqRt);
+      if (prereqCreate && depCreate) {
+        addEdge(
+          prereqCreate,
+          depCreate,
+          isParentChild ? "parent-before-child" : "intra-rp-resource-ref",
+        );
+      }
+      if (depDelete && prereqDelete) {
+        addEdge(
+          depDelete,
+          prereqDelete,
+          isParentChild
+            ? "child-delete-before-parent-delete"
+            : "dependent-delete-before-prereq-delete",
+        );
+      }
+    }
+  }
+
+  return { nodes, edges };
 }
 
 export async function fetchProviderLiveMetadata(options: {
@@ -1050,8 +1560,8 @@ export async function discoverSpecInventory(
   const existingExamplesIndex = scanExistingTypeSpecExamples(typespecProjectDir, apiVersion);
 
   const operationsMap: Record<string, OperationContract> = {};
-  const externalDepsMap = new Map<string, ExternalDependencyHint>();
-  let detectedNamespace = service.providerNamespace;
+  const rawCandidateTokensByOp = new Map<string, Set<string>>();
+  const namespaceVotes = new Map<string, number>();
 
   for (const httpOp of httpOperations) {
     const method = httpOp.verb.toUpperCase() as HttpMethod;
@@ -1064,7 +1574,7 @@ export async function discoverSpecInventory(
       method,
     );
     if (providerNamespace !== "Microsoft.Resources" && providerNamespace !== "Unknown.Provider") {
-      detectedNamespace = providerNamespace;
+      namespaceVotes.set(providerNamespace, (namespaceVotes.get(providerNamespace) ?? 0) + 1);
     }
 
     const { declaredPageable: pageable, inferredPagination } =
@@ -1164,10 +1674,9 @@ export async function discoverSpecInventory(
       }
       for (const dep of bodyMeta.externalDeps.values()) {
         opExternalDeps.push(dep);
-        const depKey = `${dep.kind}:${dep.propertyPath}`;
-        if (!externalDepsMap.has(depKey)) {
-          externalDepsMap.set(depKey, dep);
-        }
+      }
+      if (bodyMeta.intraRpCandidateTokens.size > 0) {
+        rawCandidateTokensByOp.set(operationId, bodyMeta.intraRpCandidateTokens);
       }
 
       const bodyDesc = describeTypeSpecType(reqBody.type);
@@ -1288,7 +1797,108 @@ export async function discoverSpecInventory(
     };
   }
 
+  const majorityRouteNamespace =
+    [...namespaceVotes.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "Unknown.Provider";
+  const detectedNamespace =
+    service.providerNamespace &&
+    service.providerNamespace !== "Unknown.Provider" &&
+    service.providerNamespace !== "Microsoft.Resources"
+      ? service.providerNamespace
+      : majorityRouteNamespace;
+
+  // Filter out self-RP hints from externalDependencies (intra-RP references belong in executionGraph,
+  // not external cross-RP fixtures), and record cross-RP extension host scopes (e.g. Microsoft.Compute/cloudServices).
+  const externalDepsMap = new Map<string, ExternalDependencyHint>();
+  for (const op of Object.values(operationsMap)) {
+    const providerMatches = [...op.pathTemplate.matchAll(/\/providers\/([^/]+)/gi)].map(
+      (m) => m[1],
+    );
+    for (const hostNs of providerMatches) {
+      if (
+        hostNs.toLowerCase() !== detectedNamespace.toLowerCase() &&
+        hostNs.toLowerCase() !== "microsoft.resources"
+      ) {
+        op.externalDependencies.push({
+          propertyPath: "$hostScope",
+          providerNamespace: hostNs,
+          kind: "generic-arm-resource",
+          required: true,
+          description: `Extension route hosted under ${hostNs}`,
+        });
+      }
+    }
+    op.externalDependencies = op.externalDependencies.filter(
+      (dep) =>
+        !dep.providerNamespace ||
+        dep.providerNamespace.toLowerCase() !== detectedNamespace.toLowerCase(),
+    );
+  }
+
+  const unfilteredOperations = Object.values(operationsMap);
+  const fullDepsByResourceType = resolveIntraRpResourceDependencies(
+    unfilteredOperations,
+    rawCandidateTokensByOp,
+    detectedNamespace,
+  );
+
+  // Optional --resource-filter narrows operationsMap while automatically retaining transitive intra-RP
+  // create/delete prerequisites so filtered runs remain self-contained in a fresh disposable RG.
+  const rawResourceFilter = options.resourceFilter
+    ? Array.isArray(options.resourceFilter)
+      ? options.resourceFilter
+      : [options.resourceFilter]
+    : [];
+  if (rawResourceFilter.length > 0) {
+    const needles = rawResourceFilter
+      .flatMap((f) => f.split(","))
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    if (needles.length > 0) {
+      const matchedOps = new Set<string>();
+      const matchedTypes = new Set<string>();
+      for (const op of unfilteredOperations) {
+        const haystacks = [
+          op.operationId.toLowerCase(),
+          op.resourceType.toLowerCase(),
+          op.pathTemplate.toLowerCase(),
+        ];
+        if (needles.some((n) => haystacks.some((h) => h.includes(n)))) {
+          matchedOps.add(op.operationId);
+          matchedTypes.add(op.resourceType);
+        }
+      }
+      // Close over transitive prerequisite resourceTypes (create + delete contracts).
+      const prereqTypes = new Set<string>();
+      const queue = [...matchedTypes];
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const depRt of fullDepsByResourceType.get(cur) ?? []) {
+          if (!matchedTypes.has(depRt) && !prereqTypes.has(depRt)) {
+            prereqTypes.add(depRt);
+            queue.push(depRt);
+          }
+        }
+      }
+      for (const op of unfilteredOperations) {
+        const keep =
+          matchedOps.has(op.operationId) ||
+          (prereqTypes.has(op.resourceType) && (op.phase === "create" || op.phase === "delete"));
+        if (!keep) {
+          delete operationsMap[op.operationId];
+        }
+      }
+    }
+  }
+
   const allOperations = Object.values(operationsMap);
+  for (const op of allOperations) {
+    for (const dep of op.externalDependencies) {
+      const depKey = `${dep.kind}:${dep.providerNamespace ?? ""}:${dep.propertyPath}`;
+      if (!externalDepsMap.has(depKey)) {
+        externalDepsMap.set(depKey, dep);
+      }
+    }
+  }
 
   // Pair resource GET operations with their sibling PUT contracts so post-create GET round-trip
   // mutability validation knows which properties were writable vs. read-only on PUT (#26 / #27).
@@ -1320,7 +1930,23 @@ export async function discoverSpecInventory(
     }
   }
 
-  const executionOrder = computeTopologicalExecutionOrder(allOperations);
+  const depsByResourceType = new Map<string, Set<string>>();
+  const activeResourceTypes = new Set(allOperations.map((o) => o.resourceType));
+  for (const rt of activeResourceTypes) {
+    const filteredSet = new Set<string>(
+      [...(fullDepsByResourceType.get(rt) ?? [])].filter((d) => activeResourceTypes.has(d)),
+    );
+    depsByResourceType.set(rt, filteredSet);
+  }
+
+  const executionOrder = computeTopologicalExecutionOrder(allOperations, depsByResourceType);
+  const externalDependencies = [...externalDepsMap.values()];
+  const executionGraph = buildExecutionDag(
+    operationsMap,
+    executionOrder,
+    depsByResourceType,
+    externalDependencies,
+  );
 
   const coverage: Record<string, OperationCoverageEntry> = {};
   for (const opId of executionOrder) {
@@ -1387,7 +2013,8 @@ export async function discoverSpecInventory(
       ? { disposableResourceGroup: preSeededLedger.disposableResourceGroup }
       : {}),
     providerLiveMetadata,
-    externalDependencies: [...externalDepsMap.values()],
+    externalDependencies,
+    executionGraph,
     provisionedFixtures: preSeededLedger?.provisionedFixtures ?? [],
     runtimeState: preSeededLedger?.runtimeState ?? {
       pathSlotValues: {},
@@ -1401,4 +2028,271 @@ export async function discoverSpecInventory(
 
   saveLedger(options.workDir, ledger);
   return ledger;
+}
+
+export function partitionLedgerIntoShards(options: {
+  workDir: string;
+  shardCount?: number;
+  maxOpsPerShard?: number;
+  outputDir?: string;
+}): ShardPartitionManifest {
+  const parentWorkDir = path.resolve(options.workDir);
+  const parentLedger = loadLedger(parentWorkDir);
+  const allOps = Object.values(parentLedger.operations);
+  if (allOps.length === 0) {
+    throw new Error(`Parent ledger in "${parentWorkDir}" has 0 discovered operations.`);
+  }
+
+  const maxOps = Math.max(10, options.maxOpsPerShard ?? 140);
+  const targetShardCount = Math.max(
+    1,
+    Math.min(allOps.length, options.shardCount ?? Math.ceil(allOps.length / maxOps)),
+  );
+  const shardsBaseDir = path.resolve(options.outputDir ?? path.join(parentWorkDir, "shards"));
+  fs.rmSync(shardsBaseDir, { recursive: true, force: true });
+  fs.mkdirSync(shardsBaseDir, { recursive: true });
+
+  // Group operations by root resource family (e.g. Microsoft.Network/virtualNetworks groups VNet + Subnets + Peerings)
+  // while keeping oversized families splittable by exact resourceType if needed.
+  const opsByResourceType = new Map<string, OperationContract[]>();
+  const globalPreflightOps: OperationContract[] = [];
+  for (const op of allOps) {
+    if (op.phase === "preflight-discovery" && op.depth === 0) {
+      globalPreflightOps.push(op);
+      continue;
+    }
+    const bucket = opsByResourceType.get(op.resourceType) ?? [];
+    bucket.push(op);
+    opsByResourceType.set(op.resourceType, bucket);
+  }
+
+  // Group resourceTypes by top-level collection (Microsoft.Foo/<topCollection>) unless that family > maxOps * 1.25.
+  const familyBuckets = new Map<string, string[]>();
+  for (const rt of opsByResourceType.keys()) {
+    const segs = rt.split("/");
+    const rootKey = segs.length >= 2 ? `${segs[0]}/${segs[1]}` : rt;
+    const list = familyBuckets.get(rootKey) ?? [];
+    list.push(rt);
+    familyBuckets.set(rootKey, list);
+  }
+
+  const units: Array<{ key: string; resourceTypes: string[]; opCount: number }> = [];
+  for (const [familyKey, rts] of familyBuckets.entries()) {
+    const totalCount = rts.reduce((acc, rt) => acc + (opsByResourceType.get(rt)?.length ?? 0), 0);
+    if (totalCount <= Math.ceil(maxOps * 1.25) || rts.length === 1) {
+      units.push({ key: familyKey, resourceTypes: rts.sort(), opCount: totalCount });
+    } else {
+      for (const rt of rts.sort()) {
+        units.push({
+          key: rt,
+          resourceTypes: [rt],
+          opCount: opsByResourceType.get(rt)?.length ?? 0,
+        });
+      }
+    }
+  }
+
+  // Greedy LPT bin-packing (largest unit first into lightest shard) for balanced shard sizes.
+  units.sort((a, b) => b.opCount - a.opCount || a.key.localeCompare(b.key));
+  const shardBins: Array<{
+    primaryResourceTypes: Set<string>;
+    primaryOps: Set<string>;
+    load: number;
+  }> = Array.from({ length: targetShardCount }, () => ({
+    primaryResourceTypes: new Set<string>(),
+    primaryOps: new Set<string>(),
+    load: 0,
+  }));
+
+  // Assign global depth-0 preflight ops to Shard 0.
+  for (const preOp of globalPreflightOps) {
+    shardBins[0].primaryOps.add(preOp.operationId);
+    shardBins[0].primaryResourceTypes.add(preOp.resourceType);
+    shardBins[0].load += 1;
+  }
+
+  for (const unit of units) {
+    let minIdx = 0;
+    for (let i = 1; i < shardBins.length; i++) {
+      if (shardBins[i].load < shardBins[minIdx].load) {
+        minIdx = i;
+      }
+    }
+    for (const rt of unit.resourceTypes) {
+      shardBins[minIdx].primaryResourceTypes.add(rt);
+      for (const op of opsByResourceType.get(rt) ?? []) {
+        shardBins[minIdx].primaryOps.add(op.operationId);
+      }
+    }
+    shardBins[minIdx].load += unit.opCount;
+  }
+
+  // Build resource dependency map from parentledger.operations (parent-child + intraRpDependencies).
+  const depsByRt = new Map<string, Set<string>>();
+  const creatableByLower = new Map<string, string>();
+  for (const op of allOps) {
+    if (op.phase === "create" && op.depth >= 1) {
+      creatableByLower.set(op.resourceType.toLowerCase(), op.resourceType);
+    }
+  }
+  for (const op of allOps) {
+    if (!depsByRt.has(op.resourceType)) {
+      depsByRt.set(op.resourceType, new Set());
+    }
+    const parts = op.resourceType.split("/");
+    if (parts.length >= 3) {
+      const parentRt = creatableByLower.get(parts.slice(0, -1).join("/").toLowerCase());
+      if (parentRt && parentRt !== op.resourceType) {
+        depsByRt.get(op.resourceType)!.add(parentRt);
+      }
+    }
+    for (const intra of op.intraRpDependencies ?? []) {
+      depsByRt.get(op.resourceType)!.add(intra);
+    }
+  }
+
+  const nonEmptyBins = shardBins.filter((b) => b.primaryOps.size > 0);
+  const manifestShards: ShardPartitionManifest["shards"] = [];
+  const now = new Date().toISOString();
+
+  nonEmptyBins.forEach((bin, idx) => {
+    const shardId = `shard-${String(idx + 1).padStart(2, "0")}`;
+    const shardWorkDir = path.join(shardsBaseDir, shardId);
+    fs.mkdirSync(shardWorkDir, { recursive: true });
+
+    // Close over transitive prerequisite resourceTypes so this shard can create/delete parents/refs in its own RG.
+    const prereqTypes = new Set<string>();
+    const queue = [...bin.primaryResourceTypes];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      for (const depRt of depsByRt.get(cur) ?? []) {
+        if (!bin.primaryResourceTypes.has(depRt) && !prereqTypes.has(depRt)) {
+          prereqTypes.add(depRt);
+          queue.push(depRt);
+        }
+      }
+    }
+
+    const shardOperationsMap: Record<string, OperationContract> = {};
+    for (const op of allOps) {
+      const include =
+        bin.primaryOps.has(op.operationId) ||
+        (prereqTypes.has(op.resourceType) && (op.phase === "create" || op.phase === "delete"));
+      if (include) {
+        shardOperationsMap[op.operationId] = op;
+      }
+    }
+
+    const shardOpsList = Object.values(shardOperationsMap);
+    const shardDepsByRt = new Map<string, Set<string>>();
+    const shardRtSet = new Set(shardOpsList.map((o) => o.resourceType));
+    for (const rt of shardRtSet) {
+      shardDepsByRt.set(
+        rt,
+        new Set([...(depsByRt.get(rt) ?? [])].filter((d) => shardRtSet.has(d))),
+      );
+    }
+    const shardExecOrder = computeTopologicalExecutionOrder(shardOpsList, shardDepsByRt);
+    const shardExtDepsMap = new Map<string, ExternalDependencyHint>();
+    for (const op of shardOpsList) {
+      for (const d of op.externalDependencies) {
+        const k = `${d.kind}:${d.providerNamespace ?? ""}:${d.propertyPath}`;
+        if (!shardExtDepsMap.has(k)) shardExtDepsMap.set(k, d);
+      }
+    }
+    const shardExtDeps = [...shardExtDepsMap.values()];
+    const shardDag = buildExecutionDag(
+      shardOperationsMap,
+      shardExecOrder,
+      shardDepsByRt,
+      shardExtDeps,
+    );
+
+    const shardCoverage: Record<string, OperationCoverageEntry> = {};
+    for (const opId of shardExecOrder) {
+      const c = shardOperationsMap[opId];
+      const isPrimary = bin.primaryOps.has(opId);
+      shardCoverage[opId] = {
+        operationId: opId,
+        method: c.method,
+        pathTemplate: c.pathTemplate,
+        sourceLocation: c.sourceLocation,
+        phase: c.phase,
+        resourceType: c.resourceType,
+        status: isPrimary ? "pending" : "skipped",
+        ...(isPrimary
+          ? {}
+          : {
+              blockerReason:
+                "Prerequisite helper contract (primary coverage owned by sibling shard)",
+            }),
+        attempts: 0,
+        traceFiles: [],
+        discrepancyCount: 0,
+        generatedExamples: [],
+      };
+    }
+
+    const shardLedger: CoverageLedger = {
+      schemaVersion: "2.0-typespec",
+      runId: `${parentLedger.runId}-${shardId}`,
+      createdAt: now,
+      updatedAt: now,
+      serviceName: parentLedger.serviceName,
+      providerNamespace: parentLedger.providerNamespace,
+      apiVersion: parentLedger.apiVersion,
+      availableApiVersions: parentLedger.availableApiVersions,
+      typespecProjectDir: parentLedger.typespecProjectDir,
+      entrypointFile: parentLedger.entrypointFile,
+      subscriptionId: parentLedger.subscriptionId,
+      location: parentLedger.location,
+      armBaseUrl: parentLedger.armBaseUrl,
+      armTokenResource: parentLedger.armTokenResource,
+      ...(parentLedger.allowedArmOrigins
+        ? { allowedArmOrigins: parentLedger.allowedArmOrigins }
+        : {}),
+      ...(parentLedger.providerLiveMetadata
+        ? { providerLiveMetadata: parentLedger.providerLiveMetadata }
+        : {}),
+      externalDependencies: shardExtDeps,
+      executionGraph: shardDag,
+      provisionedFixtures: [],
+      runtimeState: {
+        pathSlotValues: {},
+        putBodiesByResourceType: {},
+        listItemNamesByResourceType: {},
+      },
+      executionOrder: shardExecOrder,
+      operations: shardOperationsMap,
+      coverage: shardCoverage,
+    };
+
+    saveLedger(shardWorkDir, shardLedger);
+    manifestShards.push({
+      shardId,
+      workDir: shardWorkDir,
+      primaryOperationCount: bin.primaryOps.size,
+      totalOperationCount: shardExecOrder.length,
+      resourceTypes: [...bin.primaryResourceTypes].sort(),
+      prerequisiteResourceTypes: [...prereqTypes].sort(),
+    });
+  });
+
+  const manifest: ShardPartitionManifest = {
+    schemaVersion: "1.0",
+    createdAt: now,
+    parentWorkDir,
+    serviceName: parentLedger.serviceName,
+    providerNamespace: parentLedger.providerNamespace,
+    apiVersion: parentLedger.apiVersion,
+    totalOperations: allOps.length,
+    shardCount: manifestShards.length,
+    shards: manifestShards,
+  };
+  fs.writeFileSync(
+    path.join(parentWorkDir, "shard-manifest.json"),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8",
+  );
+  return manifest;
 }

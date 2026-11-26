@@ -21,7 +21,8 @@ export type ExternalDependencyKind =
   | "key-vault"
   | "storage-account"
   | "log-analytics"
-  | "generic-arm-resource";
+  | "generic-arm-resource"
+  | "custom";
 
 export interface TypeSpecSourceLocation {
   file: string;
@@ -99,6 +100,7 @@ export interface OperationContract {
   secretConstraints?: Record<string, SecretStringConstraint>;
   secretResponseHeaders?: string[];
   secretResponseStatuses?: string[];
+  intraRpDependencies?: string[];
   externalDependencies: ExternalDependencyHint[];
   existingExampleNames: string[];
   existingExamplePaths: string[];
@@ -176,6 +178,57 @@ export interface LedgerRuntimeState {
   listItemNamesByResourceType: Record<string, string[]>;
 }
 
+export interface ExecutionDagNode {
+  id: string;
+  kind: "operation" | "external-fixture";
+  operationId?: string;
+  fixtureKind?: ExternalDependencyKind;
+  resourceType?: string;
+  phase: LifecyclePhase;
+  topoTier: number;
+}
+
+export interface ExecutionDagEdge {
+  from: string;
+  to: string;
+  reason:
+    | "preflight-before-create"
+    | "external-fixture-prereq"
+    | "parent-before-child"
+    | "intra-rp-resource-ref"
+    | "create-before-lifecycle"
+    | "lifecycle-before-delete"
+    | "child-delete-before-parent-delete"
+    | "dependent-delete-before-prereq-delete"
+    | "delete-before-soft-delete-purge";
+}
+
+export interface ExecutionDag {
+  nodes: ExecutionDagNode[];
+  edges: ExecutionDagEdge[];
+}
+
+export interface ShardPartitionEntry {
+  shardId: string;
+  workDir: string;
+  primaryOperationCount: number;
+  totalOperationCount: number;
+  resourceTypes: string[];
+  prerequisiteResourceTypes: string[];
+}
+
+export interface ShardPartitionManifest {
+  schemaVersion: "1.0";
+  createdAt: string;
+  parentWorkDir: string;
+  serviceName: string;
+  providerNamespace: string;
+  apiVersion: string;
+  totalOperations: number;
+  shardCount: number;
+  shards: ShardPartitionEntry[];
+}
+
 export interface CoverageLedger {
   schemaVersion: "2.0-typespec";
   runId?: string;
@@ -193,10 +246,12 @@ export interface CoverageLedger {
   armTokenResource?: string;
   allowedArmOrigins?: string[];
   disposableResourceGroup?: DisposableResourceGroupState;
+  mergedShardResourceGroups?: DisposableResourceGroupState[];
   providerLiveMetadata?: ProviderLiveMetadata;
   externalDependencies: ExternalDependencyHint[];
   provisionedFixtures: ProvisionedFixture[];
   runtimeState?: LedgerRuntimeState;
+  executionGraph?: ExecutionDag;
   executionOrder: string[];
   operations: Record<string, OperationContract>;
   coverage: Record<string, OperationCoverageEntry>;

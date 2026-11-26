@@ -14,17 +14,19 @@ import {
   stripConfiguredArmBasePath,
   validateAndNormalizeArmBaseUrl,
 } from "../scripts/auth-and-http.ts";
-import { executeOperationProbe } from "../scripts/execute-probe.ts";
+import { runCli } from "../scripts/cli.ts";
+import { executeOperationProbe, executeProbeBatch } from "../scripts/execute-probe.ts";
 import {
   evaluateExampleOavCompleteness,
   generateLiveExamples,
 } from "../scripts/generate-examples.ts";
+import { mergeShardWorkDirs, updateLedgerAtomically } from "../scripts/ledger-store.ts";
 import {
   createDisposableResourceGroup,
   deleteDisposableResourceGroup,
   provisionExternalFixture,
 } from "../scripts/manage-rg.ts";
-import { discoverSpecInventory } from "../scripts/plan-inventory.ts";
+import { discoverSpecInventory, partitionLedgerIntoShards } from "../scripts/plan-inventory.ts";
 import { buildSummaryReport } from "../scripts/render-report.ts";
 import { sanitizePayload } from "../scripts/sanitize-example.ts";
 import {
@@ -1256,6 +1258,7 @@ interface PrivateConns {
         workDir,
         kind: "managed-identity",
         pollIntervalMs: 5,
+        maxPollAttempts: 3,
         bearerToken: MOCK_TOKEN,
       }),
     ).rejects.toThrow(/timed out|non-ready/);
@@ -2474,5 +2477,880 @@ interface KvItems {
     );
     expect(failedValidation.requestErrors.length).toBeGreaterThan(0);
     expect(failedValidation.requestErrors[0].code).toBe("TYPESPEC_VALIDATION_ERROR");
+
+    // Read-only location check*Visibility POSTs are permitted by assertSafeArmTarget!
+    expect(() =>
+      assertSafeArmTarget(
+        "POST",
+        `https://management.azure.com/subscriptions/${REAL_SUB_ID}/providers/Microsoft.Network/locations/eastus/checkPrivateLinkServiceVisibility?api-version=2026-03-01`,
+        {
+          trustedArmBaseUrl: "https://management.azure.com",
+          subscriptionId: REAL_SUB_ID,
+          disposableRgName: rgName,
+          disposableRgCleanupStatus: "active",
+          expectedRunId: activeRunId,
+          verifiedRgRunIdTag: activeRunId,
+        },
+        { privateLinkServiceAlias: "mypls.alias.eastus.azure.privatelinkservice" },
+      ),
+    ).not.toThrow();
+  });
+
+  it("avoids O(k!) OOM on large non-discriminated SubResource hierarchies with mutual cycles and polls >45 LRO attempts by default", async () => {
+    const tempRoot = makeTempDir();
+    const projectDir = path.join(
+      tempRoot,
+      "specification",
+      "mocknet",
+      "resource-manager",
+      "Microsoft.MockNet",
+      "MockNet",
+    );
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "tspconfig.yaml"), "{}\n", "utf8");
+
+    // Build 30 non-@discriminator SubResourceModel subclasses with mutual cross-references
+    // (previously triggered 30! path explosion in plan-inventory.ts and render-html-report.ts).
+    const subModels = Array.from({ length: 30 }, (_, idx) => {
+      const nextIdx = (idx + 1) % 30;
+      const prevIdx = (idx + 29) % 30;
+      return `
+model SubChild${idx} extends BaseSubResource {
+  peerNext?: SubChild${nextIdx};
+  peerPrev?: SubChild${prevIdx};
+  genericLink?: BaseSubResource;
+  anotherLink?: BaseSubResource;
+}`;
+    }).join("\n");
+
+    fs.writeFileSync(
+      path.join(projectDir, "main.tsp"),
+      `
+import "@typespec/http";
+import "@typespec/rest";
+import "@typespec/versioning";
+import "@azure-tools/typespec-azure-core";
+import "@azure-tools/typespec-azure-resource-manager";
+
+using TypeSpec.Http;
+using TypeSpec.Rest;
+using TypeSpec.Versioning;
+using Azure.ResourceManager;
+
+@armProviderNamespace
+@service(#{ title: "Microsoft.MockNet" })
+@versioned(Versions)
+namespace Microsoft.MockNet;
+
+enum Versions {
+  @armCommonTypesVersion(Azure.ResourceManager.CommonTypes.Versions.v5)
+  v2026_03_01: "2026-03-01",
+}
+
+model BaseSubResource {
+  id?: string;
+}
+
+${subModels}
+
+model Gateway is TrackedResource<GatewayProperties> {
+  ...ResourceNameParameter<Gateway, "gatewayName", "gateways", "^[a-zA-Z0-9-]{3,24}$">;
+}
+
+model GatewayProperties {
+  sub0?: SubChild0;
+  subRef?: BaseSubResource;
+  @secret
+  sharedKey?: string;
+  @visibility(Lifecycle.Read)
+  provisioningState?: ResourceProvisioningState;
+}
+
+@armResourceOperations
+interface Gateways {
+  get is ArmResourceRead<Gateway>;
+  createOrUpdate is ArmResourceCreateOrReplaceAsync<Gateway>;
+}
+`,
+      "utf8",
+    );
+
+    let mockBaseUrl = "";
+    let pollCounter = 0;
+    let activeRunId = "";
+    const server = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      const pathname = reqUrl.pathname;
+      const method = (req.method ?? "GET").toUpperCase();
+
+      if (/^\/subscriptions\/[^/]+\/resourcegroups\/rg-arm-blackbox-[^/]+$/i.test(pathname)) {
+        const name = pathname.split("/").pop()!;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: pathname,
+            name,
+            location: "eastus",
+            tags: { "arm-blackbox-ephemeral": "true", "arm-blackbox-run-id": activeRunId },
+            properties: { provisioningState: "Succeeded" },
+          }),
+        );
+        return;
+      }
+
+      if (pathname.endsWith("/asyncOps/gw-slow-50") && method === "GET") {
+        pollCounter++;
+        // Require 50 polls (> old 45-poll ceiling!) before succeeding!
+        const status = pollCounter >= 50 ? "Succeeded" : "Updating";
+        res.writeHead(200, { "Content-Type": "application/json", "Retry-After": "0" });
+        res.end(JSON.stringify({ status }));
+        return;
+      }
+
+      if (pathname.includes("/providers/Microsoft.MockNet/gateways/gw-01")) {
+        if (method === "PUT") {
+          res.writeHead(201, {
+            "Content-Type": "application/json",
+            "Azure-AsyncOperation": `${mockBaseUrl}/subscriptions/${REAL_SUB_ID}/providers/Microsoft.MockNet/locations/eastus/asyncOps/gw-slow-50?api-version=2026-03-01`,
+            "Retry-After": "0",
+          });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: "gw-01",
+              type: "Microsoft.MockNet/gateways",
+              location: "eastus",
+              properties: { provisioningState: "Creating" },
+            }),
+          );
+          return;
+        }
+        if (method === "GET") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: pathname,
+              name: "gw-01",
+              type: "Microsoft.MockNet/gateways",
+              location: "eastus",
+              properties: { provisioningState: "Succeeded" },
+            }),
+          );
+          return;
+        }
+      }
+
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "NotFound", message: "Not found" } }));
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    server.keepAliveTimeout = 60_000;
+    servers.push(server);
+    mockBaseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    const workDir = path.join(tempRoot, "work-oom-uncapped");
+    const inv = await discoverSpecInventory({
+      specPath: projectDir,
+      apiVersion: "2026-03-01",
+      workDir,
+      armBaseUrl: mockBaseUrl,
+      subscriptionId: REAL_SUB_ID,
+      location: "eastus",
+    });
+    activeRunId = inv.runId!;
+    // @secret inside GatewayProperties is still discovered accurately!
+    expect(inv.operations["Gateways_CreateOrUpdate"].secretProperties).toContain(
+      "properties.sharedKey",
+    );
+
+    const { rgName } = await createDisposableResourceGroup({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+    });
+    const gwProbe = await executeOperationProbe({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      input: {
+        operationId: "Gateways_CreateOrUpdate",
+        pathOrUrl: `/subscriptions/${REAL_SUB_ID}/resourceGroups/${rgName}/providers/Microsoft.MockNet/gateways/gw-01`,
+        body: { location: "eastus", properties: { sharedKey: "SUPER_SECRET_GW_KEY" } },
+        pollIntervalMs: 1,
+      },
+    });
+    expect(gwProbe.trace.probeSucceeded).toBe(true);
+    expect(gwProbe.trace.observedLro.pollCount).toBe(50);
+    expect(gwProbe.trace.observedLro.completionStatus).toBe("succeeded");
+
+    await deleteDisposableResourceGroup({
+      workDir,
+      bearerToken: MOCK_TOKEN,
+      wait: true,
+      pollIntervalMs: 1,
+      maxPollAttempts: 2,
+    });
+    const { htmlIndexPath } = await buildSummaryReport(workDir);
+    expect(fs.existsSync(htmlIndexPath!)).toBe(true);
+  });
+
+  it("enforces intra-RP SubResource DAG ordering, sharding/merging, custom fixtures, warm probe-batch, sync-200 LRO skip, async-202 expectError, and pending===0 RG delete gate", async () => {
+    const tempRoot = makeTempDir();
+    const projectDir = path.join(tempRoot, "NetGraph.Management");
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "tspconfig.yaml"), "{}\n", "utf8");
+
+    const tsp = `
+import "@typespec/http";
+import "@typespec/rest";
+import "@typespec/versioning";
+import "@typespec/openapi";
+import "@azure-tools/typespec-azure-core";
+
+using TypeSpec.Http;
+using TypeSpec.Rest;
+using TypeSpec.Versioning;
+using TypeSpec.OpenAPI;
+using Azure.Core;
+
+@service(#{ title: "Microsoft.NetGraph" })
+@versioned(Versions)
+namespace Microsoft.NetGraph;
+
+enum Versions {
+  v2026_03_01: "2026-03-01",
+}
+
+model ArmError {
+  code: string;
+  message: string;
+}
+
+@error
+model ErrorEnvelope {
+  error: ArmError;
+}
+
+model SubResourceRef {
+  id?: string;
+}
+
+model SubnetProps {
+  addressPrefix?: string;
+  @visibility(Lifecycle.Read)
+  provisioningState?: string;
+}
+
+model Subnet {
+  id?: string;
+  name?: string;
+  properties?: SubnetProps;
+}
+
+model VNetProps {
+  subnets?: Subnet[];
+  @visibility(Lifecycle.Read)
+  provisioningState?: string;
+}
+
+model VirtualNetwork {
+  @visibility(Lifecycle.Read) id?: string;
+  @visibility(Lifecycle.Read) name?: string;
+  location: string;
+  properties?: VNetProps;
+}
+
+model PipProps {
+  @visibility(Lifecycle.Read)
+  provisioningState?: string;
+}
+
+model PublicIPAddress {
+  @visibility(Lifecycle.Read) id?: string;
+  @visibility(Lifecycle.Read) name?: string;
+  location: string;
+  properties?: PipProps;
+}
+
+model NicProps {
+  subnet?: SubResourceRef;
+  publicIPAddress?: SubResourceRef;
+  keyVaultSecretId?: armResourceIdentifier<[{ type: "Microsoft.KeyVault/vaults" }]>;
+  @visibility(Lifecycle.Read)
+  provisioningState?: string;
+}
+
+model NetworkInterface {
+  @visibility(Lifecycle.Read) id?: string;
+  @visibility(Lifecycle.Read) name?: string;
+  location: string;
+  properties?: NicProps;
+}
+
+model OpList {
+  value: Record<unknown>[];
+}
+
+// Provider/Location preflight discovery ops
+@route("/providers/Microsoft.NetGraph/operations")
+@get
+@operationId("Operations_List")
+op listOps(@query("api-version") apiVersion: string): OpList | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/providers/Microsoft.NetGraph/locations/{location}/usages")
+@get
+@operationId("Usages_List")
+op listUsages(
+  @path subscriptionId: string,
+  @path location: string,
+  @query("api-version") apiVersion: string,
+): OpList | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/providers/Microsoft.NetGraph/locations/{location}/checkDnsNameAvailability")
+@get
+@operationId("CheckDnsNameAvailability")
+op checkDns(
+  @path subscriptionId: string,
+  @path location: string,
+  @query domainNameLabel: string,
+  @query("api-version") apiVersion: string,
+): Record<unknown> | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/providers/Microsoft.NetGraph/locations/{location}/checkPrivateLinkServiceVisibility")
+@post
+@operationId("PrivateLinkServices_CheckVisibility")
+op checkVisibility(
+  @path subscriptionId: string,
+  @path location: string,
+  @query("api-version") apiVersion: string,
+  @body body: Record<unknown>,
+): Record<unknown> | ErrorEnvelope;
+
+// VirtualNetworks + Subnets + Instance checkIpAddressAvailability
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/virtualNetworks/{virtualNetworkName}")
+@put
+@extension("x-ms-long-running-operation", true)
+@operationId("VirtualNetworks_CreateOrUpdate")
+op putVnet(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path virtualNetworkName: string,
+  @query("api-version") apiVersion: string,
+  @body parameters: VirtualNetwork,
+): VirtualNetwork | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/virtualNetworks/{virtualNetworkName}/checkIpAddressAvailability")
+@get
+@operationId("VirtualNetworks_CheckIPAddressAvailability")
+op checkVnetIp(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path virtualNetworkName: string,
+  @query ipAddress: string,
+  @query("api-version") apiVersion: string,
+): Record<unknown> | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/virtualNetworks/{virtualNetworkName}/listDdosProtectionStatus")
+@post
+@extension("x-ms-long-running-operation", true)
+@operationId("VirtualNetworks_ListDdosProtectionStatus")
+op listDdos(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path virtualNetworkName: string,
+  @query("api-version") apiVersion: string,
+): { @statusCode _: 202; @header("Location") location?: string; } | OpList | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/virtualNetworks/{virtualNetworkName}")
+@delete
+@operationId("VirtualNetworks_Delete")
+op deleteVnet(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path virtualNetworkName: string,
+  @query("api-version") apiVersion: string,
+): { @statusCode _: 200 } | { @statusCode _: 204 } | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/virtualNetworks/{virtualNetworkName}/subnets/{subnetName}")
+@put
+@operationId("Subnets_CreateOrUpdate")
+op putSubnet(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path virtualNetworkName: string,
+  @path subnetName: string,
+  @query("api-version") apiVersion: string,
+  @body subnetParameters: Subnet,
+): Subnet | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/virtualNetworks/{virtualNetworkName}/subnets/{subnetName}")
+@delete
+@operationId("Subnets_Delete")
+op deleteSubnet(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path virtualNetworkName: string,
+  @path subnetName: string,
+  @query("api-version") apiVersion: string,
+): { @statusCode _: 200 } | { @statusCode _: 204 } | ErrorEnvelope;
+
+// PublicIPAddresses
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/publicIPAddresses/{publicIpAddressName}")
+@put
+@operationId("PublicIPAddresses_CreateOrUpdate")
+op putPip(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path publicIpAddressName: string,
+  @query("api-version") apiVersion: string,
+  @body parameters: PublicIPAddress,
+): PublicIPAddress | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/publicIPAddresses/{publicIpAddressName}")
+@delete
+@operationId("PublicIPAddresses_Delete")
+op deletePip(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path publicIpAddressName: string,
+  @query("api-version") apiVersion: string,
+): { @statusCode _: 200 } | { @statusCode _: 204 } | ErrorEnvelope;
+
+// NetworkInterfaces referencing BOTH Subnet and PublicIPAddress (intra-RP SubResource refs!)
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/networkInterfaces/{networkInterfaceName}")
+@put
+@operationId("NetworkInterfaces_CreateOrUpdate")
+op putNic(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path networkInterfaceName: string,
+  @query("api-version") apiVersion: string,
+  @body parameters: NetworkInterface,
+): NetworkInterface | ErrorEnvelope;
+
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.NetGraph/networkInterfaces/{networkInterfaceName}")
+@delete
+@operationId("NetworkInterfaces_Delete")
+op deleteNic(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path networkInterfaceName: string,
+  @query("api-version") apiVersion: string,
+): { @statusCode _: 200 } | { @statusCode _: 204 } | ErrorEnvelope;
+
+// Cross-RP host route (Microsoft.Compute/cloudServices)
+@route("/subscriptions/{subscriptionId}/resourceGroups/{resourceGroupName}/providers/Microsoft.Compute/cloudServices/{cloudServiceName}/networkInterfaces")
+@get
+@operationId("NetworkInterfaces_ListCloudServiceNetworkInterfaces")
+op listCloudServiceNics(
+  @path subscriptionId: string,
+  @path resourceGroupName: string,
+  @path cloudServiceName: string,
+  @query("api-version") apiVersion: string,
+): OpList | ErrorEnvelope;
+`;
+    fs.writeFileSync(path.join(projectDir, "main.tsp"), tsp, "utf8");
+
+    const rgStore = new Map<string, Record<string, unknown>>();
+    const customKvStore = new Map<string, Record<string, unknown>>();
+    let bogusMonitorPolled = false;
+    let baseUrl = "";
+
+    const server = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      const pathname = reqUrl.pathname;
+      const method = req.method ?? "GET";
+
+      const rgMatch = /^\/subscriptions\/([^/]+)\/resourceGroups\/([^/]+)$/i.exec(pathname);
+      if (rgMatch) {
+        const key = `${rgMatch[1].toLowerCase()}/${rgMatch[2].toLowerCase()}`;
+        if (method === "GET") {
+          const found = rgStore.get(key);
+          res.writeHead(found ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(found ?? { error: { code: "NotFound", message: "missing" } }));
+          return;
+        }
+        if (method === "PUT") {
+          let raw = "";
+          req.on("data", (c: Buffer) => (raw += String(c)));
+          req.on("end", () => {
+            const parsed = (raw ? JSON.parse(raw) : {}) as Record<string, unknown>;
+            const rec = { id: pathname, location: "eastus2", ...parsed };
+            rgStore.set(key, rec);
+            res.writeHead(201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(rec));
+          });
+          return;
+        }
+        if (method === "DELETE") {
+          rgStore.delete(key);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ id: pathname }));
+          return;
+        }
+      }
+
+      // Custom KeyVault fixture endpoint
+      if (pathname.includes("/providers/Microsoft.KeyVault/vaults/")) {
+        if (method === "PUT") {
+          let raw = "";
+          req.on("data", (c: Buffer) => (raw += String(c)));
+          req.on("end", () => {
+            const parsed = (raw ? JSON.parse(raw) : {}) as Record<string, unknown>;
+            const rec = {
+              id: pathname,
+              location: "eastus2",
+              ...parsed,
+              properties: { provisioningState: "Succeeded" },
+            };
+            customKvStore.set(pathname.toLowerCase(), rec);
+            res.writeHead(200, {
+              "Content-Type": "application/json",
+              // Stale async header on sync 200 Succeeded (must NOT be polled!)
+              "Azure-AsyncOperation": `${baseUrl}/bogus-404-monitor`,
+            });
+            res.end(JSON.stringify(rec));
+          });
+          return;
+        }
+        if (method === "GET") {
+          const rec = customKvStore.get(pathname.toLowerCase());
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify(rec ?? { id: pathname, properties: { provisioningState: "Succeeded" } }),
+          );
+          return;
+        }
+      }
+
+      if (pathname === "/bogus-404-monitor") {
+        bogusMonitorPolled = true;
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "NotFound", message: "stale async op" } }));
+        return;
+      }
+
+      // Async 202 expectError endpoint (VirtualNetworks_ListDdosProtectionStatus)
+      if (pathname.endsWith("/listDdosProtectionStatus") && method === "POST") {
+        res.writeHead(202, {
+          "Content-Type": "application/json",
+          Location: `${baseUrl}/ddos-op-fail`,
+          "Retry-After": "0",
+        });
+        res.end();
+        return;
+      }
+      if (pathname === "/ddos-op-fail") {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: {
+              code: "VirtualNetworkBasicDdosProtectionNotEnabled",
+              message: "DDoS protection is not enabled on this VNet.",
+            },
+          }),
+        );
+        return;
+      }
+
+      // VNet PUT returns HTTP 200 with provisioningState: "Succeeded" AND a stale 404 Azure-AsyncOperation header!
+      if (
+        /\/providers\/Microsoft\.NetGraph\/virtualNetworks\/[^/]+$/i.test(pathname) &&
+        method === "PUT"
+      ) {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Azure-AsyncOperation": `${baseUrl}/bogus-404-monitor`,
+        });
+        res.end(
+          JSON.stringify({
+            id: pathname,
+            name: pathname.split("/").pop(),
+            location: "eastus2",
+            properties: { provisioningState: "Succeeded" },
+          }),
+        );
+        return;
+      }
+
+      // Generic 200 responses for other NetGraph endpoints
+      if (method === "DELETE") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      if (
+        pathname.endsWith("/operations") ||
+        pathname.endsWith("/usages") ||
+        pathname.endsWith("/networkInterfaces")
+      ) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ value: [] }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: pathname,
+          name: pathname.split("/").pop(),
+          location: "eastus2",
+          properties: { provisioningState: "Succeeded" },
+        }),
+      );
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    server.keepAliveTimeout = 60_000;
+    servers.push(server);
+    baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+
+    {
+      const workDir = path.join(tempRoot, "netgraph-work");
+      const ledger = await discoverSpecInventory({
+        specPath: projectDir,
+        apiVersion: "2026-03-01",
+        workDir,
+        armBaseUrl: baseUrl,
+        subscriptionId: REAL_SUB_ID,
+        location: "eastus2",
+      });
+
+      // 1. Scope-aware preflight-discovery classification (Gap 3):
+      expect(ledger.operations.Operations_List.phase).toBe("preflight-discovery");
+      expect(ledger.operations.Usages_List.phase).toBe("preflight-discovery");
+      expect(ledger.operations.CheckDnsNameAvailability.phase).toBe("preflight-discovery");
+      expect(ledger.operations.PrivateLinkServices_CheckVisibility.phase).toBe(
+        "preflight-discovery",
+      );
+      // Instance checkIpAddressAvailability MUST NOT be preflight-discovery — it must run AFTER VNet create!
+      expect(ledger.operations.VirtualNetworks_CheckIPAddressAvailability.phase).not.toBe(
+        "preflight-discovery",
+      );
+
+      // 2. Clean externalDependencies (no self-RP leaf noise; KeyVault + Compute host scope retained):
+      expect(
+        ledger.externalDependencies.some((d) => d.providerNamespace === "Microsoft.NetGraph"),
+      ).toBe(false);
+      expect(
+        ledger.externalDependencies.some((d) => d.providerNamespace === "Microsoft.KeyVault"),
+      ).toBe(true);
+      expect(
+        ledger.externalDependencies.some((d) => d.providerNamespace === "Microsoft.Compute"),
+      ).toBe(true);
+
+      // 3. Intra-RP SubResource DAG ordering (Gap 1 & Gap 5):
+      expect(ledger.operations.NetworkInterfaces_CreateOrUpdate.intraRpDependencies).toEqual([
+        "Microsoft.NetGraph/publicIPAddresses",
+        "Microsoft.NetGraph/virtualNetworks/subnets",
+      ]);
+      // Inline child array VirtualNetwork.properties.subnets must NOT make VirtualNetwork depend on Subnets!
+      expect(ledger.operations.VirtualNetworks_CreateOrUpdate.intraRpDependencies).toBeUndefined();
+
+      const order = ledger.executionOrder;
+      expect(order.indexOf("VirtualNetworks_CreateOrUpdate")).toBeLessThan(
+        order.indexOf("Subnets_CreateOrUpdate"),
+      );
+      expect(order.indexOf("Subnets_CreateOrUpdate")).toBeLessThan(
+        order.indexOf("NetworkInterfaces_CreateOrUpdate"),
+      );
+      expect(order.indexOf("PublicIPAddresses_CreateOrUpdate")).toBeLessThan(
+        order.indexOf("NetworkInterfaces_CreateOrUpdate"),
+      );
+      // Reverse bottom-up delete order: NIC deleted BEFORE Subnet and PublicIP, Subnet deleted BEFORE VNet!
+      expect(order.indexOf("NetworkInterfaces_Delete")).toBeLessThan(
+        order.indexOf("Subnets_Delete"),
+      );
+      expect(order.indexOf("NetworkInterfaces_Delete")).toBeLessThan(
+        order.indexOf("PublicIPAddresses_Delete"),
+      );
+      expect(order.indexOf("Subnets_Delete")).toBeLessThan(order.indexOf("VirtualNetworks_Delete"));
+      expect(
+        ledger.executionGraph?.edges.some(
+          (e) =>
+            e.from === "Subnets_CreateOrUpdate" &&
+            e.to === "NetworkInterfaces_CreateOrUpdate" &&
+            e.reason === "intra-rp-resource-ref",
+        ),
+      ).toBe(true);
+
+      // 4. --resource-filter automatically closes over transitive intra-RP create/delete prerequisites:
+      const filteredDir = path.join(tempRoot, "netgraph-filtered");
+      const filteredLedger = await discoverSpecInventory({
+        specPath: projectDir,
+        apiVersion: "2026-03-01",
+        workDir: filteredDir,
+        armBaseUrl: baseUrl,
+        subscriptionId: REAL_SUB_ID,
+        location: "eastus2",
+        resourceFilter: ["NetworkInterfaces_CreateOrUpdate"],
+      });
+      expect(Object.keys(filteredLedger.operations)).toEqual(
+        expect.arrayContaining([
+          "VirtualNetworks_CreateOrUpdate",
+          "Subnets_CreateOrUpdate",
+          "PublicIPAddresses_CreateOrUpdate",
+          "NetworkInterfaces_CreateOrUpdate",
+          "Subnets_Delete",
+          "PublicIPAddresses_Delete",
+          "VirtualNetworks_Delete",
+        ]),
+      );
+
+      // 5. Sharding & execution across shards + custom fixture + sync-200 LRO skip + async-202 expectError + pending===0 gate:
+      const manifest = partitionLedgerIntoShards({
+        workDir,
+        shardCount: 2,
+        maxOpsPerShard: 10,
+      });
+      expect(manifest.shardCount).toBe(2);
+      const unionShardOps = new Set<string>();
+      for (const s of manifest.shards) {
+        const sLedger = JSON.parse(
+          fs.readFileSync(path.join(s.workDir, "coverage-ledger.json"), "utf8"),
+        ) as CoverageLedger;
+        for (const opId of Object.keys(sLedger.coverage)) {
+          unionShardOps.add(opId);
+        }
+      }
+      expect(unionShardOps.size).toBe(ledger.executionOrder.length);
+
+      // Execute each shard to pending === 0!
+      for (const shard of manifest.shards) {
+        await createDisposableResourceGroup({
+          workDir: shard.workDir,
+          bearerToken: MOCK_TOKEN,
+        });
+
+        // CLI `rg delete` refuses teardown while operations are still pending (Gap 6)!
+        await expect(runCli(["rg", "delete", "--work-dir", shard.workDir])).rejects.toThrow(
+          /remain "pending"/,
+        );
+
+        // Test custom cross-RP fixture inside disposable RG (Gap 2) + cross-RG escape block!
+        await expect(
+          provisionExternalFixture({
+            workDir: shard.workDir,
+            kind: "custom",
+            customResourcePath: `/subscriptions/${REAL_SUB_ID}/resourceGroups/rg-prod-escape/providers/Microsoft.KeyVault/vaults/kvbad`,
+            customApiVersion: "2023-07-01",
+            bearerToken: MOCK_TOKEN,
+          }),
+        ).rejects.toThrow(/Blocked custom fixture/);
+
+        const kvFix = await provisionExternalFixture({
+          workDir: shard.workDir,
+          kind: "custom",
+          customResourcePath: "providers/Microsoft.KeyVault/vaults/bbxkvtest",
+          customApiVersion: "2023-07-01",
+          customBody: { properties: { sku: { family: "A", name: "standard" } } },
+          bearerToken: MOCK_TOKEN,
+        });
+        expect(kvFix.resourceId).toContain("/providers/Microsoft.KeyVault/vaults/bbxkvtest");
+
+        const sLedger = JSON.parse(
+          fs.readFileSync(path.join(shard.workDir, "coverage-ledger.json"), "utf8"),
+        ) as CoverageLedger;
+
+        const batchItems: Parameters<typeof executeProbeBatch>[0]["items"] = [];
+        for (const opId of sLedger.executionOrder) {
+          if (opId === "NetworkInterfaces_ListCloudServiceNetworkInterfaces") {
+            batchItems.push({
+              markBlocked: {
+                operationIds: [opId],
+                reason: "Hosted under retired Microsoft.Compute/cloudServices (classic)",
+              },
+            });
+          } else if (opId === "VirtualNetworks_ListDdosProtectionStatus") {
+            // Test async HTTP 202 polling on expectError: true (Gap 9)!
+            batchItems.push({
+              operationId: opId,
+              expectError: true,
+              scenario: "ddos-not-enabled",
+              pollIntervalMs: 1,
+            });
+            // Then mark blocked due to DDoS plan requirement
+            batchItems.push({
+              markBlocked: {
+                operationIds: [opId],
+                reason:
+                  "Requires paid DDoS Protection Plan on VNet (live 400 VirtualNetworkBasicDdosProtectionNotEnabled)",
+              },
+            });
+          } else if (opId === "CheckDnsNameAvailability") {
+            batchItems.push({
+              operationId: opId,
+              query: { domainNameLabel: "bbxdnstest" },
+            });
+          } else if (opId === "VirtualNetworks_CheckIPAddressAvailability") {
+            batchItems.push({
+              operationId: opId,
+              query: { ipAddress: "10.0.0.4" },
+            });
+          } else if (opId === "PrivateLinkServices_CheckVisibility") {
+            batchItems.push({
+              operationId: opId,
+              body: { privateLinkServiceAlias: "test.alias.eastus2.azure.privatelinkservice" },
+            });
+          } else if (opId.endsWith("_CreateOrUpdate")) {
+            batchItems.push({
+              operationId: opId,
+              body:
+                opId === "Subnets_CreateOrUpdate"
+                  ? { properties: { addressPrefix: "10.0.0.0/24" } }
+                  : { location: "eastus2", properties: {} },
+            });
+          } else {
+            batchItems.push({ operationId: opId });
+          }
+        }
+
+        const results = await executeProbeBatch({
+          workDir: shard.workDir,
+          items: batchItems,
+          continueOnError: false,
+          bearerToken: MOCK_TOKEN,
+        });
+        expect(results.every((r) => r.probeSucceeded)).toBe(true);
+        // Stale Azure-AsyncOperation header on HTTP 200 Succeeded must NEVER be polled (Gap 9)!
+        expect(bogusMonitorPolled).toBe(false);
+
+        await generateLiveExamples({ workDir: shard.workDir, validateWithTypeSpec: true });
+
+        // Refuses merge while shard RG is still active!
+        if (shard === manifest.shards[0]) {
+          expect(() => mergeShardWorkDirs({ parentWorkDir: workDir })).toThrow(
+            /Refusing to merge shard/,
+          );
+        }
+
+        await deleteDisposableResourceGroup({
+          workDir: shard.workDir,
+          wait: true,
+          bearerToken: MOCK_TOKEN,
+        });
+      }
+
+      // 6. Merge shards back into parent workDir and verify pending === 0 across all 15 operations!
+      const merged = mergeShardWorkDirs({ parentWorkDir: workDir });
+      expect(merged.pendingOperations).toBe(0);
+      expect(merged.totalOperations).toBe(ledger.executionOrder.length);
+      expect(merged.mergedTraces).toBeGreaterThanOrEqual(13);
+
+      // 7. Concurrent atomic ledger updates preserve both mutations (Gap 8):
+      updateLedgerAtomically(workDir, (l) => {
+        l.runtimeState!.pathSlotValues.concurrentSlotA = "valA";
+      });
+      updateLedgerAtomically(workDir, (l) => {
+        l.runtimeState!.pathSlotValues.concurrentSlotB = "valB";
+      });
+      const finalParent = JSON.parse(
+        fs.readFileSync(path.join(workDir, "coverage-ledger.json"), "utf8"),
+      ) as CoverageLedger;
+      expect(finalParent.runtimeState?.pathSlotValues.concurrentSlotA).toBe("valA");
+      expect(finalParent.runtimeState?.pathSlotValues.concurrentSlotB).toBe("valB");
+    }
   });
 });

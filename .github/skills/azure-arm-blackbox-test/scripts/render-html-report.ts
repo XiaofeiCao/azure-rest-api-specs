@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getUnionAsEnum } from "@azure-tools/typespec-azure-core";
 import {
+  getDiscriminator,
   isArrayModelType,
   isRecordModelType,
   isSecret,
@@ -306,10 +307,16 @@ function collectRequestBodyLeafSpecs(
   depth = 0,
   visited = new Set<Type>(),
   out = new Map<string, BodyLeafSpec>(),
+  minVisitedDepth = new Map<Type, number>(),
 ): BodyLeafSpec[] {
-  if (!type || depth > 6 || visited.has(type)) {
+  if (!type || depth > 5 || visited.has(type) || out.size >= 400) {
     return [...out.values()];
   }
+  const prevDepth = minVisitedDepth.get(type);
+  if (prevDepth !== undefined && prevDepth <= depth) {
+    return [...out.values()];
+  }
+  minVisitedDepth.set(type, depth);
 
   const branchVisited = new Set(visited);
   branchVisited.add(type);
@@ -350,6 +357,7 @@ function collectRequestBodyLeafSpecs(
           depth + 1,
           branchVisited,
           out,
+          minVisitedDepth,
         );
       }
       return [...out.values()];
@@ -390,7 +398,10 @@ function collectRequestBodyLeafSpecs(
             break;
           }
         }
-        if (propType.derivedModels.length > 0) {
+        if (
+          getDiscriminator(program, propType) !== undefined &&
+          propType.derivedModels.length > 0
+        ) {
           hasNestedModelChildren = true;
         }
       }
@@ -408,6 +419,7 @@ function collectRequestBodyLeafSpecs(
           depth + 1,
           branchVisited,
           out,
+          minVisitedDepth,
         );
       } else if (propType.kind === "Model" && isArrayModelType(program, propType)) {
         upsertBodyLeaf(out, {
@@ -428,6 +440,7 @@ function collectRequestBodyLeafSpecs(
           depth + 1,
           branchVisited,
           out,
+          minVisitedDepth,
         );
       } else if (propType.kind === "Union") {
         const [unionEnum] = getUnionAsEnum(propType);
@@ -451,6 +464,7 @@ function collectRequestBodyLeafSpecs(
             depth + 1,
             branchVisited,
             out,
+            minVisitedDepth,
           );
         }
       } else {
@@ -463,20 +477,23 @@ function collectRequestBodyLeafSpecs(
       }
     }
 
-    for (const derived of type.derivedModels) {
-      collectRequestBodyLeafSpecs(
-        program,
-        metadataInfo,
-        reqVisibility,
-        false,
-        derived,
-        prefix,
-        false,
-        modelSecret || isSecret(program, derived),
-        depth,
-        branchVisited,
-        out,
-      );
+    if (getDiscriminator(program, type) !== undefined) {
+      for (const derived of type.derivedModels) {
+        collectRequestBodyLeafSpecs(
+          program,
+          metadataInfo,
+          reqVisibility,
+          false,
+          derived,
+          prefix,
+          false,
+          modelSecret || isSecret(program, derived),
+          depth,
+          branchVisited,
+          out,
+          minVisitedDepth,
+        );
+      }
     }
   }
   return [...out.values()];

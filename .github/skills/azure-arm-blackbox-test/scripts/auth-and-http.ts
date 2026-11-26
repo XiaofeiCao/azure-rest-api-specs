@@ -536,8 +536,8 @@ export function assertSafeArmTarget(
     .join("/");
   const subSegmentMatch = /^\/subscriptions\/([^/]+)(?:\/|$)/i.exec(pathname);
 
-  // Non-destructive ARM name-availability checks are subscription/provider scoped POSTs.
-  if (upperMethod === "POST" && /\/checknameavailability$/i.test(pathname)) {
+  // Non-destructive ARM availability/visibility checks are subscription/provider scoped POSTs.
+  if (upperMethod === "POST" && /\/check[a-z0-9]*(?:availability|visibility)$/i.test(pathname)) {
     if (
       subSegmentMatch &&
       ctx.subscriptionId &&
